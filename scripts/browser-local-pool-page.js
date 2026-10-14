@@ -1,7 +1,7 @@
 // Actual HostPeer/BrowserEncodingPool comparison; synthetic source and local receivers only.
 import { BrowserEncodingPool as ProbePool } from '../src/client/media/browser-encoding-pool';
 import { HostPeer as ProbeHostPeer } from '../src/client/webrtc/host-peer';
-import { applyVideoCaptureProfile as probeApplyProfile } from '../src/client/media/quality';
+import { applyVideoCaptureProfile as probeApplyProfile, QUALITY_RESOLUTIONS } from '../src/client/media/quality';
 import { browserDebugEnabled, exportBrowserDebug } from '../src/client/lib/debug';
 
 const settings = new URLSearchParams(location.search);
@@ -13,16 +13,29 @@ const nativeSource = settings.get('nativeSource') === '1', background = settings
 const lifecycle = settings.get('lifecycle') === '1', shapedRate = Number(settings.get('rate') || 120000);
 const relay = settings.get('relay') === '1';
 const shortPulse = settings.get('shortPulse') === '1';
-const selectedProfile = () => ({ resolution: high ? '1080p' : '480p', maxFramerate: 30,
-    maxBitrate: high ? 5000000 : 1700000,
+const displaySource = settings.get('displaySource') === '1';
+const quietStart = settings.get('quietStart') === '1';
+const customSize = settings.has('width') ? { width: Number(settings.get('width')), height: Number(settings.get('height')) } : null;
+const selectedProfile = () => ({ resolution: customSize ?? QUALITY_RESOLUTIONS[high ? '1080p' : '480p'], maxFramerate: 30,
+    maxBitrate: customSize ? 12000000 : high ? 5000000 : 1700000,
     degradationPreference: settings.get('preference') || (high ? 'maintain-resolution' : 'balanced'),
-    screenAudioQuality: 'music' });
+    maxAudioBitrate: Number(settings.get('audioBitrate') || 128000) });
 const productPool = mode === 'carrier' ? new ProbePool() : null;
 const productPeers = [], peers = [], tracks = [], edges = [], monitors = [], audioMonitors = [];
-const errors = [], sourcePulses = [], controls = [], visibility = [], productTrace = [];
+const errors = [], sourcePulses = [], controls = [], visibility = [], productTrace = [], sourceFrames = [];
+let sourceReader, sourceReading;
+const displayClones = [];
+if (displaySource) {
+    const clone = MediaStreamTrack.prototype.clone;
+    MediaStreamTrack.prototype.clone = function () {
+        const track = clone.call(this);
+        if (this.getSettings().displaySurface) displayClones.push(track);
+        return track;
+    };
+}
 const sourceTimes = new Map(), seenProductGroups = new Map();
 let rawSource, drawing, productTraceTimer, audioContext, audioTrack, audioGain, upstreamPeer;
-let producing = true, sourceFrame = 0, phase = 'startup';
+let producing = !quietStart, sourceFrame = 0, phase = 'startup';
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const poolState = () => productPool ? {
     members: [...productPool.members].map(m => ({ id: m.id, group: m.current?.producer.id,
@@ -34,6 +47,8 @@ const poolState = () => productPool ? {
         ready: g.ready, failed: g.failed, output: g.output }))
 } : null;
 window.probeProgress = () => ({ phase, sourceFrame, errors, pool: poolState(),
+    sourceSize: { width: rawSource?.getSettings().width, height: rawSource?.getSettings().height },
+    captured: sourceFrames.slice(-3), decoded: monitors.map(m => ({ role: m.role, last: m.samples.at(-1) })),
     peers: peers.map(p => ({ connection: p.connectionState, ice: p.iceConnectionState })),
     audio: audioMonitors.map(m => ({ role: m.role, attached: m.attached, pulses: m.pulses.length })) });
 
@@ -44,7 +59,7 @@ function watch(video, role) {
     let stopped = false;
     const next = () => video.requestVideoFrameCallback((_time, metadata) => {
         if (stopped) return;
-        if (nativeSource) {
+        if (nativeSource || displaySource) {
             samples.push({ at: performance.now(), phase, id: metadata.presentedFrames, age: null,
                 width: video.videoWidth, height: video.videoHeight });
         } else {
@@ -181,7 +196,8 @@ async function statistics() {
     const result = {};
     for (const edge of edges) {
         const metrics = edge.peer.getSnapshot().metrics;
-        result[edge.role] = { send: selectReport(await edge.send.getStats()),
+        result[edge.role] = { audioParameters: edge.peer.getSnapshot().audioSenderParameters,
+            send: selectReport(await edge.send.getStats()),
             receive: selectReport(await edge.receive.getStats()),
             details: Object.fromEntries(['frameWidth', 'frameHeight', 'framesPerSecond', 'bitrateKbps',
                 'qualityLimitationReason', 'nativeEdgeQualityState', 'intervalFramesSent', 'intervalFramesEncoded']
@@ -218,14 +234,29 @@ async function run() {
         audioTrack = destination.stream.getAudioTracks()[0]; tracks.push(audioTrack);
     }
     const source = document.createElement('canvas');
-    source.width = high ? 1920 : 640; source.height = high ? 1080 : 360;
+    source.width = customSize?.width ?? (high ? 1920 : 640); source.height = customSize?.height ?? (high ? 1080 : 360);
     if (!nativeSource) document.body.prepend(source);
     const ctx = source.getContext('2d');
-    if (high) ctx.scale(3, 3);
-    rawSource = nativeSource ? (await navigator.mediaDevices.getUserMedia({
+    ctx.scale(source.width / 640, source.height / 360);
+    if (displaySource) {
+        document.body.style.margin = '0';
+        source.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:10';
+    }
+    rawSource = displaySource ? await new Promise((resolve, reject) => {
+        window.acquireDisplay = () => navigator.mediaDevices.getDisplayMedia({ audio: false, preferCurrentTab: true,
+            selfBrowserSurface: 'include', video: { width: source.width, height: source.height, frameRate: 30 } })
+            .then(stream => resolve(stream.getVideoTracks()[0]), reject);
+    }) : nativeSource ? (await navigator.mediaDevices.getUserMedia({
         video: { width: source.width, height: source.height, frameRate: 30 }, audio: false
     })).getVideoTracks()[0] : source.captureStream(0).getVideoTracks()[0];
     rawSource.contentHint = 'motion'; tracks.push(rawSource);
+    if (displaySource) {
+        sourceReader = new MediaStreamTrackProcessor({ track: rawSource, maxBufferSize: 1 }).readable.getReader();
+        sourceReading = (async () => { for (;;) {
+            const { done, value } = await sourceReader.read(); if (done) break;
+            sourceFrames.push({ at: performance.now(), phase, width: value.displayWidth, height: value.displayHeight }); value.close();
+        } })().catch(error => errors.push(String(error)));
+    }
     await probeApplyProfile(rawSource, selectedProfile());
     const main = rawSource;
     const connectChildren = async () => {
@@ -247,7 +278,7 @@ async function run() {
         for (let bit = 0; bit < 12; bit++) {
             ctx.fillStyle = id & (1 << bit) ? '#fff' : '#000'; ctx.fillRect(bit * 50, 0, 50, 30);
         }
-        (relay ? main : rawSource).requestFrame();
+        (relay ? main : rawSource).requestFrame?.();
     }, 1000 / (lifecycle ? 60 : 30));
     if (productPool) productTraceTimer = setInterval(() => productTrace.push({ at: performance.now(), phase, ...poolState() }), 500);
     if (relay) {
@@ -266,13 +297,15 @@ async function run() {
         let activated = null;
         for (;;) {
             const members = [...productPool.members];
+            // Compatible allocations share an owner; distinct BWE budgets must
+            // remain independent even when this synthetic scene encodes cheaply.
             const sharing = members.length === productPeers.length && members.every(m => m.current && m.carrier && !m.replacement) &&
-                new Set(members.map(m => m.current)).size === 1;
+                new Set(members.map(m => m.current)).size === new Set(members.map(m => m.budget)).size;
             if (sharing) activated ??= performance.now();
             else activated = null;
             if (activated !== null && monitors.every(m => {
                 const last = m.samples.at(-1);
-                return last?.width > 16 && (nativeSource ? last.at >= activated :
+                return last?.width > 16 && (nativeSource || displaySource ? last.at >= activated :
                     last.age !== null && (sourceTimes.get(last.id) ?? -1) >= activated);
             })) break;
             if (performance.now() >= deadline) throw Error('Product shared output did not become fresh');
@@ -283,6 +316,15 @@ async function run() {
         extensions: e.send.localDescription?.sdp.match(/^a=extmap:.*$/gm),
         parameters: e.sender.getParameters().encodings }));
     const snapshots = [await snapshot()];
+    if (quietStart) {
+        const deadline = performance.now() + 10000;
+        while (!monitors.every(m => m.samples.some(s => s.width > 16))) {
+            if (performance.now() >= deadline) throw Error('Static display produced no first frame');
+            await wait(30);
+        }
+        controls.push({ action: 'static-first-frame', at: performance.now(), sourceFrame });
+        producing = true;
+    }
     phase = 'healthy'; await wait(shortPulse ? 45000 : 6000); snapshots.push(await snapshot());
     if (lifecycle) {
         let appliedProfile = selectedProfile();
@@ -298,16 +340,16 @@ async function run() {
             phase = name; await wait(duration); snapshots.push(await snapshot());
             if (name.startsWith('quiet-') || name.startsWith('paused-')) return;
             for (const monitor of monitors) {
-                const last = monitor.samples.at(-1), ceiling = { '480p': 480, '720p': 720, '1080p': 1080 }[appliedProfile.resolution];
-                if (last?.phase !== name || last.age === null || last.age >= 1000 ||
-                    performance.now() - last.at >= 1000 || last.height > ceiling)
+                const last = monitor.samples.at(-1), ceiling = appliedProfile.resolution;
+                if (last?.phase !== name || (!displaySource && (last.age === null || last.age >= 1000)) ||
+                    performance.now() - last.at >= 1000 || last.width > ceiling.width || last.height > ceiling.height)
                     throw Error(name + ': receiver did not deliver current frames within the requested ceiling');
             }
         };
-        const p60 = { ...selectedProfile(), resolution: '720p', maxFramerate: 60, maxBitrate: 5000000 };
+        const p60 = { ...selectedProfile(), resolution: QUALITY_RESOLUTIONS['720p'], maxFramerate: 60, maxBitrate: 5000000 };
         phase = 'profile-720p60'; await apply(p60); await observe(phase);
         producing = false; phase = 'quiet-profile-480p30';
-        await apply({ ...p60, resolution: '480p', maxFramerate: 30, maxBitrate: 3000000 });
+        await apply({ ...p60, resolution: QUALITY_RESOLUTIONS['480p'], maxFramerate: 30, maxBitrate: 3000000 });
         await observe(phase, 2500);
         producing = true; await observe('resumed-480p30');
         rawSource.enabled = false; productPeers.forEach(peer => peer.setPaused(true));
@@ -346,13 +388,19 @@ async function run() {
         await fetch('/shaper?rate=0');
         // --auto extends recovery observation; adaptation always belongs to the product.
         phase = 'released'; await wait(automatic ? 40000 : 10000); snapshots.push(await snapshot());
+        if (displaySource) {
+            const healthy = sourceFrames.findLast(frame => frame.phase === 'healthy');
+            if (!healthy || sourceFrames.some(frame => ['limited', 'released'].includes(frame.phase) &&
+                (frame.width < healthy.width - 2 || frame.height < healthy.height - 2)))
+                throw Error('Sender adaptation reduced its display-capture input');
+        }
     }
-    return { descriptions, snapshots, browser: navigator.userAgent, sourcePulses,
+    return { descriptions, snapshots, browser: navigator.userAgent, sourcePulses, sourceFrames,
         audioMonitors: audioMonitors.map(({ role, pulses, attached }) => ({ role, pulses, attached })),
         monitors: monitors.map(({ role, samples }) => ({ role, samples })) };
 }
 const configuration = { mode, codec, product: true, network, automatic, av, high, single, late, shortPulse,
-    background, nativeSource, lifecycle, relay, shapedRate, profile: selectedProfile() };
+    background, nativeSource, displaySource, quietStart, lifecycle, relay, shapedRate, profile: selectedProfile() };
 try {
     window.probeResult = { ...configuration, ...await run(), controls, visibility, productTrace, errors };
     if (browserDebugEnabled) {
@@ -370,7 +418,10 @@ try {
     monitors.forEach(m => m.stop()); audioMonitors.forEach(m => m.stop());
     productPeers.forEach(peer => peer.dispose()); productPool?.dispose();
     upstreamPeer?.dispose();
+    await sourceReader?.cancel();
+    await sourceReading;
     tracks.forEach(t => t.stop()); peers.forEach(pc => pc.close());
     await audioContext?.close();
+    if (displayClones.some(track => track.readyState !== 'ended')) errors.push('Sender retirement left a live display-capture clone');
     window.probeDone = true;
 }

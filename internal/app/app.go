@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,21 +21,23 @@ import (
 	"github.com/TNTcraftHIM/Piik/internal/app/lan"
 	"github.com/TNTcraftHIM/Piik/internal/app/launcher"
 	"github.com/TNTcraftHIM/Piik/internal/app/loopback"
+	"github.com/TNTcraftHIM/Piik/internal/app/nativeaudio"
 	"github.com/TNTcraftHIM/Piik/internal/app/nativecapture"
 	"github.com/TNTcraftHIM/Piik/internal/app/nativecontrol"
 	"github.com/TNTcraftHIM/Piik/internal/app/publictunnel"
 	"github.com/TNTcraftHIM/Piik/internal/diagnostics"
 	serverapp "github.com/TNTcraftHIM/Piik/internal/server/app"
 	serverconfig "github.com/TNTcraftHIM/Piik/internal/server/config"
+	"github.com/TNTcraftHIM/Piik/internal/server/protocol"
 	"github.com/TNTcraftHIM/Piik/internal/server/webassets"
 	"golang.org/x/mod/semver"
 )
 
 const (
-	DefaultLocalPort            = 8787
-	publicSTUNURL               = "stun:stun.cloudflare.com:3478"
-	publicNATPredictionSTUNURLA = "stun:stun.miwifi.com:3478"
-	publicNATPredictionSTUNURLB = "stun:stun.chat.bilibili.com:3478"
+	DefaultLocalPort       = 8787
+	publicSTUNURL          = "stun:stun.cloudflare.com:3478"
+	publicFallbackSTUNURLA = "stun:stun.miwifi.com:3478"
+	publicFallbackSTUNURLB = "stun:stun.chat.bilibili.com:3478"
 	// localShutdownTimeout bounds the ordered Local stop. The packaged smoke
 	// allows 10 s between the stop request and the exit, so it stays well
 	// inside that budget.
@@ -75,9 +78,12 @@ func Run(ctx context.Context, options Options) (returnedErr error) {
 	options.Debug = options.Debug || debugEnabled(os.Getenv("PIIK_DEBUG"))
 	options.console = newConsole(cancel, options.DisableBrowser)
 	var recorder *diagnostics.Recorder
+	var diagnosticsMu sync.Mutex
 	var restoreLogger func()
 	defer func() {
 		cancel()
+		diagnosticsMu.Lock()
+		defer diagnosticsMu.Unlock()
 		returnedErr = finishRun(options.console, recorder, restoreLogger, returnedErr)
 	}()
 	enableDiagnostics := func() error {
@@ -158,11 +164,16 @@ func Run(ctx context.Context, options Options) (returnedErr error) {
 			"softwareVP8", nativeMedia.capabilities.SoftwareVP8, diagnostics.Error(nativeMedia.discoveryErr))
 	}
 	recordContext(options, config)
+	qualityPreference, preferenceErr := appconfig.LoadQualityPreference(configPath)
+	if preferenceErr != nil {
+		slog.Debug("piik-client", "event", "quality-preference-load-failed", diagnostics.Error(preferenceErr))
+	}
 	control, err := loopback.Start(ctx, loopback.Options{
-		AllowedOrigins: allowedOrigins(config.Site, options.Port),
-		NativeMedia:    nativeMedia.capabilities,
-		NewControl:     nativeMedia.controlFactory(),
-		Presentation:   options.console.setLanguage,
+		AllowedOrigins:    allowedOrigins(config.Site, options.Port),
+		NativeMedia:       nativeMedia.capabilities,
+		NewControl:        nativeMedia.controlFactory(),
+		Presentation:      options.console.setLanguage,
+		QualityPreference: qualityPreference,
 	})
 	if err != nil {
 		return fmt.Errorf("Piik App native control could not start: %w", err)
@@ -174,19 +185,24 @@ func Run(ctx context.Context, options Options) (returnedErr error) {
 			return err
 		}
 	}
-	if !explicitMode(options) {
-		return runLauncher(ctx, options, configPath, config, control, func(selected *Options, config appconfig.Config) error {
-			if selected.Debug {
-				if err := enableDiagnostics(); err != nil {
-					return err
-				}
-				selected.logger = recorder.Logger()
+	return runLauncher(ctx, options, configPath, config, control, func(selected *Options, config appconfig.Config) error {
+		diagnosticsMu.Lock()
+		defer diagnosticsMu.Unlock()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if selected.Debug {
+			if err := enableDiagnostics(); err != nil {
+				return err
 			}
-			recordContext(*selected, config)
-			return nil
-		})
-	}
-	return runConfigured(ctx, options, config, control)
+		}
+		if recorder != nil {
+			selected.Debug = true
+			selected.logger = recorder.Logger()
+		}
+		recordContext(*selected, config)
+		return nil
+	})
 }
 
 func finishRun(console *console, recorder *diagnostics.Recorder, restoreLogger func(), err error) error {
@@ -211,18 +227,6 @@ func explicitMode(options Options) bool {
 	return options.SiteSet || options.Local || options.Link || options.DisableBrowser
 }
 
-func runConfigured(
-	ctx context.Context,
-	options Options,
-	config appconfig.Config,
-	control *loopback.Server,
-) error {
-	if config.Site != "" && !options.Local && !options.Link {
-		return runSite(config.Site, options, control)
-	}
-	return runLocal(ctx, options, config, control)
-}
-
 func runLauncher(
 	ctx context.Context,
 	options Options,
@@ -231,9 +235,29 @@ func runLauncher(
 	control *loopback.Server,
 	configureDiagnostics func(*Options, appconfig.Config) error,
 ) (returnedErr error) {
+	automatic := explicitMode(options)
+	directRoom := automatic && (options.Local || options.Link || config.Site == "")
+	initialOptions := options
+	initialConfig := config
 	mode, err := launcher.LoadMode(configPath)
 	if err != nil {
 		slog.Debug("Could not restore the last launcher mode", diagnostics.Error(err))
+	}
+	// Site approval and room startup mutate separate fields of one config.
+	// Serialize persistence and publish only the complete successfully saved value.
+	var configMu sync.Mutex
+	launcherOrigin := ""
+	updateConfig := func(change func(*appconfig.Config)) (appconfig.Config, error) {
+		configMu.Lock()
+		defer configMu.Unlock()
+		next := config
+		change(&next)
+		if err := appconfig.Save(configPath, next); err != nil {
+			return config, err
+		}
+		config = next
+		err := control.SetAllowedOrigins(append(allowedOrigins(config.Site, initialOptions.Port), launcherOrigin))
+		return config, err
 	}
 	launch, err := launcher.Start(
 		ctx,
@@ -243,42 +267,91 @@ func runLauncher(
 			Site:        config.Site, Version: buildVersion(), Revision: BuildRevision,
 			LocalAccessPassword: config.LocalAccessPassword,
 			Debug:               options.Debug, LANAddress: options.LANAddress,
+			ChangeSite: func(site string) (string, error) {
+				current, err := updateConfig(func(next *appconfig.Config) { next.Site = site })
+				return current.Site, err
+			},
+			EnableDebug: func() error {
+				configMu.Lock()
+				defer configMu.Unlock()
+				selected := initialOptions
+				selected.Debug = true
+				return configureDiagnostics(&selected, config)
+			},
 		},
 	)
 	if err != nil {
 		return err
 	}
-	defer launch.Close()
+	defer func() { returnedErr = errors.Join(returnedErr, launch.Close()) }()
+	control.SetConnectURL(launch.URL())
+	defer control.SetConnectURL("")
 	launchAddress, err := url.Parse(launch.URL())
 	if err != nil {
 		return err
 	}
-	control.SetAllowedOrigins(append(
-		allowedOrigins(config.Site, options.Port),
-		launchAddress.Scheme+"://"+launchAddress.Host,
-	))
-	options.console.show(consoleView{state: "setup", entry: launch.URL()})
-	options.console.openBrowser(launch.URL())
+	configMu.Lock()
+	launcherOrigin = launchAddress.Scheme + "://" + launchAddress.Host
+	err = control.SetAllowedOrigins(append(allowedOrigins(config.Site, options.Port), launcherOrigin))
+	configMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !automatic {
+		options.console.show(consoleView{state: "setup", entry: launch.URL()})
+		options.console.openBrowser(launch.URL())
+	} else if initialConfig.Site != "" && !options.Local && !options.Link {
+		// --site is still an explicit approval shortcut. It supplies native
+		// capabilities immediately; the launcher can start a Local room later.
+		openSite(initialConfig.Site, options)
+	}
+	// An interactive room is a child of the resident App. Its failure must not
+	// retire an unrelated Site's native sessions or its approval page. Explicit
+	// CLI launches still return their outcome to the caller. Call only after the
+	// room has retired, so neither approval nor process exit depends on its work.
+	finishRoom := func(roomErr error) error {
+		if directRoom || roomErr == nil || ctx.Err() != nil {
+			return roomErr
+		}
+		launch.SetResult("", roomErr)
+		options.console.show(consoleView{state: "setup", entry: launch.URL(), problem: diagnostics.SafeText(roomErr.Error())})
+		slog.Debug("piik-client", "event", "local-room-stopped", diagnostics.Error(roomErr))
+		select {
+		case <-ctx.Done():
+		case err := <-control.Done():
+			roomErr = errors.Join(roomErr, err)
+		case err := <-launch.Done():
+			roomErr = errors.Join(roomErr, err)
+		}
+		return roomErr
+	}
 
 	var selection launcher.Selection
-	select {
-	case selection = <-launch.Selection():
-	case <-ctx.Done():
-		return nil
-	case err = <-launch.Done():
-		if err != nil {
-			return fmt.Errorf("Piik App launcher stopped unexpectedly: %w", err)
+	if directRoom {
+		selection = launcher.Selection{Mode: launcher.ModeLocal, LocalAccessPassword: initialConfig.LocalAccessPassword}
+		if options.Link {
+			selection.Mode = launcher.ModeLink
 		}
-		return nil
+		launch.Begin()
+	} else {
+		select {
+		case selection = <-launch.Selection():
+		case <-ctx.Done():
+			return nil
+		case err = <-control.Done():
+			return err
+		case err = <-launch.Done():
+			if err != nil {
+				return fmt.Errorf("Piik App launcher stopped unexpectedly: %w", err)
+			}
+			return nil
+		}
 	}
-	options.console.setLanguage(selection.Language)
+	if selection.Language != "" {
+		options.console.setLanguage(selection.Language)
+	}
 	if err := launcher.SaveMode(configPath, selection.Mode); err != nil {
 		slog.Debug("Could not save the launcher mode", diagnostics.Error(err))
-	}
-	if selection.Mode == launcher.ModeSite {
-		config.Site = selection.Site
-	} else {
-		config.LocalAccessPassword = selection.LocalAccessPassword
 	}
 	options.Local = selection.Mode == launcher.ModeLocal
 	options.Link = selection.Mode == launcher.ModeLink
@@ -286,60 +359,50 @@ func runLauncher(
 	if selection.LANAddress != nil {
 		options.LANAddress = *selection.LANAddress
 	}
-	if err = configureDiagnostics(&options, config); err != nil {
-		launch.SetResult("", err)
-		<-launch.Handled()
-		return err
-	}
-	if err = appconfig.Save(configPath, config); err != nil {
+	selectedConfig, err := updateConfig(func(next *appconfig.Config) {
+		next.LocalAccessPassword = selection.LocalAccessPassword
+	})
+	if err != nil {
 		err = fmt.Errorf("Piik App configuration could not be saved: %w", err)
-		launch.SetResult("", err)
-		<-launch.Handled()
-		return err
+		return finishRoom(err)
 	}
-	control.SetAllowedOrigins(allowedOrigins(config.Site, options.Port))
-	options.DisableBrowser = true
+	if err = configureDiagnostics(&options, selectedConfig); err != nil {
+		return finishRoom(err)
+	}
+	if !directRoom {
+		options.DisableBrowser = true
+	}
 	ready := make(chan string, 1)
-	options.Ready = func(target string) { ready <- target }
+	onReady := options.Ready
+	options.Ready = func(target string) {
+		if onReady != nil {
+			onReady(target)
+		}
+		ready <- target
+	}
 	runtimeContext, cancelRuntime := context.WithCancel(ctx)
 	runtimeDone := make(chan struct{})
 	var runtimeErr error
 	go func() {
-		runtimeErr = runConfigured(runtimeContext, options, config, control)
+		runtimeErr = runLocal(runtimeContext, options, selectedConfig, control)
 		close(runtimeDone)
 	}()
-	defer func() {
-		cancelRuntime()
-		<-runtimeDone
-		returnedErr = errors.Join(returnedErr, runtimeErr)
-	}()
-
+	var exitErr error
 	select {
 	case target := <-ready:
 		launch.SetResult(target, nil)
+		select {
+		case <-runtimeDone:
+		case exitErr = <-launch.Done():
+		case <-ctx.Done():
+		}
 	case <-runtimeDone:
-		launch.SetResult("", runtimeErr)
-		<-launch.Handled()
-		return nil
 	case <-ctx.Done():
 		launch.SetResult("", ctx.Err())
-		return nil
 	}
-
-	select {
-	case <-launch.Handled():
-		_ = launch.Close()
-	case <-runtimeDone:
-		return nil
-	case <-ctx.Done():
-		return nil
-	}
-	select {
-	case <-runtimeDone:
-		return nil
-	case <-ctx.Done():
-		return nil
-	}
+	cancelRuntime()
+	<-runtimeDone
+	return finishRoom(errors.Join(exitErr, runtimeErr))
 }
 
 func applyMode(config appconfig.Config, options Options) (appconfig.Config, error) {
@@ -394,11 +457,7 @@ func openDiagnostics(directory string) (*diagnostics.Recorder, error) {
 	return diagnostics.Open(filepath.Join(cache, "Piik", "logs"), "client", BuildRevision)
 }
 
-// runSite opens the configured Piik Site in the Browser and waits for the
-// loopback server, which is the only thing this mode owns. It takes no context:
-// cancellation reaches it through control.Done().
-func runSite(site string, options Options, control *loopback.Server) error {
-	var err error
+func openSite(site string, options Options) {
 	slog.Debug("piik-client", "event", "mode", "mode", "site")
 	targetURL := launchURL(site)
 	view := consoleView{mode: "site", state: "ready", entry: targetURL}
@@ -408,14 +467,11 @@ func runSite(site string, options Options, control *loopback.Server) error {
 	}
 	if !options.DisableBrowser {
 		options.console.openBrowser(targetURL)
-	} else if options.Ready != nil {
+	}
+	if options.Ready != nil {
 		options.Ready(targetURL)
 	}
 	slog.Debug("piik-client", "event", "site-ready")
-	if err = <-control.Done(); err != nil {
-		return fmt.Errorf("Piik App native control stopped unexpectedly: %w", err)
-	}
-	return nil
 }
 
 func runLocal(ctx context.Context, options Options, config appconfig.Config,
@@ -526,7 +582,8 @@ func runLocal(ctx context.Context, options Options, config appconfig.Config,
 	options.console.show(view)
 	if !options.DisableBrowser {
 		options.console.openBrowser(launchURL)
-	} else if options.Ready != nil {
+	}
+	if options.Ready != nil {
 		options.Ready(launchURL)
 	}
 	var tunnelDone <-chan struct{}
@@ -621,29 +678,39 @@ func discoverNativeMedia(ctx context.Context, configuredPath string) nativeRunti
 		captureProcess: path,
 		capture:        capabilities,
 		capabilities: loopback.NativeMediaCapabilities{
-			ReceiverReuse:        true,
-			Video:                summary.Video,
-			CaptureBorderControl: summary.CaptureBorderControl,
-			Microphone:           summary.Microphone,
-			ProcessAudio:         summary.ProcessAudio,
-			SystemAudio:          summary.SystemAudio,
-			HardwareH264:         summary.HardwareH264,
-			SoftwareVP8:          summary.SoftwareVP8,
+			MaxVideoResolution: protocol.QualityResolution{
+				Width: nativecapture.MaxVideoDimension, Height: nativecapture.MaxVideoDimension,
+			},
+			MaxVideoPixels:               nativecapture.MaxVideoPixels,
+			MaxVideoMacroblocksPerSecond: nativecapture.MaxVideoMacroblocksPerSecond,
+			MaxVideoFramerate:            nativecapture.MaxVideoFramerate,
+			MaxVideoBitrate:              nativecapture.MaxVideoBitrate,
+			MaxAudioBitrate:              nativeaudio.MaxSendBitrate,
+			ReceiverReuse:                true,
+			Video:                        summary.Video,
+			CaptureBorderControl:         summary.CaptureBorderControl,
+			Microphone:                   summary.Microphone,
+			ProcessAudio:                 summary.ProcessAudio,
+			ProcessAudioExclusion:        summary.ProcessAudioExclusion,
+			SystemAudio:                  summary.SystemAudio,
+			HardwareH264:                 summary.HardwareH264,
+			SoftwareVP8:                  summary.SoftwareVP8,
 		},
 	}
 }
 
 // localSTUNURLs is the Local room authority's ICE configuration. Only --link
 // has a public path, so only --link configures public STUN and the bounded NAT
-// prediction survey. The lists are literals on purpose: a gate that sets
-// STUN_URLS is configuring the App's own Pion edge, and that value must not
-// reach the room server (which is why serverconfig.Local reads no environment).
+// prediction survey. Native edges receive ICE configuration from that authority;
+// serverconfig.Local deliberately does not inherit Hosted environment settings.
+// All three destinations also serve ordinary discovery: disabling prediction
+// must not make public-link ICE depend on a single STUN operator.
 func localSTUNURLs(link bool) (stunURLs []string, natPredictionSTUNURLs []string) {
 	if !link {
 		return nil, nil
 	}
-	return []string{publicSTUNURL},
-		[]string{publicNATPredictionSTUNURLA, publicNATPredictionSTUNURLB}
+	return []string{publicSTUNURL, publicFallbackSTUNURLA, publicFallbackSTUNURLB},
+		[]string{publicFallbackSTUNURLA, publicFallbackSTUNURLB}
 }
 
 // endLocalServer is step 1 of the ADR-0010 item 12 unwind: every room ends,

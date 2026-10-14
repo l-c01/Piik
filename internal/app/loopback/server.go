@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	appconfig "github.com/TNTcraftHIM/Piik/internal/app/config"
+	"github.com/TNTcraftHIM/Piik/internal/server/protocol"
 	"github.com/coder/websocket"
 )
 
@@ -29,12 +31,13 @@ const (
 )
 
 type Options struct {
-	PortStart      int
-	PortEnd        int
-	AllowedOrigins []string
-	NativeMedia    NativeMediaCapabilities
-	NewControl     func() ControlSession
-	Presentation   func(language string)
+	PortStart         int
+	PortEnd           int
+	AllowedOrigins    []string
+	NativeMedia       NativeMediaCapabilities
+	NewControl        func() ControlSession
+	Presentation      func(language string)
+	QualityPreference *appconfig.QualityPreference
 }
 
 type ControlSession interface {
@@ -51,6 +54,9 @@ type ControlSession interface {
 type ControlEvent struct {
 	Value   any
 	Current func() bool
+	// BeforeWrite releases an operation's admission before its ACK can trigger
+	// the next command. It must not block on I/O or send another event.
+	BeforeWrite func()
 }
 
 type Endpoint struct {
@@ -61,43 +67,62 @@ type Endpoint struct {
 }
 
 type Health struct {
-	Protocol      int                     `json:"protocol"`
-	Service       string                  `json:"service"`
-	Port          int                     `json:"port"`
-	InstanceToken string                  `json:"instanceToken"`
-	NativeMedia   NativeMediaCapabilities `json:"nativeMedia"`
+	Protocol          int                     `json:"protocol"`
+	Service           string                  `json:"service"`
+	Port              int                     `json:"port"`
+	InstanceToken     string                  `json:"instanceToken"`
+	NativeMedia       NativeMediaCapabilities `json:"nativeMedia"`
+	QualityPreference bool                    `json:"qualityPreference,omitempty"`
 }
 
 type NativeMediaCapabilities struct {
-	ReceiverReuse        bool `json:"receiverReuse,omitempty"`
-	Video                bool `json:"video"`
-	CaptureBorderControl bool `json:"captureBorderControl,omitempty"`
-	Microphone           bool `json:"microphone,omitempty"`
-	ProcessAudio         bool `json:"processAudio"`
-	SystemAudio          bool `json:"systemAudio"`
-	HardwareH264         bool `json:"hardwareH264"`
-	SoftwareVP8          bool `json:"softwareVP8"`
+	MaxVideoResolution           protocol.QualityResolution `json:"maxVideoResolution,omitzero"`
+	MaxVideoPixels               int                        `json:"maxVideoPixels,omitempty"`
+	MaxVideoMacroblocksPerSecond int                        `json:"maxVideoMacroblocksPerSecond,omitempty"`
+	MaxVideoFramerate            int                        `json:"maxVideoFramerate,omitempty"`
+	MaxVideoBitrate              int                        `json:"maxVideoBitrate,omitempty"`
+	MaxAudioBitrate              int                        `json:"maxAudioBitrate,omitempty"`
+	ReceiverReuse                bool                       `json:"receiverReuse,omitempty"`
+	Video                        bool                       `json:"video"`
+	CaptureBorderControl         bool                       `json:"captureBorderControl,omitempty"`
+	Microphone                   bool                       `json:"microphone,omitempty"`
+	ProcessAudio                 bool                       `json:"processAudio"`
+	ProcessAudioExclusion        bool                       `json:"processAudioExclusion,omitempty"`
+	SystemAudio                  bool                       `json:"systemAudio"`
+	HardwareH264                 bool                       `json:"hardwareH264"`
+	SoftwareVP8                  bool                       `json:"softwareVP8"`
 }
 
 type Server struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	listener       net.Listener
-	httpServer     *http.Server
-	endpoint       Endpoint
-	allowedOrigins []string
-	nativeMedia    NativeMediaCapabilities
-	newControl     func() ControlSession
-	presentation   func(string)
-	done           chan error
+	ctx               context.Context
+	cancel            context.CancelFunc
+	listener          net.Listener
+	httpServer        *http.Server
+	endpoint          Endpoint
+	allowedOrigins    []string
+	nativeMedia       NativeMediaCapabilities
+	newControl        func() ControlSession
+	presentation      func(string)
+	qualityPreference *appconfig.QualityPreference
+	connectURL        string
+	done              chan error
 
 	mu          sync.Mutex
-	connections map[*websocket.Conn]struct{}
-	claimed     int
+	connections map[*controlConnection]struct{}
 	closed      bool
 	controls    sync.WaitGroup
 	closeOnce   sync.Once
 	closeErr    error
+}
+
+// Claims start before the WebSocket upgrade so revocation also retires a
+// pending handshake, even if that same origin is approved again later.
+type controlConnection struct {
+	origin string
+	ctx    context.Context
+	cancel context.CancelFunc
+	socket *websocket.Conn
+	done   chan struct{}
 }
 
 func Start(parent context.Context, options Options) (*Server, error) {
@@ -128,12 +153,13 @@ func Start(parent context.Context, options Options) (*Server, error) {
 			Port:          address.Port,
 			InstanceToken: instanceToken,
 		},
-		allowedOrigins: normalizedOrigins(options.AllowedOrigins),
-		nativeMedia:    options.NativeMedia,
-		newControl:     options.NewControl,
-		presentation:   options.Presentation,
-		done:           make(chan error, 1),
-		connections:    make(map[*websocket.Conn]struct{}),
+		allowedOrigins:    normalizedOrigins(options.AllowedOrigins),
+		nativeMedia:       options.NativeMedia,
+		newControl:        options.NewControl,
+		presentation:      options.Presentation,
+		qualityPreference: options.QualityPreference,
+		done:              make(chan error, 1),
+		connections:       make(map[*controlConnection]struct{}),
 	}
 	server.httpServer = &http.Server{
 		Handler:           server,
@@ -156,9 +182,40 @@ func (server *Server) Done() <-chan error {
 	return server.done
 }
 
-func (server *Server) SetAllowedOrigins(origins []string) {
+func (server *Server) SetAllowedOrigins(origins []string) error {
 	server.mu.Lock()
 	server.allowedOrigins = normalizedOrigins(origins)
+	var retired []*controlConnection
+	for connection := range server.connections {
+		if connection.ctx.Err() != nil || !server.originAllowedLocked(connection.origin) {
+			connection.cancel()
+			retired = append(retired, connection)
+		}
+	}
+	server.mu.Unlock()
+	ctx, cancel := context.WithTimeout(server.ctx, shutdownTimeout)
+	defer cancel()
+	for _, connection := range retired {
+		// A cancelled claim cannot attach a socket after leaving the lock.
+		if connection.socket != nil {
+			_ = connection.socket.CloseNow()
+		}
+	}
+	for _, connection := range retired {
+		select {
+		case <-connection.done:
+		case <-ctx.Done():
+			// Permission already changed. Never restore a revoked origin because
+			// one of its media resources is slow to close.
+			return errors.New("App is still releasing the previous site's media; try again shortly")
+		}
+	}
+	return nil
+}
+
+func (server *Server) SetConnectURL(value string) {
+	server.mu.Lock()
+	server.connectURL = value
 	server.mu.Unlock()
 }
 
@@ -168,7 +225,10 @@ func (server *Server) Close() error {
 		server.closed = true
 		connections := make([]*websocket.Conn, 0, len(server.connections))
 		for connection := range server.connections {
-			connections = append(connections, connection)
+			connection.cancel()
+			if connection.socket != nil {
+				connections = append(connections, connection.socket)
+			}
 		}
 		server.mu.Unlock()
 		server.cancel()
@@ -205,6 +265,10 @@ func (server *Server) serve() {
 }
 
 func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	if request.URL.Path == "/connect-discovery" {
+		server.handleConnectDiscovery(response, request)
+		return
+	}
 	if !server.requestAllowed(response, request) {
 		return
 	}
@@ -215,9 +279,53 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		server.handleControl(response, request)
 	case "/presentation":
 		server.handlePresentation(response, request)
+	case "/quality-preference":
+		server.handleQualityPreference(response, request)
 	default:
 		http.NotFound(response, request)
 	}
+}
+
+// Discovery is the only cross-origin endpoint available before local approval.
+// It exposes process identity and its local approval page, never capabilities,
+// source lists, settings, or control access. A GET has no side effects.
+func (server *Server) handleConnectDiscovery(response http.ResponseWriter, request *http.Request) {
+	if !server.hostAllowed(request.Host) {
+		http.NotFound(response, request)
+		return
+	}
+	origin := request.Header.Get("Origin")
+	normalized, err := appconfig.NormalizeSite(origin)
+	if err != nil || origin == "" || normalized != origin {
+		http.Error(response, "forbidden", http.StatusForbidden)
+		return
+	}
+	response.Header().Set("Access-Control-Allow-Origin", origin)
+	response.Header().Add("Vary", "Origin")
+	response.Header().Set("Cache-Control", "no-store")
+	if request.Method == http.MethodOptions {
+		response.Header().Set("Access-Control-Allow-Methods", http.MethodGet)
+		allowPrivateNetwork(response, request)
+		response.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", "GET, OPTIONS")
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server.mu.Lock()
+	connectURL := server.connectURL
+	server.mu.Unlock()
+	if connectURL == "" {
+		http.NotFound(response, request)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{
+		"protocol": ProtocolVersion, "service": ServiceName,
+		"port": server.endpoint.Port, "instanceToken": server.endpoint.InstanceToken,
+		"connectURL": connectURL,
+	})
 }
 
 func (server *Server) handlePresentation(response http.ResponseWriter, request *http.Request) {
@@ -264,11 +372,12 @@ func (server *Server) handleHealth(response http.ResponseWriter, request *http.R
 	}
 	response.Header().Set("Cache-Control", "no-store")
 	writeJSON(response, http.StatusOK, Health{
-		Protocol:      ProtocolVersion,
-		Service:       ServiceName,
-		Port:          server.endpoint.Port,
-		InstanceToken: server.endpoint.InstanceToken,
-		NativeMedia:   server.nativeMedia,
+		Protocol:          ProtocolVersion,
+		Service:           ServiceName,
+		Port:              server.endpoint.Port,
+		InstanceToken:     server.endpoint.InstanceToken,
+		NativeMedia:       server.nativeMedia,
+		QualityPreference: server.qualityPreference != nil,
 	})
 }
 
@@ -284,15 +393,16 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !server.claimConnection() {
+	claim := server.claimConnection(request.Header.Get("Origin"))
+	if claim == nil {
 		http.Error(response, "native control capacity is occupied", http.StatusConflict)
 		return
 	}
 	var connection *websocket.Conn
-	defer func() { server.releaseConnection(connection) }()
+	defer server.releaseConnection(claim)
 	expectedSubprotocol := ControlSubprotocol + "." + server.endpoint.InstanceToken
 	var err error
-	connection, err = websocket.Accept(response, request, &websocket.AcceptOptions{
+	connection, err = websocket.Accept(response, request.WithContext(claim.ctx), &websocket.AcceptOptions{
 		Subprotocols:   []string{expectedSubprotocol},
 		OriginPatterns: server.originPatterns(),
 	})
@@ -304,15 +414,18 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 		closeControl(connection, "unsupported control protocol")
 		return
 	}
-	if !server.setConnection(connection) {
+	if !server.setConnection(claim, connection) {
 		return
 	}
 	connection.SetReadLimit(MaxControlMessageBytes)
 
-	helloContext, cancelHello := context.WithTimeout(server.ctx, helloTimeout)
+	helloContext, cancelHello := context.WithTimeout(claim.ctx, helloTimeout)
 	messageType, payload, err := connection.Read(helloContext)
 	cancelHello()
-	if err != nil || messageType != websocket.MessageText {
+	if err != nil {
+		return
+	}
+	if messageType != websocket.MessageText {
 		closeControl(connection, "hello frame required")
 		return
 	}
@@ -333,6 +446,9 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 			if event.Current != nil && !event.Current() {
 				return nil
 			}
+			if event.BeforeWrite != nil {
+				event.BeforeWrite()
+			}
 			value = event.Value
 		}
 		encoded, encodeErr := encodeMessage(value)
@@ -341,13 +457,12 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 		}
 		return connection.Write(ctx, websocket.MessageText, encoded)
 	}
-	if err = write(server.ctx, controlMessage{
+	if err = write(claim.ctx, controlMessage{
 		Version: ProtocolVersion, ID: message.ID, Type: "ready",
 	}); err != nil {
 		return
 	}
-	controlContext, cancelControl := context.WithCancel(server.ctx)
-	defer cancelControl()
+	controlContext, cancelControl := claim.ctx, claim.cancel
 	var extension ControlSession
 	if server.newControl != nil {
 		extension = server.newControl()
@@ -387,11 +502,17 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 		}
 	}()
 	for {
+		if controlContext.Err() != nil {
+			return
+		}
 		select {
 		case <-controlContext.Done():
 			return
 		case payload = <-reads:
 			messageType = websocket.MessageText
+		}
+		if controlContext.Err() != nil {
+			return
 		}
 		message, err = decodeEnvelope(payload)
 		if err != nil {
@@ -400,11 +521,13 @@ func (server *Server) handleControl(response http.ResponseWriter, request *http.
 		}
 		if message.Type == "ping" {
 			strict, strictErr := decodeRequest(payload)
-			if strictErr != nil || validatePing(strict) != nil ||
-				write(controlContext, controlMessage{
-					Version: ProtocolVersion, ID: message.ID, Type: "pong",
-				}) != nil {
+			if strictErr != nil || validatePing(strict) != nil {
 				closeControl(connection, "invalid control message")
+				return
+			}
+			if write(controlContext, controlMessage{
+				Version: ProtocolVersion, ID: message.ID, Type: "pong",
+			}) != nil {
 				return
 			}
 			continue
@@ -474,6 +597,20 @@ func (server *Server) allowedOrigin(origin string) bool {
 	return false
 }
 
+// Caller holds mu. Empty Origin is reserved for per-user native tooling;
+// browsers always send it when opening a cross-origin control connection.
+func (server *Server) originAllowedLocked(origin string) bool {
+	if origin == "" || server.localOrigin(origin) {
+		return true
+	}
+	for _, allowed := range server.allowedOrigins {
+		if sameOrigin(origin, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
 func (server *Server) hostAllowed(host string) bool {
 	if host == server.endpoint.Host {
 		return true
@@ -482,40 +619,40 @@ func (server *Server) hostAllowed(host string) bool {
 }
 
 func (server *Server) localOrigin(origin string) bool {
-	parsed, err := url.Parse(origin)
-	return err == nil && parsed.Scheme == "http" &&
-		parsed.Port() == strconv.Itoa(server.endpoint.Port) &&
-		(strings.EqualFold(parsed.Hostname(), "localhost") ||
-			strings.EqualFold(parsed.Hostname(), "127.0.0.1"))
+	port := strconv.Itoa(server.endpoint.Port)
+	return sameOrigin(origin, "http://127.0.0.1:"+port) || sameOrigin(origin, "http://localhost:"+port)
 }
 
-func (server *Server) claimConnection() bool {
+func (server *Server) claimConnection(origin string) *controlConnection {
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if server.closed || server.claimed >= maxControlSessions {
-		return false
+	if server.closed || len(server.connections) >= maxControlSessions || !server.originAllowedLocked(origin) {
+		return nil
 	}
-	server.claimed++
+	ctx, cancel := context.WithCancel(server.ctx)
+	claim := &controlConnection{origin: origin, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	server.connections[claim] = struct{}{}
 	server.controls.Add(1)
-	return true
+	return claim
 }
 
-func (server *Server) setConnection(connection *websocket.Conn) bool {
+func (server *Server) setConnection(claim *controlConnection, connection *websocket.Conn) bool {
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if server.closed {
+	if server.closed || claim.ctx.Err() != nil {
 		return false
 	}
-	server.connections[connection] = struct{}{}
+	claim.socket = connection
 	return true
 }
 
-func (server *Server) releaseConnection(connection *websocket.Conn) {
+func (server *Server) releaseConnection(connection *controlConnection) {
+	connection.cancel()
 	server.mu.Lock()
 	delete(server.connections, connection)
-	server.claimed--
 	server.mu.Unlock()
 	server.controls.Done()
+	close(connection.done)
 }
 
 func listenInRange(bindAddress string, start, end int) (net.Listener, error) {

@@ -42,14 +42,14 @@ it("exhausts each pool before repeating and avoids repeating across a round boun
   expect([single(), single()]).toEqual(["Only", "Only"]);
 });
 
-it("advances on the shared eight-second cadence", () => {
+it("advances on the shared fifteen-second waiting cadence", () => {
   const tick = vi.fn();
   stop = startTextRotation(tick);
-  vi.advanceTimersByTime(7_999);
+  vi.advanceTimersByTime(14_999);
   expect(tick).not.toHaveBeenCalled();
   vi.advanceTimersByTime(1);
   expect(tick).toHaveBeenCalledTimes(1);
-  vi.advanceTimersByTime(16_000);
+  vi.advanceTimersByTime(30_000);
   expect(tick).toHaveBeenCalledTimes(3);
 });
 
@@ -63,7 +63,7 @@ it("does not consume hidden entries and resumes with a full reading interval", (
   vi.advanceTimersByTime(60_000);
   page.visibilityState = "visible";
   page.dispatchEvent(new Event("visibilitychange"));
-  vi.advanceTimersByTime(7_999);
+  vi.advanceTimersByTime(14_999);
   expect(tick).not.toHaveBeenCalled();
   vi.advanceTimersByTime(1);
   expect(tick).toHaveBeenCalledTimes(1);
@@ -76,7 +76,7 @@ it("honors reduced motion at entry and when the preference changes", () => {
   expect(vi.getTimerCount()).toBe(0);
   motion.matches = false;
   motion.dispatchEvent(new Event("change"));
-  vi.advanceTimersByTime(8_000);
+  vi.advanceTimersByTime(15_000);
   expect(tick).toHaveBeenCalledTimes(1);
   motion.matches = true;
   motion.dispatchEvent(new Event("change"));
@@ -84,7 +84,7 @@ it("honors reduced motion at entry and when the preference changes", () => {
   expect(tick).toHaveBeenCalledTimes(1);
   motion.matches = false;
   motion.dispatchEvent(new Event("change"));
-  vi.advanceTimersByTime(7_999);
+  vi.advanceTimersByTime(14_999);
   expect(tick).toHaveBeenCalledTimes(1);
   vi.advanceTimersByTime(1);
   expect(tick).toHaveBeenCalledTimes(2);
@@ -92,24 +92,40 @@ it("honors reduced motion at entry and when the preference changes", () => {
 
 it("pauses offscreen surfaces and releases all listeners at retirement", () => {
   const tick = vi.fn();
+  const activity = vi.fn();
   const show = (visible: boolean) => intersect([
     { isIntersecting: visible, intersectionRatio: visible ? 1 : 0 } as IntersectionObserverEntry,
   ], {} as IntersectionObserver);
-  stop = startTextRotation(tick, {} as Element);
+  stop = startTextRotation(tick, {} as Element, activity);
   expect(vi.getTimerCount()).toBe(0);
+  expect(activity).toHaveBeenLastCalledWith(false);
   intersect([
     { isIntersecting: false, intersectionRatio: 0 } as IntersectionObserverEntry,
     { isIntersecting: true, intersectionRatio: 1 } as IntersectionObserverEntry,
   ], {} as IntersectionObserver); // One notification can contain several queued states.
-  vi.advanceTimersByTime(4_000);
+  expect(activity).toHaveBeenLastCalledWith(true);
+  page.visibilityState = "hidden";
+  page.dispatchEvent(new Event("visibilitychange"));
+  expect(activity).toHaveBeenLastCalledWith(false);
+  page.visibilityState = "visible";
+  page.dispatchEvent(new Event("visibilitychange"));
+  expect(activity).toHaveBeenLastCalledWith(true);
+  motion.matches = true;
+  motion.dispatchEvent(new Event("change"));
+  expect(activity).toHaveBeenLastCalledWith(false);
+  motion.matches = false;
+  motion.dispatchEvent(new Event("change"));
+  expect(activity).toHaveBeenLastCalledWith(true);
+  vi.advanceTimersByTime(7_000);
   show(true); // A repeated observation must not reset the running clock.
-  vi.advanceTimersByTime(4_000);
+  vi.advanceTimersByTime(8_000);
   expect(tick).toHaveBeenCalledTimes(1);
   show(false);
+  expect(activity).toHaveBeenLastCalledWith(false);
   vi.advanceTimersByTime(60_000);
   expect(tick).toHaveBeenCalledTimes(1);
   show(true);
-  vi.advanceTimersByTime(7_999);
+  vi.advanceTimersByTime(14_999);
   expect(tick).toHaveBeenCalledTimes(1);
   vi.advanceTimersByTime(1);
   expect(tick).toHaveBeenCalledTimes(2);
@@ -120,5 +136,17 @@ it("pauses offscreen surfaces and releases all listeners at retirement", () => {
   page.dispatchEvent(new Event("visibilitychange"));
   motion.dispatchEvent(new Event("change"));
   expect(vi.getTimerCount()).toBe(0);
+  expect(activity).toHaveBeenLastCalledWith(false);
   expect(disconnect).toHaveBeenCalled();
+});
+
+it("observes a static welcome's visibility without running a rotation timer", () => {
+  const activity = vi.fn();
+  stop = startTextRotation(undefined, {} as Element, activity);
+  intersect([{ isIntersecting: true, intersectionRatio: 1 } as IntersectionObserverEntry], {} as IntersectionObserver);
+  expect(activity).toHaveBeenLastCalledWith(true);
+  expect(vi.getTimerCount()).toBe(0);
+  page.visibilityState = "hidden";
+  page.dispatchEvent(new Event("visibilitychange"));
+  expect(activity).toHaveBeenLastCalledWith(false);
 });

@@ -3,6 +3,7 @@ import { copyFile, mkdir, mkdtemp } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fittedCaptureSize, matchesCaptureSize } from "./media-gate-geometry";
 
 import {
   CdpConnection,
@@ -266,7 +267,7 @@ async function browserMediaGate(input: {
   sourceTitle: string;
   sourceKind: "window" | "display";
   stunUrls: string;
-}): Promise<MediaEvidence> {
+}, geometry: { fit: typeof fittedCaptureSize; matches: typeof matchesCaptureSize }): Promise<MediaEvidence> {
   let socket: WebSocket | null = null;
   const peers: RTCPeerConnection[] = [];
   const result: MediaEvidence = {
@@ -355,7 +356,7 @@ async function browserMediaGate(input: {
           rejectRequest(new Error("Native request timed out: " + type));
         }, 8_000);
         pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
-        socket!.send(JSON.stringify({ version: 9, id, type, ...fields }));
+        socket!.send(JSON.stringify({ version: 10, id, type, ...fields }));
       });
     };
     socket.onmessage = (event) => {
@@ -436,11 +437,11 @@ async function browserMediaGate(input: {
       encoderIndex: encoder.index,
       edgeCapacity: 2,
       profile: {
-        resolution: "720p",
+        resolution: { width: 2560, height: 1440 },
         maxFramerate: 30,
         maxBitrate: 3_000_000,
-        degradationPreference: "balanced",
-        screenAudioQuality: "music",
+        degradationPreference: "maintain-resolution",
+        maxAudioBitrate: 128000,
       },
     });
     if (started.shareId !== shareId || started.audio !== result.audioAvailable) {
@@ -495,6 +496,11 @@ async function browserMediaGate(input: {
         await peer.addIceCandidate(candidate);
       }
       const answer = await peer.createAnswer();
+      // This fixture is an unchanged-Opus receiver, like the product Viewer.
+      // Declare its receive capacity; the offer's fmtp is the opposite direction.
+      const opus = answer.sdp?.match(/^a=rtpmap:(\d+) opus\/48000\/2\r?$/m)?.[1];
+      if (opus) answer.sdp = answer.sdp!.replace(new RegExp(`^(a=fmtp:${opus} [^\\r\\n]*)`, "m"),
+        "$1;stereo=1;maxaveragebitrate=510000");
       await peer.setLocalDescription(answer);
       await request("edge-answer", {
         shareId,
@@ -552,16 +558,16 @@ async function browserMediaGate(input: {
         ? Math.min(...result.edgeAudioBytes)
         : 0;
       const videos = [...edges.values()].map((edge) => edge.video);
-      result.width = videos.every((video) => video.videoWidth === 1280) ? 1280 : 0;
-      result.height = videos.every((video) => video.videoHeight === 720) ? 720 : 0;
+      result.width = videos.every((video) => video.videoWidth === videos[0]!.videoWidth && video.videoWidth <= 2560) ? videos[0]!.videoWidth : 0;
+      result.height = videos.every((video) => video.videoHeight === videos[0]!.videoHeight && video.videoHeight <= 1440) ? videos[0]!.videoHeight : 0;
       if (
         result.captureActive &&
         result.connected &&
         result.frames >= 30 &&
         (!result.audioAvailable ||
           (result.audioPackets > 10 && result.audioEnergy > 0)) &&
-        result.width === 1280 &&
-        result.height === 720 &&
+        result.width >= 320 &&
+        result.height >= 240 &&
         result.nativeCandidateTypes.includes("srflx")
       ) {
         break;
@@ -574,25 +580,28 @@ async function browserMediaGate(input: {
       result.frames < 30 ||
       (result.audioAvailable &&
         (result.audioPackets <= 10 || result.audioEnergy <= 0)) ||
-      result.width !== 1280 ||
-      result.height !== 720 ||
+      result.width < 320 ||
+      result.height < 240 ||
       !result.nativeCandidateTypes.includes("srflx")
     ) {
       throw new Error("Native H264 did not reach decoded Browser video");
     }
 
     const videos = [...edges.values()].map((edge) => edge.video);
+    const sourceSize = { width: result.width, height: result.height };
+    const liveSize = geometry.fit(sourceSize, 1280, 720);
+    const pausedSize = geometry.fit(sourceSize, 854, 480);
     const framesBeforeLiveUpdate = Math.min(
       ...videos.map((video) => video.getVideoPlaybackQuality().totalVideoFrames),
     );
     const liveUpdate = await request("update-share", {
       shareId,
       profile: {
-        resolution: "1440p",
+        resolution: { width: 1280, height: 720 },
         maxFramerate: 60,
         maxBitrate: 12_000_000,
         degradationPreference: "maintain-framerate",
-        screenAudioQuality: "very-high",
+        maxAudioBitrate: 192000,
       },
     });
     const liveDeadline = performance.now() + 15_000;
@@ -601,7 +610,7 @@ async function browserMediaGate(input: {
         ...videos.map((video) => video.getVideoPlaybackQuality().totalVideoFrames),
       );
       result.liveProfileUpdated = liveUpdate.type === "share-updated" &&
-        videos.every((video) => video.videoWidth === 2560 && video.videoHeight === 1440) &&
+        videos.every((video) => geometry.matches(video.videoWidth, video.videoHeight, liveSize)) &&
         frames >= framesBeforeLiveUpdate + 10;
       if (result.liveProfileUpdated) break;
       await new Promise((resolveWait) => window.setTimeout(resolveWait, 100));
@@ -614,11 +623,11 @@ async function browserMediaGate(input: {
     const pausedUpdate = await request("update-share", {
       shareId,
       profile: {
-        resolution: "480p",
+        resolution: { width: 854, height: 480 },
         maxFramerate: 15,
         maxBitrate: 2_000_000,
         degradationPreference: "maintain-resolution",
-        screenAudioQuality: "saver",
+        maxAudioBitrate: 64000,
       },
     });
     const framesBeforeResume = Math.min(
@@ -631,12 +640,12 @@ async function browserMediaGate(input: {
         ...videos.map((video) => video.getVideoPlaybackQuality().totalVideoFrames),
       );
       result.pausedProfileUpdated = pausedUpdate.type === "share-updated" &&
-        videos.every((video) => video.videoWidth === 854 && video.videoHeight === 480) &&
+        videos.every((video) => geometry.matches(video.videoWidth, video.videoHeight, pausedSize)) &&
         frames >= framesBeforeResume + 10;
       if (result.pausedProfileUpdated) {
         result.frames = frames;
-        result.width = 854;
-        result.height = 480;
+        result.width = videos[0]!.videoWidth;
+        result.height = videos[0]!.videoHeight;
         break;
       }
       await new Promise((resolveWait) => window.setTimeout(resolveWait, 100));
@@ -901,7 +910,7 @@ async function main(): Promise<void> {
         sourceTitle: SOURCE_TITLE,
         sourceKind,
         stunUrls: GATE_STUN_URLS,
-      }) + "))((target) => target)",
+      }) + `, { fit: ${fittedCaptureSize.toString()}, matches: ${matchesCaptureSize.toString()} }))((target) => target)`,
       Date.now() + 70_000,
     );
     if (media.error) throw new Error(media.error);
@@ -925,7 +934,7 @@ async function main(): Promise<void> {
     (!media.audioAvailable ||
       (media.audioPackets > 10 && media.audioEnergy > 0)) &&
     media.liveProfileUpdated && media.pausedProfileUpdated &&
-    media.width === 854 && media.height === 480 &&
+    media.width > 0 && media.width <= 854 && media.height > 0 && media.height <= 480 &&
     media.nativeCandidateTypes.includes("srflx") &&
     cleanup.browserExited && cleanup.nativeExited && cleanup.serverClosed &&
     cleanup.portsClosed && cleanup.profileRemoved;

@@ -212,6 +212,15 @@ The replaced local Group/
 Selection and receiving-PC sender-estimator registry are deleted, not retained
 as alternate implementations. There is no mirrored counter summing unused layers.
 
+Source subscription must retain layer discovery that happens during registration.
+LiveKit's `ReceiverBase.AddDownTrack` delivers initial layer metadata before
+registering the subscriber, leaving a notification gap. The shared Source
+refreshes that metadata after successful registration; DownTrack keeps its
+highest observed layers, so a concurrent newer notification cannot be undone.
+This boundary serves both Native outputs and SFU publication. A controlled
+discovery in that gap reproduces the failure without retries or network loss;
+it does not establish the cause of unmatched field reports.
+
 The parent reads child state at actual capture InputBegin. A controlled layer
 switch uses the existing DownTrack resync before outputs for that input, retaining
 its target; this prevents an old-layer packet winning the same presentation time.
@@ -223,8 +232,8 @@ input anchor, not independently to each encoder's completion time.
 
 Local capture replacement keeps its RTP source and cumulative counters while
 rebasing only the input packetizers. It must not also restart the RTP projector.
-Unconnected edges reserve capacity without asking for output. Existing audio
-settings or observed relay-audio bytes reserve that portion of the PC budget.
+Unconnected edges reserve child slots without asking for output. Video capacity
+comes from its tracked traffic; untracked audio must not be subtracted again.
 
 Capture producers now implement the coordinated v5 multi-output boundary below;
 the packaged runtime has not been physically accepted. A bounded real libvpx
@@ -386,19 +395,87 @@ fixes and demand hooks beyond a thin adapter; do not maintain both candidates.
 Keep the dependency behind a shared media package. For one video per connection,
 use the public provisional allocation primitives, with exact typed child state
 read by its parent; do not parse DebugInfo or run a second multi-track allocator.
-The candidate now uses LiveKit SendSideBWE and Prober through their public APIs.
-Pacing reuses the upstream queue with admission capped by the existing packet
-cache bound; canceled probe tickets remain charged until actually dequeued.
-The pinned Pion pacer's 1.5 headroom applies only to pacing, not codec or BWE
-budgets. Adapted probe lifecycle code retains Apache-2.0 attribution. Probe
+The candidate uses LiveKit SendSideBWE and Prober through their public APIs,
+with the [scoped measurement repair](../../internal/thirdparty/README.md#livekit-send-side-bandwidth-estimation).
+Packet sending uses the pinned [LiveKit transport's send-side BWE default](https://github.com/livekit/livekit/blob/v1.13.6/pkg/rtc/transport.go),
+`NoQueue`: an asynchronous writer without a second bitrate throttle on already
+encoded packets. Admission stays capped by the existing packet cache bound;
+canceled probe tickets remain charged until actually dequeued. Congestion
+estimation, probes and codec/allocation budgets retain their existing owners.
+Adapted probe lifecycle code retains Apache-2.0 attribution. Probe
 promotion requires the upstream validity criterion and non-congestion signal;
 an empty or inconclusive attempt cannot promote the estimator's initial ceiling.
 
-The explicit `TestTransportConstrainedDormantRecovery` virtual-network trace uses real
-Pion RTP/TWCC through 6 Mbps -> 500 kbps -> 6 Mbps shaping. It measured a minimum
-budget about 497 kbps, stopped the upper output, and restored sustained 1.20 Mbps
-after release. Recovery occurred about 4.4 seconds after release in the recorded
-run; this is a bounded local trace, not a success-rate or game-latency claim.
+#### Send Queue Recovery
+
+A bounded writer-stall control exposes a limitation in the former SFU queue:
+after the estimate falls from 500 to 8 kbps, only three of 32 already-encoded
+packets drain in two seconds. The upstream unthrottled writer drains the same
+input once the writer resumes. A separate real Windows VP8 codec and
+Native forwarding control reproduces stale decoded pictures after roughly one
+second of ordinary UDP loss; the packet-count cap alone does not prevent this.
+The [ordinary media controls](./nat-traversal.md#recovery-ownership-and-forwarding)
+retain the decoded-picture and address-change evidence boundary.
+
+Congestion callbacks could also promote the estimator's unmeasured 100 Mbps
+initial capacity while a probe was pending. Congestion now only reduces the
+committed budget; a valid completed non-congesting probe owns increases.
+Publication allocation and encoder input use that same committed video capacity.
+This follows the
+[upstream distinction between congestion events and completed probes](https://github.com/livekit/livekit/blob/v1.13.6/pkg/sfu/streamallocator/streamallocator.go),
+without introducing another estimator.
+
+Two upstream measurement defects also affect completed probes. The pinned
+[finalizer](https://github.com/livekit/livekit/blob/v1.13.6/pkg/sfu/bwe/sendsidebwe/congestion_detector.go)
+returns retained capacity, initially 100 Mbps, rather than the current probe's
+acknowledged rate; no feedback can also be classified as non-congesting. The
+[probe packet group](https://github.com/livekit/livekit/blob/v1.13.6/pkg/sfu/bwe/sendsidebwe/probe_packet_group.go)
+includes the transport's preceding idle interval in the new measurement window.
+An 800 kbps probe after five idle seconds therefore either promotes 100 Mbps or,
+with only the return-value correction, fails to restore the existing budget.
+The scoped repair returns only current probe evidence, marks invalid or
+unacknowledged probes inconclusive, and starts timing at the first acknowledged
+probe packet. Removing either correction fails the real-TWCC regression. These
+changes preserve upstream estimation, loss handling and probe scheduling.
+
+Real decode also exposed a packet-format mismatch at the shared writer:
+LiveKit 1.13.6 includes padding in its probe payload, while Pion SRTP serializes
+another block from `Header.PaddingSize`. An actual library probe therefore
+arrived with 255 bytes of apparent video payload plus 255 bytes of padding.
+The adapter now removes the already-included block only at the Pion write
+boundary; pacing and TWCC retain the intended packet size. Both publication
+and single-child forwarding use that boundary. The regression checks decoded
+RTP payload emptiness after SRTP delivery, rather than treating any received
+packet as valid video. The primary owners are
+[LiveKit probe construction](https://github.com/livekit/livekit/blob/v1.13.6/pkg/sfu/downtrack.go)
+and [Pion packet serialization](https://github.com/pion/rtp/blob/v1.10.5/packet.go).
+
+The explicit `TestTransportConstrainedDormantRecovery` virtual-network trace uses
+real Pion RTP/TWCC through 6 Mbps -> 500 kbps -> 6 Mbps shaping. The repaired
+library restores sustained 1.20 Mbps video after release, with a budget assertion
+that rejects the unmeasured initial capacity. Earlier passing recovery traces
+could promote 100 Mbps and do not establish correct budgeting. The SDK
+latency-aware queue requires an extra adapter and is not retained. Earlier
+flaky comparisons also registered TWCC twice on the receiver, duplicating
+feedback; those results do not rank the queues. Product receivers already use
+the single default interceptor owner.
+
+Live audio changes exposed a related scope mismatch: Piik's TWCC tracks only
+video, but the adapter deducted audio from that measured capacity and included
+audio in expected probe usage. After restoring 320 kbps Opus, this could remove
+an already recovered video layer on a healthy 6 Mbps link. The adapter now uses
+the measured video capacity directly, matching the upstream allocator's
+video-only usage accounting. Native and SFU share this rule; quality reports
+compare video capacity with video payload while retaining total traffic in
+diagnostics. Opus rate and transport behavior are unchanged. The retained
+network gate exercises video-only and real Opus 320/96/320 kbps cases, requiring
+sustained high video and decoded audio after recovery. The former subtraction
+fails a matched trace but can be masked by later probe traffic; a passing
+recovery alone does not establish correct accounting. This is not proof of
+perceptual audio quality or behavior on every physical network.
+
+No reset, retry owner or minimum quality is added. These are bounded local traces,
+not a field diagnosis, success-rate or game-latency claim.
 Ordinary focused checks cover NACK repair, no-RR probe admission, zero-write
 termination and exact shutdown. Before runtime cutover, complete actual codec,
 Browser and physical recovery checks rather than inferring them from this trace.
@@ -415,33 +492,21 @@ selectable only through real codec output and the normal library allocation.
 Configured ceilings are conservative and do not replace bandwidth probing;
 no cache of historical layer rates or additional polling owner is introduced.
 
-### Capture Contract For The Next Implementation
+### Capture Boundary
 
-Use the existing LiveKit 2.22.1 screen-share construction as the initial output
-set: original plus half-size at the same FPS, quarter bitrate with its 150 kbps
-floor. Align derived NV12 dimensions down to even values. The group supports up
-to three outputs, but this step does not invent a third product preset.
+Output construction follows the [media-quality owner](../standards/media-quality.md):
+original plus a half-size output at the same FPS, with lower bitrate bounded by
+the source ceiling. Derived NV12 dimensions round down to even values. The
+group's bounded output slots do not add product presets.
 
-The private capture command/probe contract advances to v5. Video arguments retain
-the source profile and append one `--output WIDTH HEIGHT FPS BITRATE` per output,
-ordered low to high. All current producers/readers change together, without v4
-fallback. Output profiles are codec bounds, not user preset choices.
-
-SMED v2 has a 32-byte big-endian header: magic[0:4], version[4], kind[5], flags[6],
-layer[7], timestamp100ns[8:16], duration100ns[16:24], width[24:26], height[26:28],
-payload length[28:32]. Video carries its output dimensions. PCM/status dimensions
-and layer are zero. Kind 5 is a zero-payload input-frame begin with dimensions/
-layer/flags zero and a valid source timestamp/duration; it precedes all outputs
-for that input even when the active prefix is zero. Kind 6 reports an unavailable
-output layer with a bounded UTF-8 diagnostic, zero timing/dimensions/flags.
-
-Both pipe directions use this envelope. Kind 7 carries one bounded ASCII control
-command (at most 64 bytes), with all other header fields zero: `Q`, `K layer`
-(`-1` means all outputs), `A activeCount`, `B layer bitrate`. Reuse the existing
-command grammar instead of mixing a line reader with binary video on stdin. Keyframe
-requests consumed at encode start are restored on failure; requests arriving
-during encoding must not be erased when an older keyframe completes. Control
-wakeup is I/O work, not another media-quality scheduler.
+The current [capture reader](../../internal/app/nativecapture/protocol.go) owns
+frame layout, kind-specific validation and allocation limits; [status](../status.md)
+owns the matched bundle's protocol versions. Both pipe directions use that framed
+boundary. Input-frame events precede per-output results, including when no output
+is active; a lower-output failure remains distinct from loss of the source.
+Keyframe requests consumed at encode start are restored on failure; requests
+arriving during encoding must survive an older keyframe completing. Control wakeup
+is I/O work, not another media-quality scheduler.
 
 Every slot owns its encoder/converter. Windows must retain one safe copy of the
 WGC input surface shared by slot workers, not reuse a returned frame-pool texture.

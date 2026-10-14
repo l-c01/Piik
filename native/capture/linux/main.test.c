@@ -1,7 +1,8 @@
-// build.sh --check uses synthetic GStreamer elements; no capture or codec is used.
+// build.sh --check uses synthetic video/GStreamer elements; no capture or codec is used.
 #define main capture_main
 #include "main.c"
 #undef main
+#include <gst/video/video.h>
 
 typedef struct { GstElement parent; guint bitrate; } FixtureEncoder;
 typedef struct { GstElementClass parent; } FixtureEncoderClass;
@@ -30,7 +31,7 @@ static void fixture_encoder_class_init(FixtureEncoderClass *klass) {
   object_class->set_property = fixture_set_property;
   object_class->get_property = fixture_get_property;
   g_object_class_install_property(object_class, 1,
-      g_param_spec_uint("bitrate", "Bitrate", "Bitrate in bps", 1000, 12000000,
+      g_param_spec_uint("bitrate", "Bitrate", "Bitrate in bps", 1000, 50000000,
                         3000000, G_PARAM_READWRITE | GST_PARAM_MUTABLE_PLAYING));
 }
 
@@ -62,8 +63,15 @@ static void check_encoder_admission_and_control(void) {
   gst_object_unref(encoder);
 }
 
+static gboolean capture_failure_timeout(gpointer data) {
+  (void)data;
+  g_error("capture failure was lost before the main loop started");
+  return G_SOURCE_REMOVE;
+}
+
 static void check_bus_error_retains_primary_cause(void) {
-  CaptureRun run = {.loop = g_main_loop_new(NULL, FALSE), .output_count = 1};
+  CaptureRun run = {.loop = g_main_loop_new(NULL, FALSE), .output_count = 1,
+                    .pipeline = gst_pipeline_new(NULL)};
   g_mutex_init(&run.lock);
   run.outputs[0].run = &run;
   run.outputs[0].encoder = gst_element_factory_make("identity", NULL);
@@ -85,9 +93,19 @@ static void check_bus_error_retains_primary_cause(void) {
   unlink(frame_path);
   g_free(frame_path);
   g_assert_cmpstr(run.failure, ==, error->message);
+  // Startup callbacks can fail before the bus watch/main loop is running.
+  // The recorded failure must still retire the pipeline once dispatch starts.
+  GstBus *bus = gst_element_get_bus(run.pipeline);
+  guint watch = gst_bus_add_watch(bus, bus_message, &run);
+  guint timeout = g_timeout_add(500, capture_failure_timeout, NULL);
+  g_main_loop_run(run.loop);
+  g_source_remove(timeout);
+  g_source_remove(watch);
+  gst_object_unref(bus);
   gst_message_unref(message);
   g_error_free(error);
   gst_object_unref(run.outputs[0].encoder);
+  gst_object_unref(run.pipeline);
   g_free(run.failure);
   g_main_loop_unref(run.loop);
   g_mutex_clear(&run.lock);
@@ -135,6 +153,151 @@ static void check_slot_profiles(void) {
   for (guint index = 0; index < run.output_count; ++index) {
     g_assert_false(run.outputs[index].enabled);
   }
+
+  char *numeric[] = {
+      "capture", "--capture-video", "picker", "1", "0", "0",
+      "--adapter-index", "0", "--mft-index", "0", "--width", "1920",
+      "--height", "1200", "--fps", "30", "--bitrate", "3000000",
+      "--preference", "balanced", "--codec", "h264", "--protocol-v7",
+      "--output", "1920", "1200", "30", "3000000"};
+  const struct { char *width; char *height; gboolean valid; } sizes[] = {
+      {"1920", "1200", TRUE}, {"720", "1280", TRUE}, {"4", "4", TRUE},
+      {"3840", "2160", TRUE}, {"2160", "3840", TRUE}, {"3000", "2764", TRUE},
+      {"0", "720", FALSE}, {"2", "720", FALSE}, {"1280", "2", FALSE},
+      {"1279", "720", FALSE}, {"1280", "719", FALSE},
+      {"5120", "1440", TRUE}, {"4096", "2304", TRUE},
+      {"8194", "100", FALSE}, {"5120", "2880", FALSE},
+      {"4096", "2306", FALSE}, {"6562", "1438", FALSE}};
+  for (guint index = 0; index < G_N_ELEMENTS(sizes); ++index) {
+    numeric[11] = numeric[24] = sizes[index].width;
+    numeric[13] = numeric[25] = sizes[index].height;
+    run = (CaptureRun){0};
+    g_assert_cmpint(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder), ==, sizes[index].valid);
+  }
+  numeric[11] = numeric[24] = "3840";
+  numeric[13] = numeric[25] = "2160";
+  numeric[15] = numeric[26] = "60";
+  run = (CaptureRun){0};
+  g_assert_true(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder));
+  numeric[15] = "30"; // Reject an excessive derived output independently.
+  g_assert_false(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder));
+  const struct { char *fps; char *bitrate; gboolean valid; } rates[] = {
+      {"1", "100000", TRUE}, {"5", "800000", TRUE}, {"60", "50000000", TRUE},
+      {"60", "240000000", TRUE}, {"65", "100000000", FALSE},
+      {"0", "100000", FALSE}, {"1", "99999", FALSE}, {"60", "240000001", FALSE}};
+  for (guint index = 0; index < G_N_ELEMENTS(rates); ++index) {
+    numeric[15] = numeric[26] = rates[index].fps;
+    numeric[17] = numeric[27] = rates[index].bitrate;
+    run = (CaptureRun){0};
+    g_assert_cmpint(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder), ==, rates[index].valid);
+  }
+  g_assert_false(valid_video_format(G_MAXUINT, G_MAXUINT, G_MAXUINT));
+  numeric[11] = numeric[24] = "1920";
+  numeric[13] = numeric[25] = "1080";
+  numeric[15] = numeric[26] = "240";
+  numeric[17] = numeric[27] = "240000000";
+  run = (CaptureRun){0};
+  g_assert_true(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder));
+  numeric[15] = numeric[26] = "241";
+  g_assert_false(parse_profile(G_N_ELEMENTS(numeric), numeric, &run, &encoder));
+}
+
+static GstPadProbeReturn record_key_request(GstPad *pad, GstPadProbeInfo *info,
+                                           gpointer data) {
+  (void)pad;
+  GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+  if (gst_video_event_is_force_key_unit(event)) {
+    GstEvent **request = data;
+    gst_event_replace(request, event);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+static void check_encoder_timestamp_segment(GstClockTime offset) {
+  // NVENC shifts both its PTS and segment by 1000 hours. Emit the source
+  // running time, including the segment base, rather than that private PTS.
+  const guint8 h264[] = {0, 0, 1, 0x67, 0x42, 0xc0, 0x1f,
+                        0, 0, 1, 0x68, 0,
+                        0, 0, 1, 0x65, 0};
+  GError *error = NULL;
+  GstElement *pipeline = gst_parse_launch(
+      "appsrc name=source format=time handle-segment-change=true ! "
+      "appsink name=output sync=false async=false", &error);
+  g_assert_no_error(error);
+  GstElement *source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+  GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+  CaptureRun run = {.active = TRUE, .last_input_timestamp = GST_CLOCK_TIME_NONE,
+                    .profile = {.frame_rate = 30}};
+  g_mutex_init(&run.lock);
+  VideoOutput output = {.run = &run, .enabled = TRUE,
+      .activation_timestamp = GST_CLOCK_TIME_NONE, .key_timestamp = GST_CLOCK_TIME_NONE,
+      .key_requested = 7,
+      .profile = {.width = 1280, .height = 720, .frame_rate = 30}};
+  GstPad *source_pad = gst_element_get_static_pad(source, "src");
+  GstPad *sink_pad = gst_element_get_static_pad(sink, "sink");
+  GstEvent *request = NULL;
+  gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_BUFFER, begin_input_frame, &run, NULL);
+  gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_BUFFER, output_input_frame, &output, NULL);
+  gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, record_key_request, &request, NULL);
+  GstCaps *caps = gst_caps_from_string(
+      "video/x-h264,stream-format=byte-stream,alignment=au,width=640,height=480");
+  GstBuffer *buffer = gst_buffer_new_allocate(NULL, sizeof(h264), NULL);
+  gst_buffer_fill(buffer, 0, h264, sizeof(h264));
+  GST_BUFFER_PTS(buffer) = offset + GST_SECOND;
+  GstSegment segment;
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = offset;
+  segment.base = 2 * GST_SECOND;
+  GstSample *sample = gst_sample_new(buffer, caps, &segment, NULL);
+  char *frame_path = NULL;
+  int frames = g_file_open_tmp("piik-timestamp-test-XXXXXX", &frame_path, NULL);
+  int original_stdout = dup(STDOUT_FILENO);
+  g_assert_cmpint(frames, >=, 0);
+  g_assert_cmpint(original_stdout, >=, 0);
+  g_assert_cmpint(dup2(frames, STDOUT_FILENO), >=, 0);
+  g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_PLAYING), !=,
+                 GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint(gst_app_src_push_sample(GST_APP_SRC(source), sample), ==, GST_FLOW_OK);
+  gst_sample_unref(sample);
+  gst_caps_unref(caps);
+  gst_buffer_unref(buffer);
+
+  g_assert_cmpint(video_sample(GST_APP_SINK(sink), &output), ==, GST_FLOW_OK);
+  g_assert_cmpint(dup2(original_stdout, STDOUT_FILENO), >=, 0);
+  close(original_stdout);
+  close(frames);
+  char *bytes = NULL;
+  gsize size = 0;
+  g_assert_true(g_file_get_contents(frame_path, &bytes, &size, NULL));
+  g_assert_cmpuint(size, ==, 64 + sizeof(h264));
+  g_assert_cmpint(bytes[5], ==, 5);
+  g_assert_cmpuint(read_be((guint8 *)bytes + 8, 8), ==, 3 * GST_SECOND / 100);
+  g_assert_cmpint(bytes[37], ==, 2);
+  g_assert_cmpint(bytes[38], ==, 1);
+  g_assert_cmpuint(read_be((guint8 *)bytes + 40, 8), ==, 3 * GST_SECOND / 100);
+  g_assert_cmpuint(read_be((guint8 *)bytes + 56, 2), ==, 640);
+  g_assert_cmpuint(read_be((guint8 *)bytes + 58, 2), ==, 480);
+  g_assert_cmpmem(bytes + 64, sizeof(h264), h264, sizeof(h264));
+  g_assert_cmpuint(output.activation_timestamp, ==, 3 * GST_SECOND);
+  g_assert_nonnull(request);
+  GstClockTime pts, running_time;
+  guint count;
+  g_assert_true(gst_video_event_parse_downstream_force_key_unit(
+      request, &pts, NULL, &running_time, NULL, &count));
+  g_assert_cmpuint(pts, ==, offset + GST_SECOND);
+  g_assert_cmpuint(running_time, ==, 3 * GST_SECOND);
+  g_assert_cmpuint(count, ==, 7);
+  g_free(bytes);
+  unlink(frame_path);
+  g_free(frame_path);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_event_unref(request);
+  gst_object_unref(source_pad);
+  gst_object_unref(sink_pad);
+  gst_object_unref(source);
+  gst_object_unref(sink);
+  gst_object_unref(pipeline);
+  g_mutex_clear(&run.lock);
 }
 
 static GstState branch_state(VideoOutput *output) {
@@ -142,6 +305,66 @@ static GstState branch_state(VideoOutput *output) {
   g_assert_cmpint(gst_element_get_state(output->branch, &state, NULL, GST_SECOND),
                  !=, GST_STATE_CHANGE_FAILURE);
   return state;
+}
+
+static void check_source_geometry(guint max_width, guint max_height) {
+  const VideoProfile profile = {.width = max_width, .height = max_height};
+  GString *description = g_string_new("appsrc name=source format=time ! ");
+  append_video_scale(description, &profile);
+  g_string_append(description, "appsink name=output sync=false async=false");
+  GError *error = NULL;
+  GstElement *pipeline = gst_parse_launch(description->str, &error);
+  g_string_free(description, TRUE);
+  g_assert_no_error(error);
+  GstElement *source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+  GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+  g_assert_cmpint(gst_element_set_state(pipeline, GST_STATE_PLAYING), !=,
+                 GST_STATE_CHANGE_FAILURE);
+  // Keep one pipeline while input caps change, as a resized captured window or
+  // decoded relay source does. Small sources must not be enlarged to the ceiling.
+  const guint sizes[][2] = {{1080, 1920}, {3440, 1440}, {640, 480},
+                           {1920, 1080}, {641, 479}, {600, 600}};
+  for (guint index = 0; index < G_N_ELEMENTS(sizes); ++index) {
+    GstVideoInfo input;
+    g_assert_true(gst_video_info_set_format(&input, GST_VIDEO_FORMAT_NV12,
+                                           sizes[index][0], sizes[index][1]));
+    GstCaps *caps = gst_video_info_to_caps(&input);
+    gst_app_src_set_caps(GST_APP_SRC(source), caps);
+    gst_caps_unref(caps);
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, input.size, NULL);
+    gst_buffer_memset(buffer, 0, 128, input.size);
+    gst_buffer_memset(buffer, 0, 235, input.offset[1]);
+    GST_BUFFER_PTS(buffer) = index * GST_SECOND / 30;
+    GST_BUFFER_DURATION(buffer) = GST_SECOND / 30;
+    g_assert_cmpint(gst_app_src_push_buffer(GST_APP_SRC(source), buffer), ==, GST_FLOW_OK);
+    GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), GST_SECOND);
+    g_assert_nonnull(sample);
+    GstVideoInfo actual;
+    g_assert_true(gst_video_info_from_caps(&actual, gst_sample_get_caps(sample)));
+    g_assert_true(valid_video_size(actual.width, actual.height));
+    g_assert_cmpuint(actual.width, <=, max_width);
+    g_assert_cmpuint(actual.height, <=, max_height);
+    g_assert_cmpint(actual.par_n, ==, actual.par_d);
+    double scale = MIN(1.0, MIN((double)max_width / input.width,
+                               (double)max_height / input.height));
+    g_assert_cmpfloat(ABS(actual.width - input.width * scale), <=, 2);
+    g_assert_cmpfloat(ABS(actual.height - input.height * scale), <=, 2);
+    GstVideoFrame frame;
+    g_assert_true(gst_video_frame_map(&frame, &actual, gst_sample_get_buffer(sample), GST_MAP_READ));
+    const guint8 *luma = GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
+    const gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+    // No encoded letterbox: even the four corners still contain the source.
+    for (gint y = 0; y < actual.height; y += actual.height - 1) {
+      g_assert_cmpint(luma[y * stride], >=, 230);
+      g_assert_cmpint(luma[y * stride + actual.width - 1], >=, 230);
+    }
+    gst_video_frame_unmap(&frame);
+    gst_sample_unref(sample);
+  }
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(source);
+  gst_object_unref(sink);
+  gst_object_unref(pipeline);
 }
 
 static void check_slot_retirement(void) {
@@ -335,11 +558,46 @@ static void check_output_failure_isolation(gboolean post_error) {
   g_mutex_clear(&run->lock);
 }
 
+static void check_pipewire_target_identity(void) {
+  PiikPortalCapture portal = {.node_id = 42};
+  char *target = pipewire_target(&portal);
+  g_assert_cmpstr(target, ==, "path=42");
+  g_free(target);
+
+  portal.target_object = "9001";
+  target = pipewire_target(&portal);
+  g_assert_cmpstr(target, ==, "target-object=9001");
+  g_free(target);
+}
+
+static void check_h264_profile_admission(void) {
+  const struct { guint profile; gboolean supported; } cases[] = {
+      {0x42c034, TRUE}, {0x42e034, TRUE}, {0x42c00a, TRUE},
+      {0x4d8034, TRUE}, {0x58c034, TRUE},
+      {0x4d0034, FALSE}, {0x640034, FALSE}, {0x42c035, FALSE}, {0x42c134, FALSE}};
+  for (guint index = 0; index < G_N_ELEMENTS(cases); ++index) {
+    const guint profile = cases[index].profile;
+    const guint8 bytes[] = {0, 0, 0, 1, 0x67, profile >> 16, profile >> 8, profile,
+                           0, 0, 0, 1, 0x68, 0x80, 0, 0, 1, 0x65, 0x80};
+    const NalSummary nal = inspect_h264(bytes, sizeof(bytes));
+    g_assert_true(nal.sps && nal.pps && nal.idr);
+    char expected[7] = {0};
+    if (cases[index].supported) g_snprintf(expected, sizeof(expected), "%06x", profile);
+    g_assert_cmpstr(nal.profile_level_id, ==, expected);
+  }
+}
+
 int main(int argc, char **argv) {
   gst_init(&argc, &argv);
+  check_h264_profile_admission();
+  check_pipewire_target_identity();
   check_encoder_admission_and_control();
   check_bus_error_retains_primary_cause();
   check_slot_profiles();
+  check_source_geometry(1920, 1080);
+  check_source_geometry(2, 2);
+  check_encoder_timestamp_segment(1000ULL * 60 * 60 * GST_SECOND);
+  check_encoder_timestamp_segment(0);
   check_slot_retirement();
   check_output_failure_isolation(TRUE);
   check_output_failure_isolation(FALSE);

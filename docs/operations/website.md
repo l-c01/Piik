@@ -24,6 +24,21 @@ GitHub Pages can serve the complete website: it hosts
 The demo also needs the Go service for room authority, WebSocket signaling and
 UDP STUN, so it runs on the separate US server rather than Pages.
 
+### Managed Hosting Assessment
+
+Reviewed 2026-10-07. Keep the current deployment for this candidate. A managed
+container can reduce host administration, but must preserve public UDP, stable
+room authority and SQLite storage. [Fly.io supports public UDP](https://docs.fly.io/networking/udp-and-tcp)
+with a dedicated IPv4 address and a specific UDP bind address; external and
+internal UDP ports must match. Its [dedicated IPv4 charge](https://docs.fly.io/about/pricing)
+is $2/month before compute, storage and transfer. This is a possible deployment
+target, not an established cost saving over the current server.
+
+[Cloudflare Containers disks are ephemeral by default](https://developers.cloudflare.com/containers/faq/#is-disk-persistent-what-happens-to-my-disk-when-my-container-sleeps).
+Snapshots or object-backed storage are not a drop-in replacement for the current
+live SQLite contract. No provider migration is accepted; compare the complete
+cost and verify storage, UDP and restart behavior before changing the Demo.
+
 ## Public Demo Configuration
 
 The chosen demo allows entry without a site password and provides P2P sharing
@@ -37,6 +52,7 @@ PUBLIC_BASE_URL=https://demo.piik.tv
 ALLOWED_ORIGINS=https://demo.piik.tv
 SITE_ACCESS_PASSWORD=
 ROOM_DATABASE_PATH=/var/lib/piik/rooms.sqlite
+ROOM_EMPTY_TIMEOUT_SECONDS=3600
 MAX_VIEWERS_PER_ROOM=20
 STUN_URLS=stun:stun.piik.tv:3478
 NAT_PREDICTION_ENABLED=true
@@ -87,6 +103,11 @@ ranges for seeking the soundtrack. Keep asset links relative so both a custom
 domain and GitHub's `/Piik/` project path work. For a nested deployment, set
 `PIIK_DOCS_BASE=/Piik/docs/` when building; ordinary custom-domain builds use `/docs/`.
 
+The homepage, film and demonstration frames use content-hashed script/style
+bundles. Their HTML references come from the same build, including imported
+dependencies; fixed filenames must not mix a new page with cached old controls
+or styles. Publish the complete output together.
+
 ## Documentation Build
 
 `site/docs/` configures VitePress; its isolated package and lockfile keep document
@@ -119,16 +140,22 @@ HTML fallback when changing the public documentation.
 
 ## Downloads
 
-The Windows x64, macOS Apple silicon and Linux x64 cards use fixed filenames and
-each provider's native latest-attachment route:
+The Windows, macOS and Linux App cards use fixed filenames and each provider's
+native latest-attachment route:
 
 - GitHub: `releases/latest/download/asset-name.zip`
   ([documentation](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)).
 - Gitee: `releases/download/latest/asset-name.zip`
   ([Windows download](https://gitee.com/TNTcraftHIM/Piik/releases/download/latest/piik-app-windows-amd64.zip)).
 
-Both links follow provider publication without a website rebuild or a release
-API request from the build or visitor. Platform buttons say “Download from GitHub” /
+Both links follow provider publication without a website rebuild. Supported App
+architecture choices stay visible; one selection updates both providers' links.
+An optional GitHub metadata request supplies only the latest version/date;
+failure does not disable architecture selection. Without JavaScript, the default
+links remain Windows x64, Apple silicon and Linux x64. Publish a newly listed App
+package before deploying its website option. ARM64 Server packages alone do not
+enable an ARM64 App choice.
+Platform buttons say “Download from GitHub” /
 “GitHub 下载”; the secondary link says “Download from Gitee” /
 “Gitee 国内镜像下载”. Keep versions and archive formats out of these labels.
 [Versioning](../standards/versioning.md#release-sources) owns package verification
@@ -149,7 +176,8 @@ Verify the latest redirects and package checksums after releases.
 4. Accepted main pushes run CI first; success triggers **Website**, which checks
    out that CI run's exact commit. Manual dispatch uses its selected `main` commit.
    Before publishing, both paths skip a build that is no longer current main;
-   dispatch again for the latest commit when needed. Download links resolve through each provider, so
+   dispatch again for the latest commit when needed. The separate Gitee mirror
+   workflow does not gate Website deployment. Download links resolve through each provider, so
    publishing a package or retrying its mirror needs no link refresh.
    Only `build/site/` is uploaded; website work does not package App/Server.
    Verify HTTPS, both languages, relative assets and per-platform download links.

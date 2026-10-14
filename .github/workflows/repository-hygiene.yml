@@ -17,6 +17,27 @@ on:
         description: Optional candidate version (vMAJOR.MINOR.PATCH); never publishes
         required: false
         type: string
+      network_lab:
+        description: Run the isolated Linux network laboratory (never publishes)
+        required: false
+        default: none
+        type: choice
+        options: [none, verify, smoke, full]
+      network_cases:
+        description: Optional comma-separated laboratory cases (empty runs the selected suite)
+        required: false
+        type: string
+      network_prediction:
+        description: NAT enhancement setting (compare runs paired on/off trials)
+        required: false
+        default: 'on'
+        type: choice
+        options: ['on', 'off', compare]
+      network_repeat:
+        description: Repetitions per laboratory case (1..20)
+        required: false
+        default: '1'
+        type: string
 
 permissions:
   contents: read
@@ -75,7 +96,7 @@ jobs:
           ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PIIK_RELEASES_ENABLED == 'true' && 'plan' || 'build' }}
           --github-output
       - name: Preview release notes
-        if: steps.release.outputs.publish == 'true' || inputs.candidate_version != ''
+        if: steps.release.outputs.publish == 'true'
         run: node scripts/release-notes.mjs "$PIIK_RELEASE_VERSION" "$GITHUB_SHA" --github-summary
         env:
           PIIK_RELEASE_VERSION: ${{ steps.release.outputs.version }}
@@ -89,11 +110,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 1.26.6
+          go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Check Go core
         run: npm run check:go-core
-      - name: Check NAT and media ownership with the race detector
+      - name: Check reachable Go vulnerabilities
+        run: npm run check:go-vuln
+      - name: Check concurrent resource ownership with the race detector
         run: npm run check:go-race
       - name: Type-check and test
         run: npm run typecheck && npm test
@@ -101,13 +124,73 @@ jobs:
           PIIK_BUILD_VERSION: ${{ steps.release.outputs.version }}
           VITE_PIIK_VERSION: ${{ steps.release.outputs.version }}
           VITE_PIIK_REVISION: ${{ github.sha }}
+      - name: Prepare isolated network laboratory
+        if: github.event_name == 'workflow_dispatch' && inputs.network_lab != 'none' && inputs.network_lab != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 tcpdump conntrack bison flex libmnl-dev libcap-dev
+          mkdir -p build/network-lab/bin
+          CGO_ENABLED=0 go build -trimpath -o build/network-lab/bin/piik-server ./cmd/piik-server
+          CGO_ENABLED=0 go build -trimpath -o build/network-lab/bin/piik-app ./cmd/piik-app
+          CGO_ENABLED=0 go build -trimpath -o build/network-lab/bin/stun ./scripts/network-lab/stun
+      # The runner's iproute2 6.1 lacks netem's seed parameter. Keep this tool
+      # local to the opt-in lab; do not replace system networking utilities.
+      - name: Check out laboratory traffic-control tool
+        if: github.event_name == 'workflow_dispatch' && inputs.network_lab != 'none' && inputs.network_lab != ''
+        uses: actions/checkout@v6
+        with:
+          repository: iproute2/iproute2
+          ref: d2a8ffe85ac64f91ee2aa7679a5046f321b54127 # v6.17.0
+          path: build/network-lab/iproute2
+          persist-credentials: false
+      - name: Build laboratory traffic-control tool
+        if: github.event_name == 'workflow_dispatch' && inputs.network_lab != 'none' && inputs.network_lab != ''
+        run: |
+          make -C build/network-lab/iproute2 -j2 SUBDIRS='lib tc netem' TC_CONFIG_NO_XT=y
+          echo "$GITHUB_WORKSPACE/build/network-lab/iproute2/tc" >> "$GITHUB_PATH"
+      - name: Run isolated network laboratory
+        id: network_lab
+        if: github.event_name == 'workflow_dispatch' && inputs.network_lab != 'none' && inputs.network_lab != ''
+        timeout-minutes: 45
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          TC_LIB_DIR: ${{ github.workspace }}/build/network-lab/iproute2/netem
+          PIIK_NETWORK_LAB_SUITE: ${{ inputs.network_lab }}
+          PIIK_NETWORK_LAB_CASES: ${{ inputs.network_cases }}
+          PIIK_NETWORK_LAB_PREDICTION: ${{ inputs.network_prediction }}
+          PIIK_NETWORK_LAB_REPEAT: ${{ inputs.network_repeat }}
+        run: |
+          if [ "$PIIK_NETWORK_LAB_SUITE" = verify ] || [ "$PIIK_NETWORK_LAB_SUITE" = full ]; then
+            sudo --preserve-env=PATH,CHROME_PATH,TC_LIB_DIR "$(command -v node)" --import tsx scripts/network-lab.ts --verify
+          fi
+          if [ "$PIIK_NETWORK_LAB_SUITE" != verify ]; then
+            sudo --preserve-env=PATH,CHROME_PATH,TC_LIB_DIR "$(command -v node)" --import tsx scripts/network-lab.ts --suite "$PIIK_NETWORK_LAB_SUITE" --cases "$PIIK_NETWORK_LAB_CASES" --prediction "$PIIK_NETWORK_LAB_PREDICTION" --repeat "$PIIK_NETWORK_LAB_REPEAT"
+          fi
+      - name: Save network laboratory evidence
+        if: always() && steps.network_lab.outcome != 'skipped' && github.event_name == 'workflow_dispatch' && inputs.network_lab != 'none' && inputs.network_lab != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: network-lab-${{ github.sha }}
+          path: build/network-lab/results/
+          if-no-files-found: error
+          retention-days: 7
 
   release-server:
     needs: validate
     if: >-
       needs.validate.outputs.publish == 'true' ||
       (github.event_name == 'workflow_dispatch' && inputs.app_checks == true)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            artifact: piik-server
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            artifact: piik-server-linux-arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       PIIK_BUILD_VERSION: ${{ needs.validate.outputs.version }}
@@ -122,29 +205,30 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 1.26.6
+          go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Install dependencies
         run: npm ci
       - name: Package Server release
         run: >-
           node scripts/package-server-release.mjs "$RUNNER_TEMP/server-release"
-          --container-image "piik-candidate:$GITHUB_SHA"
+          --arch "${{ matrix.arch }}"
+          --container-image "piik-candidate:$GITHUB_SHA-${{ matrix.arch }}"
       - name: Check the container and deployment recipe
-        run: npm run check:container -- "piik-candidate:$GITHUB_SHA" "$GITHUB_SHA"
+        run: npm run check:container -- "piik-candidate:$GITHUB_SHA-${{ matrix.arch }}" "$GITHUB_SHA"
       - name: Save the verified container
-        run: docker save "piik-candidate:$GITHUB_SHA" --output "$RUNNER_TEMP/piik-container.tar"
+        run: docker save "piik-candidate:$GITHUB_SHA-${{ matrix.arch }}" --output "$RUNNER_TEMP/piik-container-${{ matrix.arch }}.tar"
       - name: Upload the verified container
         uses: actions/upload-artifact@v7
         with:
-          name: piik-container-${{ github.sha }}
-          path: ${{ runner.temp }}/piik-container.tar
+          name: piik-container-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/piik-container-${{ matrix.arch }}.tar
           if-no-files-found: error
           retention-days: 14
       - name: Upload Server release
         uses: actions/upload-artifact@v7
         with:
-          name: piik-server-${{ github.sha }}
+          name: ${{ matrix.artifact }}-${{ github.sha }}
           path: ${{ runner.temp }}/server-release/*
           if-no-files-found: error
           retention-days: 14
@@ -162,10 +246,16 @@ jobs:
         include:
           - target: windows-amd64
             runner: windows-latest
+          # Native Linux capture links system libraries; keep both architectures
+          # on the same explicit build baseline instead of following latest.
           - target: linux-amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
           - target: darwin-arm64
             runner: macos-15
+          - target: darwin-amd64
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     env:
@@ -181,7 +271,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: 1.26.6
+          go-version-file: go.mod
           cache-dependency-path: go.sum
       # scripts/assemble-app.mjs runs `npm run build:web` for the Web
       # assets the App binary embeds, so Vite and the license inputs must be
@@ -189,7 +279,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Install Linux packaging and native capture dependencies
-        if: matrix.target == 'linux-amd64'
+        if: startsWith(matrix.target, 'linux-')
         run: >-
           sudo apt-get update && sudo apt-get install -y
           zip
@@ -246,8 +336,9 @@ jobs:
       - name: Download Server release
         uses: actions/download-artifact@v8
         with:
-          name: piik-server-${{ github.sha }}
+          pattern: piik-server*-${{ github.sha }}
           path: ${{ runner.temp }}/publish-release
+          merge-multiple: true
       - name: Download App release candidates
         uses: actions/download-artifact@v8
         with:
@@ -257,10 +348,14 @@ jobs:
       - name: Download the verified container
         uses: actions/download-artifact@v8
         with:
-          name: piik-container-${{ github.sha }}
+          pattern: piik-container-*-${{ github.sha }}
           path: ${{ runner.temp }}/container
+          merge-multiple: true
       - name: Load the verified container
-        run: docker load --input "$RUNNER_TEMP/container/piik-container.tar"
+        run: |
+          for arch in amd64 arm64; do
+            docker load --input "$RUNNER_TEMP/container/piik-container-$arch.tar"
+          done
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -270,7 +365,6 @@ jobs:
       # Local descriptors/manifests/checksums are validated before publishing.
       # Release assets contain packages only; checksums appear in the release body.
       - name: Publish packages with release notes and checksums
-        id: github_release
         run: >-
           node scripts/publish-release.mjs
           "$RUNNER_TEMP/publish-release" "$PIIK_RELEASE_VERSION" "$GITHUB_SHA"
@@ -283,13 +377,4 @@ jobs:
           "$RUNNER_TEMP/publish-release" "$PIIK_RELEASE_VERSION" "$GITHUB_SHA"
         env:
           GH_TOKEN: ${{ github.token }}
-          PIIK_RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-      - name: Mirror verified release to Gitee
-        if: ${{ !cancelled() && steps.github_release.outcome == 'success' }}
-        run: >-
-          node scripts/mirror-release.mjs
-          "$RUNNER_TEMP/publish-release" "$PIIK_RELEASE_VERSION" "$GITHUB_SHA"
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           PIIK_RELEASE_VERSION: ${{ needs.validate.outputs.version }}

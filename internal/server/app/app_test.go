@@ -366,7 +366,17 @@ func TestCapabilitiesReportServicesDisabledByDefault(t *testing.T) {
 	server := start(t, Options{Config: testConfig(t)})
 
 	server.do(http.MethodGet, "/api/capabilities").
-		expect(http.StatusOK, `{"connectionAttemptProgress4":true,"sfu":false,"natPrediction":false}`)
+		expect(http.StatusOK, `{"sfu":false,"natPrediction":false,"roomInteractions":true,"hostRoomSession":true}`)
+
+}
+
+func TestCapabilitiesReportSFUOnlyPolicy(t *testing.T) {
+	configuration := testConfig(t)
+	configuration.SFU = &config.SFUConfig{ListenHost: "127.0.0.1", Port: 0, Only: true}
+	configuration.NATPredictionEnabled = true
+	server := start(t, Options{Config: configuration})
+	server.do(http.MethodGet, "/api/capabilities").
+		expect(http.StatusOK, `{"sfu":true,"sfuOnly":true,"natPrediction":false,"roomInteractions":true,"hostRoomSession":true}`)
 }
 
 func TestCapabilitiesReportOptionalNATPredictionWithoutExposingConfiguration(t *testing.T) {
@@ -377,7 +387,7 @@ func TestCapabilitiesReportOptionalNATPredictionWithoutExposingConfiguration(t *
 	server := start(t, Options{Config: configuration})
 
 	server.do(http.MethodGet, "/api/capabilities").
-		expect(http.StatusOK, `{"connectionAttemptProgress4":true,"sfu":false,"natPrediction":true}`).
+		expect(http.StatusOK, `{"sfu":false,"natPrediction":true,"roomInteractions":true,"hostRoomSession":true}`).
 		expectHeader("Cache-Control", "no-store").
 		expectHeader("X-Content-Type-Options", "nosniff")
 
@@ -420,7 +430,8 @@ func TestSFUListenerFollowsApplicationCloseAndEnd(t *testing.T) {
 				t.Fatal("missing runtime owner")
 			}
 			server.do(http.MethodGet, "/api/capabilities").
-				expect(http.StatusOK, `{"connectionAttemptProgress4":true,"sfu":true,"natPrediction":false}`)
+				expect(http.StatusOK, `{"sfu":true,"natPrediction":false,"roomInteractions":true,"hostRoomSession":true}`)
+
 			var err error
 			if ending {
 				err = server.End(context.Background())
@@ -1252,6 +1263,31 @@ func TestRoomCreationReturnsServiceUnavailableAtTheGlobalRoomBound(t *testing.T)
 	server.createRoom(roomRequest{}).expectStatus(http.StatusCreated)
 	server.createRoom(roomRequest{}).
 		expect(http.StatusServiceUnavailable, `{"error":"Room capacity reached"}`)
+}
+
+func TestConfiguredEmptyRoomExpiryRunsFromTheOwnedHeartbeat(t *testing.T) {
+	var now atomic.Int64
+	configuration := testConfig(t)
+	configuration.SiteAccessPassword = ""
+	configuration.RoomEmptyTimeoutSeconds = 3600
+	ticks := make(chan func(), 2)
+	server := start(t, Options{
+		Config: configuration, Now: now.Load,
+		AfterFunc: func(_ time.Duration, callback func()) func() bool {
+			ticks <- callback
+			return func() bool { return true }
+		},
+	})
+	created := server.createRoom(roomRequest{}).expectStatus(http.StatusCreated).room()
+	now.Store(3_599_999)
+	(<-ticks)()
+	request := accessRequest{roomID: created.RoomID, hostToken: created.HostToken,
+		body: `{"action":"set-code-entry-policy","policy":"private"}`}
+	server.updateRoomAccess(request).expectStatus(http.StatusOK)
+	now.Store(3_600_000)
+	(<-ticks)()
+	server.updateRoomAccess(request).expectStatus(http.StatusNotFound)
+	server.createRoom(roomRequest{}).expectStatus(http.StatusCreated)
 }
 
 // --- server HTTP listener and health --------------------------------------

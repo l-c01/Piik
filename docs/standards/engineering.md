@@ -79,6 +79,39 @@ the relevant existing fixture/check together. Do not create another handwritten
 field list in documentation, parallel DTO hierarchy or schema generator without
 a demonstrated reduction in ownership or drift.
 
+Keep UI presets, requested values, runtime capabilities, observations and hard
+resource limits distinct. Every bound needs an owner and a reason: wire/codec
+representation, accepted product policy or resource protection. A current menu
+or retry budget is not sufficient reason to freeze its values into a wire reader.
+Validate representation at the interface, then supported operations at their
+owner before allocating or changing live state. An unsupported setting should
+use the existing operation rejection, without retiring an otherwise valid session.
+
+A capability description may exceed the reader's implementation. Intersect it
+with local support and budgets; do not treat a stronger peer as absent or grant
+resources from its declaration alone. Measurements are observations, not resource
+requests: their range need not match a setting or estimated network budget.
+An unusable optional metric should become unavailable without discarding valid
+evidence or closing media control. Identity, generation, authority and required
+state consistency remain strict; never clamp a measurement into an invented fact.
+
+Detect optional platform features through bounded capability checks and actual
+operation results, not OS/browser version allowlists. Keep API availability,
+permission and successful execution distinct; version data is diagnostic context.
+
+Preserve meaningful authorization and resource bounds; prove that a producer's
+valid aggregate output fits its consumer, including serialization overhead.
+A per-item limit alone does not establish that contract.
+
+When extending a boundary, exercise a representative new value, a larger peer
+capability and an unchanged consumer before calling the design extensible.
+Check both acceptance and the effect of rejection. For media, include another source
+orientation and distinguish encode, decode and forwarding support. Optional
+presentation additions need a bounded unsupported-value policy separate from
+authority violations, following [versioning](./versioning.md#extending-interfaces).
+Use the existing owner and concrete capability negotiation; these checks do not
+justify a generic plugin framework or accepting unknown commands.
+
 ## Runtime Lifecycles
 
 Read each runtime as acquisition, the authoritative commit that makes its work
@@ -148,12 +181,17 @@ above rather than searching the tree.
   Closing a Browser connection may leave its API promises pending. Its owner
   cancels the corresponding waits so a serialized successor never depends on
   completion from a retired connection; late results still need identity checks.
-  Later cancellation must not erase a failure already observed before cleanup.
+  Failure effects need the same final identity check as successful results,
+  serialized with replacement; an earlier input check alone is insufficient.
+  Later cancellation must not erase a failure already accepted by its current
+  owner. Perform blocking retirement after releasing that owner's state lock.
   A caller deadline does not cancel a dependency that ignores it. Keep late
   work bounded and serialize its cleanup; verify the dependency's actual lifetime.
   Construction is part of acquisition: if it throws, release resources created
   before the failure and report through the existing operation owner. A failed
   allocation does not erase the operation's authoritative identity.
+  Initialize callback-visible state before registration or binding; library
+  constructors can start background work before returning.
   Ordered shutdown may require a ready auxiliary transport to outlive the stop
   request; its owner closes it after dependants retire. External convenience
   actions must not block lifecycle handling, and repeated attempts stay bounded.
@@ -261,6 +299,12 @@ sibling through the real producer/consumer boundary. Compare preparation with
 live operation, and current implementations with supported compatibility paths.
 Exercise optional failure after success and a dependency that remains pending
 after cancellation; a timeout constant or a close call alone proves no deadline.
+Keep the shared resources production retains while changing the external
+condition. New request/connection IDs alone do not prove that a dependency's
+cached observations, failure state or resource lease have been refreshed.
+For overlapping connections, preserve the actual shared local and remote
+endpoints; giving each fixture an independent listener can hide demultiplexing
+conflicts. Check both commit and rollback while the surviving media still flows.
 Keep the regression at the owning boundary and verify it rejects the old
 behavior. Report which failure sequences were exercised, rather than treating
 test counts, file coverage or an earlier audit as proof of lifecycle coverage.

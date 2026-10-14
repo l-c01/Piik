@@ -6,6 +6,7 @@ import type {
   QualitySettings,
   SignalPayload,
   SfuSignalMessage,
+  PunchPrediction,
 } from "../../shared/protocol";
 import { createOpaqueId } from "../lib/opaque-id";
 import {
@@ -18,6 +19,7 @@ import {
   nativeAckResponseSchema,
   nativeEventSchema,
   nativeDiscoveryIdentitySchema,
+  nativeConnectSchema,
   nativeHealthSchema,
   NATIVE_CLIENT_PORT_END,
   NATIVE_CLIENT_PORT_START,
@@ -34,6 +36,8 @@ import {
   sourceListResponseSchema,
   microphoneListResponseSchema,
   sourcePreviewResponseSchema,
+  punchPreparedResponseSchema,
+  punchCompleteResponseSchema,
   type NativeAdapter,
   type NativeClientEvent,
   type NativeHealth,
@@ -46,6 +50,7 @@ const REQUEST_TIMEOUT_MS = 8_000;
 
 interface NativeDiscoveryOptions {
   waitForPermission?: boolean;
+  signal?: AbortSignal;
 }
 
 async function ungrantedLocalPermission(): Promise<PermissionState | null> {
@@ -64,6 +69,7 @@ async function ungrantedLocalPermission(): Promise<PermissionState | null> {
 }
 
 interface PendingRequest<T = unknown> {
+  operation: string;
   schema: z.ZodType<T>;
   resolve: (value: T) => void;
   reject: (error: Error) => void;
@@ -74,6 +80,7 @@ export interface NativeShareInput {
   shareId: string;
   source: NativeCaptureTarget;
   audio: boolean;
+  excludeAudio?: NativeCaptureTarget;
   showCaptureBorder?: boolean;
   adapterIndex: number;
   encoderIndex: number;
@@ -89,9 +96,52 @@ export class NativeCompatibilityError extends Error {
   }
 }
 
+/** The control boundary knows the failed operation, not the driver's cause. */
+export class NativeRequestError extends Error {
+  constructor(
+    readonly reason: "unavailable" | "timeout" | "send-failed" | "rejected" | "invalid-response" | "disconnected",
+    readonly operation: string,
+    options?: ErrorOptions,
+  ) {
+    super({
+      unavailable: "Piik App is unavailable",
+      timeout: "Piik App request timed out",
+      "send-failed": "Piik App request failed",
+      rejected: "Piik App request failed",
+      "invalid-response": "Piik App response is invalid",
+      disconnected: "Piik App disconnected",
+    }[reason], options);
+    this.name = "NativeRequestError";
+  }
+}
+
 export async function discoverNativeHealth(
-  { waitForPermission = true }: NativeDiscoveryOptions = {},
+  options: NativeDiscoveryOptions = {},
 ): Promise<NativeHealth | null> {
+  const health = await discoverNative("health", body => nativeHealthSchema.parse(body), options);
+  if (health) debugEvent("native", "discovered", { capabilities: health.nativeMedia });
+  return health;
+}
+
+/** A local approval address is not permission to use native media. */
+export async function discoverNativeConnect(signal?: AbortSignal): Promise<string | null> {
+  return discoverNative("connect-discovery", body => {
+    const { connectURL } = nativeConnectSchema.parse(body);
+    const url = new URL(connectURL);
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port ||
+        url.username || url.password || url.pathname !== "/client" || url.search || url.hash) {
+      throw new Error("Invalid local App approval address");
+    }
+    url.searchParams.set("site", window.location.origin);
+    return url.toString();
+  }, { signal });
+}
+
+async function discoverNative<T>(
+  path: "health" | "connect-discovery", read: (body: unknown) => T,
+  { waitForPermission = true, signal }: NativeDiscoveryOptions,
+): Promise<T | null> {
+  if (signal?.aborted) return null;
   if (!waitForPermission) {
     const permission = await ungrantedLocalPermission();
     if (permission) {
@@ -99,6 +149,7 @@ export async function discoverNativeHealth(
       return null;
     }
   }
+  if (signal?.aborted) return null;
   const controller = new AbortController();
   // The first request may wait for browser permission. One shared deadline
   // bounds the scan; a silent port must not hide an App on another port.
@@ -108,9 +159,9 @@ export async function discoverNativeHealth(
       length: NATIVE_CLIENT_PORT_END - NATIVE_CLIENT_PORT_START + 1,
     }, async (_, index) => {
       const port = NATIVE_CLIENT_PORT_START + index;
-      const response = await fetch(`http://127.0.0.1:${port}/health`, {
+      const response = await fetch(`http://127.0.0.1:${port}/${path}`, {
         cache: "no-store",
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
         targetAddressSpace: "loopback",
       } as RequestInit);
       if (!response.ok) throw new Error("Piik App discovery was not accepted");
@@ -122,9 +173,7 @@ export async function discoverNativeHealth(
       if (identity.data.protocol !== NATIVE_CLIENT_PROTOCOL) {
         throw new NativeCompatibilityError(identity.data.protocol);
       }
-      const health = nativeHealthSchema.parse(body);
-      debugEvent("native", "discovered", { capabilities: health.nativeMedia });
-      return health;
+      return read(body);
     }));
   } catch (error) {
     const incompatible = error instanceof AggregateError
@@ -151,7 +200,7 @@ export async function notifyNativePresentation(
   signal: AbortSignal,
 ): Promise<void> {
   if (signal.aborted) return;
-  const health = await discoverNativeHealth();
+  const health = await discoverNativeHealth({ signal });
   if (!health || signal.aborted) return;
   await fetch(`http://127.0.0.1:${health.port}/presentation`, {
     method: "POST",
@@ -181,49 +230,49 @@ export class NativeClient {
   }
 
   static async connect(options?: NativeDiscoveryOptions): Promise<NativeClient | null> {
+    const signal = options?.signal;
     const health = await discoverNativeHealth(options);
-    if (!health) return null;
+    if (!health || signal?.aborted) return null;
     const socket = new WebSocket(`ws://127.0.0.1:${health.port}/control`, [
       `${NATIVE_CLIENT_SUBPROTOCOL}.${health.instanceToken}`,
     ]);
-    const opened = await new Promise<boolean>((resolveOpen) => {
-      const timer = window.setTimeout(
-        () => resolveOpen(false),
-        REQUEST_TIMEOUT_MS,
-      );
-      socket.addEventListener(
-        "open",
-        () => {
-          window.clearTimeout(timer);
-          resolveOpen(
-            socket.protocol ===
-              `${NATIVE_CLIENT_SUBPROTOCOL}.${health.instanceToken}`,
-          );
-        },
-        { once: true },
-      );
-      socket.addEventListener(
-        "error",
-        () => {
-          window.clearTimeout(timer);
-          resolveOpen(false);
-        },
-        { once: true },
-      );
-    });
-    if (!opened) {
-      debugEvent("native", "unavailable", { stage: "control" });
-      socket.close();
-      return null;
-    }
     const client = new NativeClient(health, socket);
+    // Acquisition owns discovery, the WebSocket handshake and hello together.
+    // Once returned, the caller owns the live client independently of this signal.
+    const abort = () => client.close();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
+      const opened = await new Promise<boolean>((resolveOpen) => {
+        const finish = (value: boolean) => {
+          window.clearTimeout(timer);
+          socket.removeEventListener("open", onOpen);
+          socket.removeEventListener("error", fail);
+          socket.removeEventListener("close", fail);
+          signal?.removeEventListener("abort", fail);
+          resolveOpen(value);
+        };
+        const onOpen = () => finish(socket.protocol === `${NATIVE_CLIENT_SUBPROTOCOL}.${health.instanceToken}`);
+        const fail = () => finish(false);
+        const timer = window.setTimeout(fail, REQUEST_TIMEOUT_MS);
+        socket.addEventListener("open", onOpen);
+        socket.addEventListener("error", fail);
+        socket.addEventListener("close", fail);
+        signal?.addEventListener("abort", fail, { once: true });
+      });
+      if (!opened || client.closed || signal?.aborted) {
+        if (!signal?.aborted) debugEvent("native", "unavailable", { stage: "control" });
+        client.close();
+        return null;
+      }
       await client.request("hello", {}, readyResponseSchema);
+      if (client.closed || signal?.aborted) { client.close(); return null; }
       debugEvent("native", "connected");
       return client;
     } catch {
       client.close();
       return null;
+    } finally {
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -281,11 +330,13 @@ export class NativeClient {
     input: NativeShareInput,
   ): Promise<{ audio: boolean; codec: NativeVideoCodec; sourceAudio?: boolean }> {
     // Older Apps reject unknown command fields.
-    const { showCaptureBorder = false, ...shareInput } = input;
+    const { showCaptureBorder = false, excludeAudio, ...shareInput } = input;
+    this.validateAudioExclusion(excludeAudio);
     const response = await this.request(
       "start-share",
       {
         ...shareInput,
+        ...(excludeAudio ? { excludeAudio } : {}),
         ...(this.health.nativeMedia.microphone ? { microphoneMixing: true } : {}),
         ...(this.health.nativeMedia.captureBorderControl ? { showCaptureBorder } : {}),
       },
@@ -310,19 +361,28 @@ export class NativeClient {
     }
   }
 
+  private validateAudioExclusion(target: NativeCaptureTarget | undefined): void {
+    if (target && !this.health.nativeMedia.processAudioExclusion) {
+      throw new Error("Piik App does not support audio exclusion");
+    }
+  }
+
   async replaceShareSource(
     shareId: string,
     source: NativeCaptureTarget,
     audio: boolean,
     path: NativeCapturePath,
     showCaptureBorder = false,
+    excludeAudio?: NativeCaptureTarget,
   ): Promise<void> {
+    this.validateAudioExclusion(excludeAudio);
     const response = await this.request(
       "replace-share-source",
       {
         shareId,
         source,
         audio,
+        ...(excludeAudio ? { excludeAudio } : {}),
         adapterIndex: path.adapterIndex,
         encoderIndex: path.encoderIndex,
         ...(this.health.nativeMedia.captureBorderControl ? { showCaptureBorder } : {}),
@@ -340,12 +400,14 @@ export class NativeClient {
     connectionId: string,
     iceConfig: IceConfig,
     sourceConnectionId?: string,
+    punched = false,
   ): Promise<RTCSessionDescriptionInit> {
     const response = await this.request(
       "prepare-edge",
       {
         shareId,
         connectionId,
+        ...(punched ? { punched: true } : {}),
         ...(sourceConnectionId ? { sourceConnectionId } : {}),
         iceServers: iceConfig.iceServers.map((server) => ({
           urls: Array.isArray(server.urls) ? server.urls : [server.urls],
@@ -360,6 +422,25 @@ export class NativeClient {
       throw new Error("Native edge identity changed");
     }
     return { type: "offer", sdp: response.sdp };
+  }
+
+  async preparePunch(shareId: string, connectionId: string, iceConfig: IceConfig,
+    secret: string, edgeCapacity?: number, sourceConnectionId?: string): Promise<PunchPrediction | null> {
+    const response = await this.request("prepare-punch", {
+      shareId, connectionId, secret,
+      ...(edgeCapacity !== undefined ? { edgeCapacity } : {}),
+      ...(sourceConnectionId ? { sourceConnectionId } : {}),
+      iceServers: iceConfig.iceServers.map(server => ({ urls: Array.isArray(server.urls) ? server.urls : [server.urls] })),
+    }, punchPreparedResponseSchema);
+    return response.prediction;
+  }
+
+  async runPunch(shareId: string, connectionId: string, prediction: PunchPrediction): Promise<boolean> {
+    return (await this.request("run-punch", { shareId, connectionId, prediction }, punchCompleteResponseSchema)).connected;
+  }
+
+  async closePunch(shareId: string, connectionId: string): Promise<void> {
+    await this.request("close-punch", { shareId, connectionId }, nativeAckResponseSchema);
   }
 
   async preparePublication(
@@ -469,12 +550,14 @@ export class NativeClient {
     shareId: string,
     connectionId: string,
     sourceConnectionId?: string,
-  ): Promise<RTCSessionDescriptionInit> {
+    restart = false,
+  ): Promise<RTCSessionDescriptionInit & { offerId: string }> {
     const response = await this.request(
       "prepare-local-edge",
       {
         shareId,
         connectionId,
+        restart,
         ...(sourceConnectionId ? { sourceConnectionId } : {}),
       },
       edgeOfferResponseSchema,
@@ -485,7 +568,7 @@ export class NativeClient {
     ) {
       throw new Error("Native local edge identity changed");
     }
-    return { type: "offer", sdp: response.sdp };
+    return { type: "offer", sdp: response.sdp, offerId: response.id };
   }
 
   async receiveOffer(
@@ -494,6 +577,7 @@ export class NativeClient {
     offer: RTCSessionDescriptionInit,
     iceConfig: IceConfig,
     edgeCapacity: number,
+    punched = false,
   ): Promise<{
     answer: { type: "answer"; sdp: string };
     audio: boolean;
@@ -510,6 +594,7 @@ export class NativeClient {
         connectionId,
         ...(this.health.nativeMedia.receiverReuse ? { reuseReceiver: true } : {}),
         edgeCapacity,
+        ...(punched ? { punched: true } : {}),
         iceServers: iceConfig.iceServers.map((server) => ({
           urls: Array.isArray(server.urls) ? server.urls : [server.urls],
         })),
@@ -559,13 +644,14 @@ export class NativeClient {
     shareId: string,
     connectionId: string,
     payload: SignalPayload,
+    offerId?: string,
   ): Promise<void> {
-    if (payload.connectionId !== connectionId) return;
+    if (payload.connectionId !== connectionId || payload.kind === "punch") return;
     if (payload.kind === "description") {
       if (payload.description.type !== "answer") return;
       await this.request(
         "edge-answer",
-        { shareId, connectionId, sdp: payload.description.sdp },
+        { shareId, connectionId, sdp: payload.description.sdp, ...(offerId ? { offerId } : {}) },
         nativeAckResponseSchema,
       );
       return;
@@ -645,7 +731,7 @@ export class NativeClient {
     timeoutMs: number | null = REQUEST_TIMEOUT_MS,
   ): Promise<T> {
     if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error("Piik App is unavailable"));
+      return Promise.reject(new NativeRequestError("unavailable", type));
     }
     const id = createOpaqueId();
     const began = performance.now();
@@ -657,9 +743,10 @@ export class NativeClient {
           : window.setTimeout(() => {
               this.pending.delete(id);
               debugEvent("native", "request-timeout", { ...details, durationMs: performance.now() - began });
-              rejectRequest(new Error("Piik App request timed out"));
+              rejectRequest(new NativeRequestError("timeout", type));
             }, timeoutMs);
       this.pending.set(id, {
+        operation: type,
         schema,
         resolve: (value) => {
           debugEvent("native", "response", { ...details, durationMs: performance.now() - began, applied: value });
@@ -685,7 +772,7 @@ export class NativeClient {
         if (timer !== null) window.clearTimeout(timer);
         this.pending.delete(id);
         debugError("native", "request-failed", error, { ...details, durationMs: performance.now() - began });
-        rejectRequest(new Error("Piik App request failed"));
+        rejectRequest(new NativeRequestError("send-failed", type, { cause: error }));
       }
     });
   }
@@ -707,19 +794,26 @@ export class NativeClient {
       if (pending.timer !== null) window.clearTimeout(pending.timer);
       const failure = requestFailedResponseSchema.safeParse(value);
       if (failure.success) {
-        pending.reject(new Error("Piik App request failed", { cause: { code: failure.data.code } }));
+        pending.reject(new NativeRequestError("rejected", pending.operation, { cause: { code: failure.data.code } }));
         return;
       }
       const parsed = pending.schema.safeParse(value);
       if (parsed.success) {
         pending.resolve(parsed.data);
       } else {
-        pending.reject(new Error("Piik App response is invalid", { cause: parsed.error }));
+        pending.reject(new NativeRequestError("invalid-response", pending.operation, { cause: parsed.error }));
       }
       return;
     }
     const event = nativeEventSchema.safeParse(value);
     if (!event.success) {
+      // A rejected observation has no control authority. Drop it without
+      // retiring healthy media; its identity/state must still pass to be used.
+      if (value && typeof value === "object" && "type" in value &&
+        (value.type === "edge-quality" || value.type === "publication-quality")) {
+        debugError("native", "quality-sample-invalid", event.error);
+        return;
+      }
       debugError("native", "protocol-failed", event.error, { stage: "event-invalid" });
       this.failConnection();
       return;
@@ -751,7 +845,7 @@ export class NativeClient {
   private rejectPending(): void {
     for (const request of this.pending.values()) {
       if (request.timer !== null) window.clearTimeout(request.timer);
-      request.reject(new Error("Piik App disconnected"));
+      request.reject(new NativeRequestError("disconnected", request.operation));
     }
     this.pending.clear();
   }

@@ -14,7 +14,7 @@ const (
 )
 
 type localCandidateGathering struct {
-	engine         *Engine
+	socket         *iceSocket
 	servers        []webrtc.ICEServer
 	mappedPort     int
 	prepareMapping func() int
@@ -32,15 +32,15 @@ type localCandidateGathering struct {
 }
 
 func newLocalCandidateGathering(
-	engine *Engine,
+	socket *iceSocket,
 	servers []webrtc.ICEServer,
 	prepareMapping func() int,
 	emit func(*webrtc.ICECandidateInit),
 ) *localCandidateGathering {
-	ctx, cancel := context.WithCancel(engine.ctx)
+	ctx, cancel := context.WithCancel(socket.ctx)
 	surveyServers := stunServers(servers)
 	return &localCandidateGathering{
-		engine: engine, servers: surveyServers, prepareMapping: prepareMapping, emit: emit,
+		socket: socket, servers: surveyServers, prepareMapping: prepareMapping, emit: emit,
 		ctx: ctx, cancel: cancel, supplementalDone: len(surveyServers) == 0,
 		mappedCandidates: make(map[string]struct{}),
 	}
@@ -85,7 +85,7 @@ func (gathering *localCandidateGathering) emitMappedCandidate(
 			" 1 udp " + strconv.Itoa(mappedCandidatePriority) + " " +
 			mapped.address + " " + strconv.Itoa(gathering.mappedPort) +
 			" typ srflx raddr 0.0.0.0 rport " +
-			strconv.Itoa(gathering.engine.localPort),
+			strconv.Itoa(gathering.socket.localPort),
 		SDPMid: &mid, SDPMLineIndex: &line,
 	})
 }
@@ -110,14 +110,13 @@ func (gathering *localCandidateGathering) start() {
 			survey := make(chan mappedAddress)
 			go func() {
 				defer close(survey)
-				gathering.engine.surveySTUN(gathering.ctx, gathering.servers, func(mapped mappedAddress) {
+				gathering.socket.surveySTUN(gathering.ctx, gathering.servers, func(mapped mappedAddress) {
 					select {
 					case survey <- mapped:
 					case <-gathering.ctx.Done():
 					}
 				})
 			}()
-			index := 0
 			var observed []mappedAddress
 			for survey != nil || mapping != nil {
 				select {
@@ -135,15 +134,14 @@ func (gathering *localCandidateGathering) start() {
 						survey = nil
 						continue
 					}
-					index++
 					mid := "0"
 					line := uint16(0)
 					gathering.emitCandidate(&webrtc.ICECandidateInit{
-						Candidate: "candidate:ns" + strconv.Itoa(index) +
+						Candidate: "candidate:ns" + strconv.Itoa(mapped.serverIndex) +
 							" 1 udp " + strconv.Itoa(surveyCandidatePriority) + " " +
 							mapped.address + " " +
 							strconv.Itoa(mapped.port) + " typ srflx raddr 0.0.0.0 rport " +
-							strconv.Itoa(gathering.engine.localPort),
+							strconv.Itoa(gathering.socket.localPort),
 						SDPMid: &mid, SDPMLineIndex: &line,
 					})
 					if mapping != nil {

@@ -207,6 +207,11 @@ class HardwareEncoder final : public webrtc::VideoEncoder {
       applied_bitrate_ = profile_.bit_rate;
       return WEBRTC_VIDEO_CODEC_OK;
     } catch (...) {
+      if (config) {
+        std::osyncstream(std::cerr) << "event=encoder-initialization-failed codec=h264 width="
+            << config->width << " height=" << config->height
+            << " fps=" << config->maxFramerate << " bitrate=" << config->startBitrate * 1000 << '\n';
+      }
       failure_.Capture();
       Release();
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
@@ -503,7 +508,7 @@ class AdaptiveEncoder::Impl final : public webrtc::VideoSourceInterface<webrtc::
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     if (kind_ == OutputKind::vp8) return {webrtc::SdpVideoFormat("VP8")};
-    return {webrtc::SdpVideoFormat("H264", {{"profile-level-id", ceiling_.profile_level_id()},
+    return {webrtc::SdpVideoFormat("H264", {{"profile-level-id", kH264ProfileLevelId},
         {"packetization-mode", "1"}, {"level-asymmetry-allowed", "1"}})};
   }
   std::unique_ptr<webrtc::VideoEncoder> Create(const webrtc::Environment& env,

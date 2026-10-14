@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-09-29
+Last updated: 2026-10-14
 
 Piik is private, low-latency screen sharing for one Host and up to 20
 authenticated friends. The current product surface is Web Host, Web Viewer, and
@@ -9,11 +9,12 @@ mobile Browsers can also host. It is not a
 public broadcast service. Hosted and App run one shared Go core
 ([ADR-0012](./adr/0012-shared-go-backend-core.md)); Node and Vite build the
 Browser UI and are not a runtime. Source includes a cross-platform App that
-runs that same core in a self-contained Local deployment or opens one configured
-Site through the system Browser. Its single Go process presents Local, temporary
-public-link, and saved-Site choices on every launch, starts one process-level
-loopback capability service, owns the Local room authority in-process when
-selected, and owns the explicit native media path chosen in the same Web UI.
+runs that same core in a self-contained Local deployment or supplies native
+capability to one approved Site through the system Browser. Its single Go
+process starts the loopback capability service before room selection. The
+persistent launcher offers Local and temporary public-link choices and manages
+the Site's explicit local approval. Site use can remain on standby without a
+Local room service; native media still belongs to the participant's Web UI.
 Room source and media implementation are independent: a topology may mix
 Browser and Native peers without changing participant, signaling, capacity, or
 route identity. Local is LAN-first; explicit one-link mode exposes that same
@@ -43,7 +44,8 @@ blank keeps the self-contained site open.
 ## Product Map
 
 - [Rooms and access](./standards/rooms-access.md) owns room codes,
-  invitations, code entry, credentials, and lightweight/SQLite persistence.
+  invitations, code entry, credentials, room interactions and lightweight/SQLite
+  persistence.
 - [Routing and transport](./standards/routing-transport.md) owns P2P-first
   distribution, endpoint capacity, SFU fallback, recovery, and privacy limits.
 - [Capture and media quality](./standards/media-quality.md) owns Browser capture,
@@ -59,9 +61,10 @@ implementation and routine UI detail.
 
 - Rooms use random four-digit codes, exact Host ownership, room-scoped Viewer
   invitations and independent `open | private` code entry. Room authority ends
-  through explicit replacement/deletion, with separate invitation rotation or
-  revocation. Hosted defaults to SQLite, with explicit process-memory opt-out;
-  App Local remains process-only. Site access has a separate 24-hour idle
+  through replacement/deletion, with separate invitation rotation or revocation.
+  Hosted operators may opt into empty-room expiry and capacity reclamation;
+  the default retains rooms indefinitely. Hosted defaults to SQLite, with explicit
+  process-memory opt-out; App Local remains process-only. Site access has a separate 24-hour idle
   cookie lifetime within one service run. Production persists SQLite room
   authority; live participants, routes, and media remain process-only.
 - Media is automatic and distributed. Ordinary peers are STUN-only and prefer
@@ -70,8 +73,9 @@ implementation and routine UI detail.
   available, and anonymous provenance distinguishes ordinary from predicted
   selected paths. The configuration default remains stock ICE. The only
   application fallback is one bounded embedded SFU/UDP
-  publication; Piik configures no TURN or TCP media route. A pre-share
-  peer-only policy can exclude that SFU suffix for one share generation.
+  publication; Piik configures no TURN or TCP media route. Hosted operators may
+  require SFU-only media through the same controller. On P2P-first sites, a
+  pre-share peer-only policy can exclude that SFU suffix for one share generation.
 - Every endpoint shares one steady outbound-copy cap, default `2` and limited to
   `1..3`. One room controller owns one committed graph, one reconcile loop, and
   one serial child operation. First decoded frame commits availability work;
@@ -89,7 +93,9 @@ implementation and routine UI detail.
   periodic rebalance is accepted.
 - Browser video uses `motion`; each share chooses H.264 with VP8 fallback through
   an actual sender probe unless the Host explicitly selects VP8 or H264. Screen
-  audio uses 64/128/192 kbps ceilings with 128 default.
+  audio retains its compact presets and 128 kbps default. The 2.0 contract
+  separates numeric bitrate requests from those UI shortcuts; implementation
+  limits and admission remain in the media-quality owner.
 - Viewer playback uses one native video element. Presentation and recovery are
   fenced by current route/media identity and current-frame proof; hidden-page
   time alone is not media-failure evidence or a keepalive guarantee.

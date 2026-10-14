@@ -19,7 +19,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
-	"github.com/pion/transport/v4/vnet"
+	"github.com/pion/transport/v5/vnet"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -66,13 +66,12 @@ func TestRelayNetworkVP8Fixture(t *testing.T) {
 	engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", InitialBitrate: 1_200_000})
 	check(err)
 	defer engine.Close()
-	source, err := engine.NewSource("vp8", 2, 2, nil)
-	check(err)
-	defer source.Close()
-	source.relay = &relayDerivation{source: source, options: RelayOptions{
+	source, err := engine.newSource("vp8", 2, 2, &RelayOptions{
 		CaptureProcess: os.Getenv("PIIK_NATIVE_CAPTURE"),
 		Capabilities:   nativecapture.Capabilities{SoftwareVP8: true, Adapters: []nativecapture.Adapter{{Index: 0}}},
-	}}
+	}, nil)
+	check(err)
+	defer source.Close()
 	check(source.SetRelayProfile(nativecapture.VideoProfile{Width: 1280, Height: 720,
 		Framerate: 30, Bitrate: 2_000_000, Preference: "balanced"}))
 	router, err := vnet.NewRouter(&vnet.RouterConfig{CIDR: "10.0.0.0/24", MinDelay: 20 * time.Millisecond,
@@ -81,6 +80,8 @@ func TestRelayNetworkVP8Fixture(t *testing.T) {
 	sendNet, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.0.0.1"}})
 	check(err)
 	check(router.AddNet(sendNet))
+	engine.listenPacket = sendNet.ListenPacket
+	engine.bindAddress = "10.0.0.1:0"
 	engine.settings = webrtc.SettingEngine{}
 	engine.settings.SetNet(sendNet)
 	engine.settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
@@ -122,7 +123,6 @@ func TestRelayNetworkVP8Fixture(t *testing.T) {
 		check(media.RegisterDefaultCodecs())
 		registry := &interceptor.Registry{}
 		check(webrtc.RegisterDefaultInterceptors(media, registry))
-		check(webrtc.ConfigureTWCCSender(media, registry))
 		receiver, createErr := webrtc.NewAPI(webrtc.WithMediaEngine(media), webrtc.WithInterceptorRegistry(registry),
 			webrtc.WithSettingEngine(settings)).NewPeerConnection(webrtc.Configuration{})
 		check(createErr)

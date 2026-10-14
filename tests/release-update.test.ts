@@ -19,11 +19,22 @@ const packageAsset = (target: string, suffix = "") => {
 };
 
 describe("App release update notice", () => {
-  it.each(["windows-amd64", "darwin-arm64", "linux-amd64"])("links the published %s ZIP without downloading it during the check", async (packageTarget) => {
-    const assets = ["windows-amd64", "darwin-arm64", "linux-amd64"].map(target => packageAsset(target));
+  it("reads publication time without making optional metadata an update prerequisite", () => {
+    expect(parseReleaseMetadata({ ...release, published_at: "2026-10-01T12:34:56Z" }))
+      .toMatchObject({ version: release.tag_name, publishedAt: "2026-10-01T12:34:56.000Z" });
+    for (const published_at of [undefined, null, 0, "0", "not-a-date", "2026-99-99T00:00:00Z"]) {
+      const parsed = parseReleaseMetadata({ ...release, published_at });
+      expect(parsed?.version).toBe(release.tag_name);
+      expect(parsed?.publishedAt).toBeUndefined();
+    }
+  });
+
+  it.each(["windows-amd64", "darwin-arm64", "darwin-amd64", "linux-amd64", "linux-arm64"])("links the published %s ZIP without downloading it during the check", async (packageTarget) => {
+    const assets = ["windows-amd64", "darwin-arm64", "darwin-amd64", "linux-amd64", "linux-arm64"].map(target => packageAsset(target));
     const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({ ...release, assets }));
     await expect(checkReleaseUpdate({ version: "v1.1.0", revision: currentRevision }, { fetchImpl, packageTarget }))
       .resolves.toMatchObject({ kind: "update-available", version: release.tag_name,
+        releaseURL: release.html_url,
         url: assets.find(asset => asset.name === `piik-app-${packageTarget}.zip`)!.browser_download_url });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(String(fetchImpl.mock.calls[0][0])).toBe(DEFAULT_RELEASE_API_URL);
@@ -54,7 +65,7 @@ describe("App release update notice", () => {
     expect(parseReleaseMetadata({ ...release, assets: [asset] })?.url).toBe(release.html_url);
   });
 
-  it.each(["windows-amd64", "darwin-arm64", "linux-amd64"])("uses a listed mirror %s ZIP only after the existing primary check fails", async (packageTarget) => {
+  it.each(["windows-amd64", "darwin-arm64", "darwin-amd64", "linux-amd64", "linux-arm64"])("uses a listed mirror %s ZIP only after the existing primary check fails", async (packageTarget) => {
     const name = `piik-app-${packageTarget}.zip`;
     const mirrorAsset = { name,
       browser_download_url: `https://gitee.com/TNTcraftHIM/Piik/releases/download/${release.tag_name}/${name}` };
@@ -63,7 +74,8 @@ describe("App release update notice", () => {
     const fetchImpl = vi.fn<typeof fetch>(async (input) => String(input) === DEFAULT_RELEASE_API_URL
       ? new Response(null, { status: 503 }) : Response.json([mirrored]));
     await expect(checkReleaseUpdate({ version: "v1.1.0", revision: currentRevision },
-      { fetchImpl, packageTarget })).resolves.toMatchObject({ url: mirrorAsset.browser_download_url });
+      { fetchImpl, packageTarget })).resolves.toMatchObject({ url: mirrorAsset.browser_download_url,
+        releaseURL: `https://gitee.com/TNTcraftHIM/Piik/releases/tag/${release.tag_name}` });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     for (const assets of [[], [mirrorAsset, mirrorAsset],
       [{ ...mirrorAsset, browser_download_url: mirrorAsset.browser_download_url.replace("gitee.com", "evil.example") }],
@@ -82,7 +94,7 @@ describe("App release update notice", () => {
     });
     await expect(checkReleaseUpdate({ version: "v1.1.0", revision: currentRevision }, { fetchImpl }))
       .resolves.toEqual({ version: "v1.2.0", revision: latestRevision,
-        url: release.html_url, kind: "update-available" });
+        url: release.html_url, releaseURL: release.html_url, kind: "update-available" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
@@ -99,8 +111,21 @@ describe("App release update notice", () => {
     ["development", currentRevision, null, null],
   ])("compares %s by release precedence, using SHA only to identify builds", (version, revision, remoteRevision, expected) => {
     expect(releaseUpdateNotice({ version, revision }, {
-      version: "v1.2.0", revision: remoteRevision, url: release.html_url,
+      version: "v1.2.0", revision: remoteRevision, url: release.html_url, releaseURL: release.html_url,
     })?.kind ?? null).toBe(expected);
+  });
+
+  it.each([
+    ["v1.9.1", "major-update"],
+    ["v0.9.0", "major-update"],
+    ["v2.0.0-rc.1", "update-available"],
+    ["v2.0.0", "different-build"],
+    ["v3.0.0", null],
+    ["development", "official-release"],
+  ])("warns for a newer major without inferring compatibility from an unknown build: %s", (version, kind) => {
+    const latest = parseReleaseMetadata({ ...release, tag_name: "v2.0.0",
+      html_url: "https://github.com/TNTcraftHIM/Piik/releases/tag/v2.0.0" })!;
+    expect(releaseUpdateNotice({ version, revision: currentRevision }, latest)?.kind ?? null).toBe(kind);
   });
 
   it("does not turn branch names, prereleases or malformed metadata into release identity", async () => {
@@ -132,6 +157,7 @@ describe("App release update notice", () => {
     await expect(checkReleaseUpdate(current, { fetchImpl })).resolves.toEqual({
       kind: "update-available", version: "v1.10.0", revision: latestRevision,
       url: "https://gitee.com/TNTcraftHIM/Piik/releases/tag/v1.10.0",
+      releaseURL: "https://gitee.com/TNTcraftHIM/Piik/releases/tag/v1.10.0",
     });
     await expect(checkReleaseUpdate({ ...current, version: "v2.0.0" }, { fetchImpl })).resolves.toBeNull();
   });

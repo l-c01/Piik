@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/TNTcraftHIM/Piik/internal/media/forwarding"
+	"github.com/TNTcraftHIM/Piik/internal/server/protocol"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -125,7 +127,10 @@ func validPublicationMedia(metadata PublicationMedia) bool {
 		return false
 	}
 	for index, format := range metadata.Formats {
-		if format.Width == 0 || format.Height == 0 || format.Bitrate == 0 ||
+		// These are this SFU's admission bounds, not the descriptive wire format.
+		// Forward the full current Browser/Native bitrate range without transcoding.
+		if format.Width == 0 || format.Width > 8192 || format.Height == 0 || format.Height > 8192 ||
+			format.Bitrate == 0 || format.Bitrate > 240_000_000 ||
 			len(metadata.RIDs[index]) > 16 ||
 			(metadata.RIDs[index] == "" && len(metadata.RIDs) != 1) ||
 			slices.Contains(metadata.RIDs[:index], metadata.RIDs[index]) {
@@ -342,9 +347,9 @@ func (media *Media) AcceptPublisherOffer(fence ResourceFence, connectionID strin
 			return webrtc.SessionDescription{}, errors.New("SFU publisher codec does not match its declaration")
 		}
 		if transceiver.Kind() == webrtc.RTPCodecTypeAudio {
-			selected[0].SDPFmtpLine = "minptime=10;useinbandfec=1;stereo=1;usedtx=0"
+			selected[0].SDPFmtpLine = "minptime=10;useinbandfec=1;stereo=1;usedtx=0;maxaveragebitrate=" + strconv.Itoa(protocol.MaxAudioBitrate)
 		}
-		if err = transceiver.SetCodecPreferences(selected[:1]); err != nil {
+		if err = transceiver.SetCodecPreferences(forwarding.WithRTX(selected[0], parameters.Codecs)); err != nil {
 			return webrtc.SessionDescription{}, err
 		}
 	}
@@ -390,15 +395,6 @@ func (media *Media) UpdatePublication(fence ResourceFence, connectionID string, 
 	metadata.Formats, metadata.RIDs = slices.Clone(metadata.Formats), slices.Clone(metadata.RIDs)
 	publication.metadata = metadata
 	publication.wakeDemand()
-	bitrate := uint32(0)
-	if metadata.Audio {
-		bitrate = metadata.AudioBitrate
-	}
-	for _, subscriber := range publication.subscribers {
-		if subscriber.transport != nil {
-			subscriber.transport.SetAudioBitrate(bitrate)
-		}
-	}
 	return nil
 }
 
@@ -459,7 +455,7 @@ func (publication *mediaPublication) consumeTrack(track *webrtc.TrackRemote, rec
 	go publication.readRTCP(track, receiver, source, layer)
 	defer publication.readers.Done()
 	for {
-		packet, _, err := track.ReadRTP()
+		packet, _, err := forwarding.ReadRTP(track)
 		if err != nil {
 			return
 		}
@@ -577,9 +573,6 @@ func (media *Media) PrepareSubscriber(ctx context.Context, fence SubscriptionFen
 	if err != nil {
 		return webrtc.SessionDescription{}, err
 	}
-	if metadata.Audio {
-		transport.SetAudioBitrate(metadata.AudioBitrate)
-	}
 	publication.mu.Lock()
 	if publication.closed || publication.failure != nil || publication.subscribers[key] != subscriber || ctx.Err() != nil || lifetime.Err() != nil {
 		publication.mu.Unlock()
@@ -638,6 +631,11 @@ func (media *Media) ApplySubscriberAnswer(fence SubscriptionFence, connectionID 
 	defer subscriber.signaling.Unlock()
 	if answer.Type != webrtc.SDPTypeAnswer {
 		return errors.New("SFU subscriber requires an answer")
+	}
+	if subscriber.transport.AudioSender != nil {
+		if err := forwarding.CheckAudioReceiveLimit(answer.SDP, protocol.MaxAudioBitrate); err != nil {
+			return err
+		}
 	}
 	return subscriber.transport.PC.SetRemoteDescription(answer)
 }

@@ -1,3 +1,5 @@
+import { parse } from "sdp-transform";
+
 export type BrowserVideoCodec = "h264" | "vp8";
 export type BrowserVideoCodecMode = "vp8" | "auto" | "h264";
 
@@ -110,4 +112,50 @@ export function applyH264ProbeCodec(
   const h264 = h264ModeOneCodecs(codecs);
   return h264.length > 0 &&
     applyCodecs(transceiver, [...h264, ...repairCodecs(codecs)]);
+}
+
+/** Remove only attributes of codecs excluded from a locally generated offer.
+ * Firefox can retain them after setCodecPreferences (Mozilla bug 1909443),
+ * making the whole offer unparseable in Chromium. Do not rewrite codec choices,
+ * valid feedback, unknown attributes or answers with asymmetric payload types.
+ */
+export function normalizeVideoOfferSdp(sdp: string): string {
+  let payloads: Set<number> | null = null;
+  let changed = false;
+  const lines = sdp.split(/\r?\n/).filter(line => {
+    if (line.startsWith("m=")) {
+      const fields = line.trim().split(/\s+/);
+      payloads = fields[0] === "m=video" && fields.length >= 4
+        ? new Set(fields.slice(3).map(Number)) : null;
+    }
+    const attribute = /^a=(?:fmtp|rtcp-fb):(\d+)(?:\s|$)/.exec(line);
+    if (payloads && attribute && !payloads.has(Number(attribute[1]))) {
+      changed = true;
+      return false;
+    }
+    return true;
+  });
+  return changed ? lines.join(sdp.includes("\r\n") ? "\r\n" : "\n") : sdp;
+}
+
+export class VideoReceiveRejectedError extends Error {
+  constructor() { super("Browser rejected the offered video"); }
+}
+
+// JSEP rejects a media section with port zero. Let the Browser negotiate codecs;
+// reject only an answer that explicitly declines every offered sending video.
+export function requireReceivingVideo(
+  offer: RTCSessionDescriptionInit,
+  answer: RTCSessionDescriptionInit,
+): void {
+  if (offer.type !== "offer" || answer.type !== "answer" || !offer.sdp || !answer.sdp) return;
+  const remote = parse(offer.sdp), local = parse(answer.sdp);
+  const sendingVideo = remote.media.flatMap((media, index) => {
+    const direction = media.direction ?? remote.direction;
+    return media.type === "video" && (media.port !== 0 || media.bundleOnly !== undefined) &&
+      direction !== "inactive" && direction !== "recvonly" ? [index] : [];
+  });
+  if (sendingVideo.length > 0 && sendingVideo.every(index =>
+    local.media[index]?.type === "video" && local.media[index]?.port === 0,
+  )) throw new VideoReceiveRejectedError();
 }

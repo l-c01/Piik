@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,13 +35,11 @@ type Mode string
 const (
 	ModeLocal Mode = "local"
 	ModeLink  Mode = "link"
-	ModeSite  Mode = "site"
 )
 
 type Selection struct {
 	Mode                Mode    `json:"mode"`
 	Language            string  `json:"language"`
-	Site                string  `json:"site,omitempty"`
 	LocalAccessPassword string  `json:"localAccessPassword"`
 	Debug               bool    `json:"debug,omitempty"`
 	LANAddress          *string `json:"lanAddress,omitempty"`
@@ -54,6 +53,8 @@ type Options struct {
 	LocalAccessPassword string
 	Debug               bool
 	LANAddress          string
+	ChangeSite          func(string) (string, error)
+	EnableDebug         func() error
 }
 
 var listLANAddresses = lan.List
@@ -72,20 +73,20 @@ type Server struct {
 	revision            string
 	debug               bool
 	lanAddress          string
+	changeSite          func(string) (string, error)
+	enableDebug         func() error
 	selection           chan Selection
 	resultReady         chan struct{}
-	handled             chan struct{}
 	done                chan error
 	ready               chan struct{}
 
-	mu          sync.Mutex
-	selected    bool
-	resultSet   bool
-	target      string
-	resultErr   error
-	closeOnce   sync.Once
-	resultOnce  sync.Once
-	handledOnce sync.Once
+	mu         sync.Mutex
+	selected   bool
+	resultSet  bool
+	target     string
+	resultErr  error
+	closeOnce  sync.Once
+	resultOnce sync.Once
 }
 
 // Start serves the launcher page and its API on a loopback port. assets is the
@@ -123,9 +124,10 @@ func Start(parent context.Context, assets fs.FS, options Options) (*Server, erro
 		revision:            strings.TrimSpace(options.Revision),
 		debug:               options.Debug,
 		lanAddress:          options.LANAddress,
+		changeSite:          options.ChangeSite,
+		enableDebug:         options.EnableDebug,
 		selection:           make(chan Selection, 1),
 		resultReady:         make(chan struct{}),
-		handled:             make(chan struct{}),
 		done:                make(chan error, 1),
 		ready:               make(chan struct{}),
 	}
@@ -151,26 +153,31 @@ func (server *Server) Selection() <-chan Selection {
 	return server.selection
 }
 
-func (server *Server) Handled() <-chan struct{} {
-	return server.handled
-}
-
 func (server *Server) Done() <-chan error {
 	return server.done
 }
 
+func (server *Server) Begin() bool {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.selected {
+		return false
+	}
+	server.selected = true
+	return true
+}
+
 func (server *Server) SetResult(target string, resultErr error) {
-	server.resultOnce.Do(func() {
-		if resultErr == nil && !validTarget(target) {
-			resultErr = errors.New("App target is invalid")
-		}
-		server.mu.Lock()
-		server.resultSet = true
-		server.target = target
-		server.resultErr = resultErr
-		server.mu.Unlock()
-		close(server.resultReady)
-	})
+	if resultErr == nil && !validTarget(target) {
+		resultErr = errors.New("App target is invalid")
+	}
+	server.mu.Lock()
+	server.resultSet = true
+	server.target = target
+	server.resultErr = resultErr
+	server.mu.Unlock()
+	// Readiness completes once; a later room failure invalidates the old target.
+	server.resultOnce.Do(func() { close(server.resultReady) })
 }
 
 func (server *Server) Close() error {
@@ -196,11 +203,18 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		return
 	}
 	response.Header().Set("X-Content-Type-Options", "nosniff")
+	response.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+	response.Header().Set("X-Frame-Options", "DENY")
+	response.Header().Set("Referrer-Policy", "no-referrer")
 	switch request.URL.Path {
 	case "/api/client-launcher":
 		server.handleState(response, request)
 	case "/api/client-launcher/launch":
 		server.handleLaunch(response, request)
+	case "/api/client-launcher/site":
+		server.handleSite(response, request)
+	case "/api/client-launcher/debug":
+		server.handleDebug(response, request)
 	case "/client", "/client/":
 		if request.Method != http.MethodGet && request.Method != http.MethodHead {
 			response.Header().Set("Allow", "GET, HEAD")
@@ -232,24 +246,97 @@ func (server *Server) handleState(response http.ResponseWriter, request *http.Re
 		values = append(values, address.Address)
 	}
 	selected, _ := lan.Select(values, server.lanAddress)
-	writeJSON(response, http.StatusOK, map[string]any{
+	server.mu.Lock()
+	state := map[string]any{
 		"site":                server.site,
 		"localAccessPassword": server.localAccessPassword,
 		"version":             server.version,
 		"revision":            server.revision,
 		"packageTarget":       runtime.GOOS + "-" + runtime.GOARCH,
 		"debug":               server.debug,
+		"target":              server.target,
+		"starting":            server.selected && !server.resultSet,
+		"detail":              errorDetail(server.resultErr),
 		"lan":                 map[string]any{"addresses": addresses, "selected": selected},
 		"defaultMode": func() Mode {
-			if validMode(server.defaultMode) && (server.defaultMode != ModeSite || server.site != "") {
+			if server.defaultMode == ModeLocal || server.defaultMode == ModeLink {
 				return server.defaultMode
-			}
-			if server.site != "" {
-				return ModeSite
 			}
 			return ModeLink
 		}(),
-	})
+	}
+	server.mu.Unlock()
+	writeJSON(response, http.StatusOK, state)
+}
+
+func (server *Server) handleSite(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	request.Body = http.MaxBytesReader(response, request.Body, maxRequestBytes)
+	var change struct {
+		Site         string `json:"site"`
+		ExpectedSite string `json:"expectedSite"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&change) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		http.Error(response, "invalid site request", http.StatusBadRequest)
+		return
+	}
+	site, err := appconfig.NormalizeSite(change.Site)
+	if err != nil {
+		http.Error(response, "invalid site origin", http.StatusBadRequest)
+		return
+	}
+	server.mu.Lock()
+	if server.site != change.ExpectedSite {
+		current := server.site
+		server.mu.Unlock()
+		writeJSON(response, http.StatusConflict, map[string]string{"site": current})
+		return
+	}
+	if server.changeSite == nil {
+		server.mu.Unlock()
+		http.Error(response, "site approval is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	current, err := server.changeSite(site)
+	// Revocation can succeed while media cleanup times out. Reflect the actual
+	// saved permission even on error; a stale confirmation must not restore it.
+	server.site = current
+	server.mu.Unlock()
+	if err != nil {
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"site": current, "detail": errorDetail(err)})
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]string{"site": current})
+}
+
+func (server *Server) handleDebug(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server.mu.Lock()
+	if !server.debug {
+		if server.selected || server.enableDebug == nil {
+			server.mu.Unlock()
+			http.Error(response, "enable diagnostics before starting a local room", http.StatusConflict)
+			return
+		}
+		if err := server.enableDebug(); err != nil {
+			server.mu.Unlock()
+			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"detail": errorDetail(err)})
+			return
+		}
+		server.debug = true
+	}
+	server.mu.Unlock()
+	writeJSON(response, http.StatusOK, map[string]bool{"debug": true})
 }
 
 func (server *Server) handleLaunch(response http.ResponseWriter, request *http.Request) {
@@ -266,33 +353,21 @@ func (server *Server) handleLaunch(response http.ResponseWriter, request *http.R
 		})
 		return
 	}
-	server.mu.Lock()
-	if server.selected {
-		server.mu.Unlock()
+	if !server.Begin() {
 		writeJSON(response, http.StatusConflict, map[string]string{
 			"error": "launch already requested", "detail": "Close and reopen Piik before starting again.",
 		})
 		return
 	}
-	server.selected = true
-	server.mu.Unlock()
 
-	select {
-	case server.selection <- selection:
-	case <-request.Context().Done():
-		server.markHandled()
-		return
-	case <-server.ctx.Done():
-		server.markHandled()
-		return
-	}
+	// Begin commits this one selection to the App, independently of the page.
+	// The single-slot queue cannot block: only the accepted request writes it.
+	server.selection <- selection
 	select {
 	case <-server.resultReady:
 	case <-request.Context().Done():
-		server.markHandled()
 		return
 	case <-server.ctx.Done():
-		server.markHandled()
 		return
 	}
 	server.mu.Lock()
@@ -302,11 +377,9 @@ func (server *Server) handleLaunch(response http.ResponseWriter, request *http.R
 		writeJSON(response, http.StatusServiceUnavailable, map[string]string{
 			"error": "Piik App could not start", "detail": errorDetail(resultErr),
 		})
-		server.markHandled()
 		return
 	}
 	writeJSON(response, http.StatusOK, map[string]string{"target": target})
-	server.markHandled()
 }
 
 func errorDetail(err error) string {
@@ -319,10 +392,6 @@ func errorDetail(err error) string {
 		return string(detail[:2048]) + "..."
 	}
 	return string(detail)
-}
-
-func (server *Server) markHandled() {
-	server.handledOnce.Do(func() { close(server.handled) })
 }
 
 func (server *Server) requestAllowed(request *http.Request) bool {
@@ -339,6 +408,10 @@ func (server *Server) requestAllowed(request *http.Request) bool {
 		return false
 	}
 	origin := strings.TrimSpace(request.Header.Get("Origin"))
+	if request.Method == http.MethodPost {
+		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+		return err == nil && mediaType == "application/json" && sameOrigin(origin, "http://"+request.Host)
+	}
 	return origin == "" || sameOrigin(origin, "http://"+request.Host)
 }
 
@@ -373,19 +446,6 @@ func decodeSelection(reader io.Reader) (Selection, error) {
 	}
 	switch selection.Mode {
 	case ModeLocal, ModeLink:
-		if strings.TrimSpace(selection.Site) != "" {
-			return Selection{}, errors.New("local launch cannot include a Site")
-		}
-		selection.Site = ""
-	case ModeSite:
-		if selection.LocalAccessPassword != "" {
-			return Selection{}, errors.New("Site launch cannot include a local access password")
-		}
-		normalized, err := appconfig.NormalizeSite(selection.Site)
-		if err != nil || normalized == "" {
-			return Selection{}, errors.New("Site launch requires an HTTP or HTTPS origin")
-		}
-		selection.Site = normalized
 	default:
 		return Selection{}, errors.New("unknown launch mode")
 	}

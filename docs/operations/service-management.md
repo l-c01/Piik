@@ -1,6 +1,6 @@
 # Service Management
 
-English · [简体中文](./service-management.zh-CN.md) · [Documentation](../README.md)
+English · [简体中文](./service-management.zh-CN.md) · [Documentation](../guide/README.md)
 
 For first installation, use the [short self-hosting guide](./self-hosting.md).
 This reference covers a persistent Linux service and container maintenance.
@@ -32,7 +32,8 @@ after adapting the domain and certificate paths.
 
 Use the [Docker Compose setup](./self-hosting.md#docker-compose) for installation.
 The image is `ghcr.io/tntcrafthim/piik`, with `latest` and matching product version
-tags (`vMAJOR.MINOR.PATCH`). It supports **linux/amd64**. Set `PIIK_IMAGE` in `.env`
+tags (`vMAJOR.MINOR.PATCH`). Docker selects **linux/amd64** or **linux/arm64**
+to match the host. Set `PIIK_IMAGE` in `.env`
 to pin a version or image digest. Updates are explicit; pulling an image does not
 replace a running container.
 

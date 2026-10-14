@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,57 @@ func TestMediaOnePublicationTwoSubscribersAndExactRetirement(t *testing.T) {
 				runMediaFanout(t, codec, layerCount)
 			})
 		}
+	}
+}
+
+func TestUnsupportedPublicationDescriptionDoesNotAllocate(t *testing.T) {
+	service := NewMedia(MediaOptions{})
+	defer service.Close()
+	fence := ResourceFence{RoomID: "1234", ShareGeneration: "share_12345678", PublicationGeneration: "publication_12345678"}
+	for _, format := range []forwarding.LayerFormat{
+		{Width: 32768, Height: 32768, Bitrate: 5_000_000},
+		{Width: 1920, Height: 1080, Bitrate: 240_000_001},
+		{Width: 0xffff_ffff, Height: 0xffff_ffff, Bitrate: 0xffff_ffff},
+	} {
+		metadata := PublicationMedia{Codec: "vp8", RIDs: []string{""}, Formats: []forwarding.LayerFormat{format}}
+		if err := service.PreparePublication(fence, "publisher_12345678", metadata); err == nil {
+			t.Fatal("unsupported format was admitted")
+		}
+		if service.HasPublication(fence, "publisher_12345678") {
+			t.Fatal("unsupported format allocated a publication")
+		}
+	}
+}
+
+func TestPublicationAdmitsSupportedBitrateCeilings(t *testing.T) {
+	service := NewMedia(MediaOptions{})
+	defer service.Close()
+	fence := ResourceFence{RoomID: "1234", ShareGeneration: "share_12345678", PublicationGeneration: "publication_12345678"}
+	metadata := PublicationMedia{Codec: "h264", RIDs: []string{""},
+		Formats: []forwarding.LayerFormat{{Width: 1920, Height: 1080, Bitrate: 240_000_000}}}
+	if err := service.PreparePublication(fence, "publisher_12345678", metadata); err != nil {
+		t.Fatalf("prepare supported publisher: %v", err)
+	}
+	publication, err := service.publication(fence, "publisher_12345678")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := publication.pc
+	for _, bitrate := range []uint32{5_000_000, 100_000_001, 240_000_000} {
+		metadata.Formats[0].Bitrate = bitrate
+		if err := service.UpdatePublication(fence, "publisher_12345678", metadata); err != nil {
+			t.Fatalf("update supported ceiling %d: %v", bitrate, err)
+		}
+		if publication.pc != pc || publication.metadata.Formats[0].Bitrate != bitrate {
+			t.Fatal("quality update replaced the publication or lost its bitrate ceiling")
+		}
+	}
+	metadata.Formats[0].Bitrate++
+	if err := service.UpdatePublication(fence, "publisher_12345678", metadata); err == nil {
+		t.Fatal("unsupported update was admitted")
+	}
+	if publication.pc != pc || publication.metadata.Formats[0].Bitrate != 240_000_000 {
+		t.Fatal("rejected update changed the existing publication")
 	}
 }
 
@@ -223,6 +275,12 @@ func runMediaFanout(t *testing.T, codec string, layerCount int) {
 		t.Fatal(ctx.Err())
 	}
 	check(publisher.SetRemoteDescription(*publication.pc.LocalDescription()))
+	parameters := publication.pc.GetTransceivers()[0].Receiver().GetParameters()
+	if len(parameters.Codecs) != 2 || parameters.Codecs[0].MimeType != capability.MimeType ||
+		parameters.Codecs[1].MimeType != webrtc.MimeTypeRTX ||
+		parameters.Codecs[1].SDPFmtpLine != fmt.Sprintf("apt=%d", parameters.Codecs[0].PayloadType) {
+		t.Fatalf("publisher lost its selected codec/repair pair: %v", parameters.Codecs)
+	}
 	mid := publisher.GetTransceivers()[0].Mid()
 	headerExtensions := videoSender.GetParameters().HeaderExtensions
 	stopSamples := make(chan struct{})
@@ -296,9 +354,45 @@ func runMediaFanout(t *testing.T, codec string, layerCount int) {
 			}
 		})
 		check(receiver.SetRemoteDescription(offer))
+		for _, transceiver := range receiver.GetTransceivers() {
+			if transceiver.Kind() != webrtc.RTPCodecTypeAudio {
+				continue
+			}
+			for _, codec := range transceiver.Receiver().GetParameters().Codecs {
+				if codec.MimeType == webrtc.MimeTypeOpus {
+					codec.SDPFmtpLine = "stereo=1;maxaveragebitrate=510000"
+					check(transceiver.SetCodecPreferences([]webrtc.RTPCodecParameters{codec}))
+					break
+				}
+			}
+		}
 		answer, answerErr := receiver.CreateAnswer(nil)
 		check(answerErr)
-		check(service.ApplySubscriberAnswer(subscription, "subscriber_123456", waitGathering(receiver, answer)))
+		answer = waitGathering(receiver, answer)
+		if index == 1 {
+			// Admission of one limited receiver must not bind its incompatible
+			// audio or disturb the publication and its already-playing sibling.
+			limited := answer
+			limited.SDP = strings.ReplaceAll(limited.SDP, "maxaveragebitrate=510000", "maxaveragebitrate=192000")
+			if limited.SDP == answer.SDP {
+				t.Fatal("receiver fixture did not declare its Opus limit")
+			}
+			if service.ApplySubscriberAnswer(subscription, "subscriber_123456", limited) == nil {
+				t.Fatal("shared audio accepted an insufficient receiver limit")
+			}
+			if physical.transport.PC.RemoteDescription() != nil {
+				t.Fatal("rejected answer was applied before admission")
+			}
+			beforeVideo, beforeAudio := videoPackets[0].Load(), audioPackets[0].Load()
+			for videoPackets[0].Load() < beforeVideo+3 || audioPackets[0].Load() < beforeAudio+3 {
+				select {
+				case <-time.After(10 * time.Millisecond):
+				case <-ctx.Done():
+					t.Fatal("receiver rejection interrupted its healthy sibling")
+				}
+			}
+		}
+		check(service.ApplySubscriberAnswer(subscription, "subscriber_123456", answer))
 	}
 	for videoPackets[0].Load() < 3 || videoPackets[1].Load() < 3 ||
 		audioPackets[0].Load() < 3 || audioPackets[1].Load() < 3 {

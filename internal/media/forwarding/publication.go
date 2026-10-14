@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/TNTcraftHIM/Piik/internal/diagnostics"
+	"github.com/TNTcraftHIM/Piik/internal/thirdparty/livekit/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/bwe"
-	"github.com/livekit/livekit-server/pkg/sfu/bwe/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
 	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
@@ -23,7 +23,7 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/transport/v4/packetio"
+	"github.com/pion/transport/v5/packetio"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -67,16 +67,14 @@ func NewPublication(options TransportOptions) (_ *Publication, err error) {
 	})}
 	publication.bandwidth.target.Store(int64(options.InitialBitrate))
 	publication.pacer = &publicationPacer{headers: make(map[uint32]publicationHeaders), boundedPacer: newBoundedPacer(
-		pacer.NewLeakyBucket(log, nil, 5*time.Millisecond, options.InitialBitrate), log, options.Source.maxPackets,
-	), bandwidth: publication.bandwidth}
+		pacer.NewNoQueue(log, nil), log, options.Source.maxPackets,
+	)}
 	publication.pacer.sender = pacer.NewBase(log, publication.bandwidth)
-	publication.bandwidth.pacer = publication.pacer
 	publication.allocator = streamallocator.NewStreamAllocator(streamallocator.StreamAllocatorParams{
 		Config: streamallocator.DefaultStreamAllocatorConfig, BWE: publication.bandwidth,
 		Pacer: publication.pacer, Logger: log,
 	}, true, true)
 	publication.allocator.Start()
-	publication.pacer.SetBitrate(options.InitialBitrate)
 	media := &webrtc.MediaEngine{}
 	codec := options.Source.Codec()
 	if err = media.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
@@ -112,7 +110,7 @@ func NewPublication(options TransportOptions) (_ *Publication, err error) {
 				return reader
 			}
 		}
-		input := packetio.NewBuffer()
+		input := &packetBuffer{Buffer: packetio.NewBuffer()}
 		limit := 1_000_000
 		if kind == packetio.RTCPBufferPacket {
 			limit = 100_000
@@ -148,7 +146,6 @@ func NewPublication(options TransportOptions) (_ *Publication, err error) {
 			return nil, trackErr
 		}
 		publication.tracks = append(publication.tracks, track)
-		track.SetMaxTemporalLayer(0)
 		track.SetMaxSpatialLayer(int32(index))
 		local := &publicationTrack{DownTrack: track, id: options.Source.TrackID(), rid: PublicationRID(index, publication.activeCount), pacer: publication.pacer, counters: &publication.counters[index]}
 		if transceiver == nil {
@@ -295,11 +292,8 @@ func (publication *Publication) RequiredActiveCount() int {
 	return publication.activeCount
 }
 
-func (publication *Publication) SetAudioBitrate(bitrate uint32) {
-	publication.bandwidth.audio.Store(int64(bitrate))
-}
 func (publication *Publication) VideoBudget() int64 {
-	return max(publication.bandwidth.target.Load()-publication.bandwidth.audio.Load(), 0)
+	return publication.bandwidth.target.Load()
 }
 func (publication *Publication) LowestLayerBudget() int64 {
 	remaining := publication.VideoBudget()
@@ -530,7 +524,11 @@ type publicationWriter struct {
 func (writer *publicationWriter) WriteRTP(header *rtp.Header, payload []byte) (int, error) {
 	written, err := writer.TrackLocalWriter.WriteRTP(header, payload)
 	if err == nil && written > 0 {
-		writer.bytes.Add(uint64(header.MarshalSize() + len(payload)))
+		size := header.MarshalSize() + len(payload)
+		if header.Padding {
+			size += int(header.PaddingSize)
+		}
+		writer.bytes.Add(uint64(size))
 		if writer.frames != nil && writer.primary && header.Marker && len(payload) > 0 {
 			writer.frames.Add(1)
 		}
@@ -555,18 +553,13 @@ type publicationAudioContext struct {
 
 func (context publicationAudioContext) WriteStream() webrtc.TrackLocalWriter { return context.writer }
 
-// Opus uses its one existing encoder at an explicit fixed ceiling. Reserve its
-// bytes from allocator capacities. TWCC observes video; reserving unobserved
-// audio is conservative and does not claim that the estimator acknowledged it.
+// TWCC measures video and its probes. Audio shares the path but is not counted
+// in this estimate; subtracting it here would understate the video budget.
 type publicationBWE struct {
 	*sendsidebwe.SendSideBWE
-	listener       bwe.BWEListener
-	target         atomic.Int64
-	audio          atomic.Int64
-	observed       atomic.Bool
-	pacer          *publicationPacer
-	probeMu        sync.Mutex
-	completedProbe ccutils.ProbeClusterInfo
+	listener bwe.BWEListener
+	target   atomic.Int64
+	observed atomic.Bool
 }
 
 func (bandwidth *publicationBWE) HandleTWCCFeedback(report *rtcp.TransportLayerCC) {
@@ -579,41 +572,23 @@ func (bandwidth *publicationBWE) SetBWEListener(listener bwe.BWEListener) {
 	bandwidth.SendSideBWE.SetBWEListener(bandwidth)
 }
 func (bandwidth *publicationBWE) OnCongestionStateChange(from, to bwe.CongestionState, capacity int64) {
-	if capacity > 0 {
+	// As for an individual Transport, only a completed non-congesting probe
+	// can raise committed capacity. All consumers use that same accepted value.
+	if to == bwe.CongestionStateCongested && capacity > 0 && capacity < bandwidth.target.Load() {
 		bandwidth.target.Store(capacity)
-		bandwidth.pacer.SetBitrate(int(capacity))
 	}
-	bandwidth.listener.OnCongestionStateChange(from, to, max(capacity-bandwidth.audio.Load(), 0))
-}
-func (bandwidth *publicationBWE) ProbeClusterDone(info ccutils.ProbeClusterInfo) {
-	bandwidth.probeMu.Lock()
-	defer bandwidth.probeMu.Unlock()
-	bandwidth.completedProbe = info
-	bandwidth.SendSideBWE.ProbeClusterDone(info)
+	bandwidth.listener.OnCongestionStateChange(from, to, bandwidth.target.Load())
 }
 func (bandwidth *publicationBWE) ProbeClusterFinalize() (ccutils.ProbeSignal, int64, bool) {
-	bandwidth.probeMu.Lock()
-	defer bandwidth.probeMu.Unlock()
 	signal, capacity, done := bandwidth.SendSideBWE.ProbeClusterFinalize()
-	if done {
-		valid := sendsidebwe.DefaultSendSideBWEConfig.CongestionDetector.ProbeSignal.IsValid(bandwidth.completedProbe)
-		bandwidth.completedProbe = ccutils.ProbeClusterInfoInvalid
-		if !valid {
-			// StreamAllocator may upgrade on Inconclusive too. Its capacity must
-			// never promote the estimator's initial sentinel after an empty probe.
-			signal = ccutils.ProbeSignalInconclusive
-			capacity = min(capacity, bandwidth.target.Load())
-		} else if signal == ccutils.ProbeSignalNotCongesting && capacity > bandwidth.target.Load() {
-			bandwidth.target.Store(capacity)
-			bandwidth.pacer.SetBitrate(int(capacity))
-		}
+	if done && signal == ccutils.ProbeSignalNotCongesting && capacity > bandwidth.target.Load() {
+		bandwidth.target.Store(capacity)
 	}
-	return signal, max(capacity-bandwidth.audio.Load(), 0), done
+	return signal, bandwidth.target.Load(), done
 }
 
 type publicationPacer struct {
 	*boundedPacer
-	bandwidth *publicationBWE
 	headersMu sync.Mutex
 	headers   map[uint32]publicationHeaders
 }
@@ -635,13 +610,8 @@ func (queue *publicationPacer) Enqueue(packet *pacer.Packet) {
 	}
 	queue.boundedPacer.Enqueue(packet)
 }
-func (queue *publicationPacer) StartProbeCluster(info ccutils.ProbeClusterInfo) {
-	queue.boundedPacer.StartProbeCluster(info)
-	queue.SetBitrate(info.Goal.DesiredBps + int(queue.bandwidth.audio.Load()))
-}
 func (queue *publicationPacer) EndProbeCluster(id ccutils.ProbeClusterId) ccutils.ProbeClusterInfo {
 	info := queue.boundedPacer.EndProbeCluster(id)
 	queue.cancelProbes(id)
-	queue.SetBitrate(int(queue.bandwidth.target.Load()))
 	return info
 }

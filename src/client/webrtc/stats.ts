@@ -6,6 +6,7 @@ import { packetLossPercentFromDeltas } from "../../shared/packet-loss";
 import { deriveVideoCodecEvidence } from "../../shared/video-codec-evidence";
 import { isPredictedCandidateFoundation } from "../../shared/nat-candidate";
 import { debugRtcFailure, debugRtcStats } from "../lib/debug-webrtc";
+import { senderCaptureTrack } from "../media/sender-video-track";
 
 type StatsRecord = Record<string, unknown> & {
   id: string;
@@ -208,7 +209,7 @@ export function captureMetrics(
   "captureWidth" | "captureHeight" | "captureFramesPerSecond"
 > {
   try {
-    const settings = track.getSettings();
+    const settings = senderCaptureTrack(track).getSettings();
     const finite = (value: unknown): number | null =>
       typeof value === "number" && Number.isFinite(value) ? value : null;
     return {
@@ -412,13 +413,28 @@ function mediaTrackIdentifier(
   return stringValue(source, "trackIdentifier");
 }
 
-function mediaSourceRecord(
+export function mediaSourceRecord(
   report: RTCStatsReport,
   media: StatsRecord | null,
 ): StatsRecord | null {
-  const source = getRecord(report, stringValue(media, "mediaSourceId"));
-  return source?.type === "media-source"
-    ? source
+  if (!media || media.type !== "outbound-rtp" || media.isRemote === true) return null;
+  if (media.mediaSourceId !== undefined) {
+    const source = getRecord(report, stringValue(media, "mediaSourceId"));
+    return source?.type === "media-source" ? source : null;
+  }
+  if (media.kind !== "video" && media.kind !== "audio") return null;
+  // Some browsers omit the link. Infer it only for one sender and one source
+  // of the same kind; stale/multiple senders or sources remain ambiguous.
+  const senders: StatsRecord[] = [];
+  const sources: StatsRecord[] = [];
+  report.forEach((raw) => {
+    const record = raw as StatsRecord;
+    if (record.kind !== media.kind) return;
+    if (record.type === "outbound-rtp" && record.isRemote !== true) senders.push(record);
+    if (record.type === "media-source") sources.push(record);
+  });
+  return senders.length === 1 && senders[0]!.id === media.id && sources.length === 1
+    ? sources[0]!
     : null;
 }
 

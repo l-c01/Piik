@@ -1,6 +1,6 @@
 # Verification Status
 
-Last updated: 2026-09-17
+Last updated: 2026-10-14
 
 This file owns physical evidence limits that change how the product may be
 described. [Status](./status.md) owns the execution/deployment index.
@@ -10,8 +10,9 @@ implementation and obsolete package history.
 ## Current Evidence
 
 Windows App and Browser are the owner's primary acceptance targets. Current
-Go packages embed their Web assets and do not run a Node backend. The current
-contract is Browser/server v23, Native control v9 and capture v7.
+Go packages embed their Web assets and do not run a Node backend.
+[Status](./status.md#accepted-release-contract) owns the accepted contract tuple
+and current release boundary; artifacts own the exact published build.
 
 Bounded current checks cover:
 
@@ -45,7 +46,28 @@ Neither a statistical NAT campaign nor exhaustive Auto hardware benchmarking
 is required to close this phase. Investigate further only from a new failure
 or a measured improvement worth its implementation and maintenance cost.
 
-## Candidate Evidence Boundary
+## Device Evidence Boundary
+
+Windows HDR-to-SDR has synthetic FP16 conversion and decoded
+H.264/VP8 Browser reception evidence. Local displays were in SDR mode; real HDR
+content, SDR white on HDR displays, mixed-display movement, display-mode changes
+and sustained GPU contention still require physical acceptance. The
+[fidelity assessment](./research/media-fidelity.md#hdr-to-sdr) owns measurements.
+These checks do not establish Browser-capture HDR behavior or end-to-end HDR.
+
+Windows source-audio exclusion has bounded parent/child tone-isolation and
+target-exit evidence. It does not establish coverage of arbitrary process trees
+or real voice applications across playback devices. Windows 10 exclusion
+activation and tone isolation still need a physical device check. The
+[audio assessment](./research/native-client-media.md#windows-audio-exclusion)
+owns that distinction.
+
+Room interactions have multi-page Browser evidence for stop/resume, idle-room
+join, Host departure/return, reconnect, invitation revocation and event timing.
+Responsive Browser checks cover narrow portrait and landscape layouts, but not
+real phone keyboards, Safari behavior or every touch/device combination. The
+owner accepted this bounded UI/model walkthrough for phase closure; these
+physical limits remain open and are not release authorization.
 
 The 2026-09-11 functional test acceptance used two genuine Windows App packages
 and matching Server source/Web builds under the same private contract. Both App/Site version
@@ -66,6 +88,14 @@ The first public release passed real Server/three-platform App packaging and
 GitHub/Gitee publication, including anonymous mirror checksum verification.
 These packaging checks do not establish physical macOS/Linux capture or expand the device/network evidence
 below. [Status](./status.md) owns current publication and activation state.
+Intel macOS runners can lack a usable hardware H.264 encoder. In that case,
+the VideoToolbox frame self-test is explicitly skipped; compilation and package
+startup do not establish Intel hardware capture. Verify it on a physical Intel
+Mac with macOS 13 or newer before claiming that device coverage.
+Linux x64 and ARM64 use the same Portal/PipeWire/GStreamer capture path.
+Package startup and headless native regressions do not establish physical
+screen/audio capture or a working hardware H.264 encoder on an ARM64 desktop.
+Verify those capabilities on the target device before claiming device coverage.
 
 ## Remaining Device And Network Acceptance
 

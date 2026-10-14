@@ -19,6 +19,11 @@ import (
 
 func TestMain(tests *testing.M) {
 	if mode := os.Getenv("PIIK_TUNNEL_FIXTURE"); mode != "" {
+		if mode == "plain-exit" {
+			fmt.Fprintln(os.Stderr, "failed to request quick Tunnel: connect timeout token=fixture-secret")
+			fmt.Fprintln(os.Stdout, "trailing ordinary output")
+			os.Exit(7)
+		}
 		if record := os.Getenv("PIIK_TUNNEL_FIXTURE_ATTEMPTS"); record != "" {
 			previous, _ := os.ReadFile(record)
 			var paths []string
@@ -46,7 +51,10 @@ func TestMain(tests *testing.M) {
 			}
 			failures, _ := strconv.Atoi(os.Getenv("PIIK_TUNNEL_FIXTURE_FAILURES"))
 			if len(paths) < failures {
-				fmt.Fprintln(os.Stderr, "fixture allocation unavailable")
+				fmt.Fprintln(os.Stderr, `{"level":"error","message":"older recovered failure"}`)
+				fmt.Fprintln(os.Stderr, `{"level":"error","message":"fixture allocation unavailable","error":"connect timeout token=fixture-secret"}`)
+				fmt.Fprintln(os.Stderr, `{"level":"warn","message":"cleanup warning"}`)
+				fmt.Fprintln(os.Stderr, `{"level":"info","message":"cleanup complete"}`)
 				code, _ := strconv.Atoi(os.Getenv("PIIK_TUNNEL_FIXTURE_EXIT_CODE"))
 				os.Exit(code)
 			}
@@ -75,11 +83,29 @@ func TestMain(tests *testing.M) {
 				time.Sleep(time.Millisecond)
 			}
 		}
+		fmt.Fprintln(os.Stderr, "fixture waiting")
 		for {
 			time.Sleep(time.Hour)
 		}
 	}
 	os.Exit(tests.Run())
+}
+
+func TestStartupRetainsPlainDependencyFailure(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIIK_TUNNEL_FIXTURE", "plain-exit")
+	process, err := startAttempt(t.Context(), executable, "http://127.0.0.1:8787")
+	var failure *exec.ExitError
+	if process != nil || !errors.Is(err, errStartupExited) || !errors.As(err, &failure) || failure.ExitCode() != 7 {
+		t.Fatalf("plain dependency failure lost its exit status: %v, %v", process, err)
+	}
+	if !strings.Contains(err.Error(), "failed to request quick Tunnel: connect timeout token=[redacted]") ||
+		strings.Contains(err.Error(), "fixture-secret") || strings.Contains(err.Error(), "ordinary output") {
+		t.Fatalf("plain dependency failure was omitted, unsafe or overwritten: %v", err)
+	}
 }
 
 func TestStartupRetriesOnlyRetiredPreReadyChildren(t *testing.T) {
@@ -119,11 +145,34 @@ func TestStartupRetriesOnlyRetiredPreReadyChildren(t *testing.T) {
 					if !errors.As(err, &failure) || failure.ExitCode() != sample.exitCode {
 						t.Fatalf("latest dependency exit was lost: %v", err)
 					}
+					if !strings.Contains(err.Error(), "fixture allocation unavailable\nconnect timeout token=[redacted]") ||
+						strings.Contains(err.Error(), "fixture-secret") || strings.Contains(err.Error(), "older recovered failure") ||
+						strings.Contains(err.Error(), "cleanup") {
+						t.Fatalf("latest sanitized dependency cause was lost or replaced: %v", err)
+					}
 				}
 			}
 			assertRetiredAttempts(t, record, 4)
 		})
 	}
+}
+
+// Child startup has no sub-second timing guarantee on Windows. Trigger
+// cancellation at the observed lifecycle boundary, not at an assumed launch time.
+type startupCancelLog struct {
+	slog.Handler
+	key, value string
+	cancel     context.CancelFunc
+}
+
+func (handler startupCancelLog) Handle(ctx context.Context, record slog.Record) error {
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == handler.key && attr.Value.String() == handler.value {
+			handler.cancel()
+		}
+		return true
+	})
+	return handler.Handler.Handle(ctx, record)
 }
 
 func TestStartupRetriesShareCancellationAndDeadline(t *testing.T) {
@@ -132,14 +181,11 @@ func TestStartupRetriesShareCancellationAndDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, sample := range []struct {
-		name       string
-		timeout    time.Duration
-		attempts   int
-		cancelOnly bool
+		name, key, value string
+		attempts         int
 	}{
-		{"during retry delay", 500 * time.Millisecond, 1, false},
-		{"during second child", 2 * time.Second, 2, false},
-		{"clean cancellation during retry delay", 500 * time.Millisecond, 1, true},
+		{"during retry delay", "event", "startup-retry", 1},
+		{"during second child", "message", "fixture waiting", 2},
 	} {
 		t.Run(sample.name, func(t *testing.T) {
 			record := filepath.Join(t.TempDir(), "attempts")
@@ -147,25 +193,50 @@ func TestStartupRetriesShareCancellationAndDeadline(t *testing.T) {
 			t.Setenv("PIIK_TUNNEL_FIXTURE_ATTEMPTS", record)
 			t.Setenv("PIIK_TUNNEL_FIXTURE_FAILURES", "1")
 			t.Setenv("PIIK_TUNNEL_FIXTURE_EXIT_CODE", "7")
-			ctx, cancel := context.WithTimeout(t.Context(), sample.timeout)
+			bound, stop := context.WithTimeout(t.Context(), 10*time.Second)
+			defer stop()
+			ctx, cancel := context.WithCancel(bound)
 			defer cancel()
-			if sample.cancelOnly {
-				ctx, cancel = context.WithCancel(t.Context())
-				defer cancel()
-				defer time.AfterFunc(sample.timeout, cancel).Stop()
-			}
-			started := time.Now()
+			previous := slog.Default()
+			slog.SetDefault(slog.New(startupCancelLog{
+				Handler: slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}),
+				key:     sample.key, value: sample.value, cancel: cancel,
+			}))
+			defer slog.SetDefault(previous)
 			process, err := Start(ctx, executable, "http://127.0.0.1:8787")
-			if process != nil || (!sample.cancelOnly && !errors.Is(err, context.DeadlineExceeded)) ||
-				(sample.cancelOnly && err != context.Canceled) {
-				t.Fatalf("startup deadline: %v, %v", process, err)
-			}
-			if time.Since(started) > sample.timeout+2*time.Second {
-				t.Fatal("retry renewed the startup deadline")
+			if process != nil || err != context.Canceled {
+				t.Fatalf("startup cancellation: %v, %v", process, err)
 			}
 			assertRetiredAttempts(t, record, sample.attempts)
 		})
 	}
+	t.Run("shared deadline", func(t *testing.T) {
+		record := filepath.Join(t.TempDir(), "attempts")
+		t.Setenv("PIIK_TUNNEL_FIXTURE", "starting")
+		t.Setenv("PIIK_TUNNEL_FIXTURE_ATTEMPTS", record)
+		t.Setenv("PIIK_TUNNEL_FIXTURE_FAILURES", "1")
+		t.Setenv("PIIK_TUNNEL_FIXTURE_EXIT_CODE", "7")
+		const timeout = 2 * time.Second
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		started := time.Now()
+		process, err := Start(ctx, executable, "http://127.0.0.1:8787")
+		if process != nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("startup deadline: %v, %v", process, err)
+		}
+		if time.Since(started) > timeout+2*time.Second {
+			t.Fatal("retry renewed the startup deadline")
+		}
+		// A slow launch can consume the deadline before reaching the retry or
+		// the second child. Check cleanup for the children that actually ran.
+		payload, err := os.ReadFile(record)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if len(payload) > 0 {
+			assertRetiredAttempts(t, record, len(strings.Split(strings.TrimSpace(string(payload)), "\n")))
+		}
+	})
 }
 
 func assertRetiredAttempts(t *testing.T, record string, count int) {
@@ -276,6 +347,9 @@ func TestCloseKeepsAnObservedFailureWhileLogsDrain(t *testing.T) {
 		var failure *exec.ExitError
 		if !errors.As(err, &failure) || failure.ExitCode() != 7 {
 			t.Fatalf("late owner cancellation lost the observed dependency failure: %v", err)
+		}
+		if !strings.Contains(err.Error(), "fixture exit failure") {
+			t.Fatalf("late output lost the dependency detail: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("tunnel did not retire after its logs drained")

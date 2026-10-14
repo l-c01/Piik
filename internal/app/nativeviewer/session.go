@@ -37,6 +37,9 @@ type sessionEdge struct {
 	sourceConnectionID string
 }
 
+// One current upstream and one prepared route may overlap during a handoff.
+const receiverCapacity = 2
+
 // Session owns the native media implementation for one Browser Viewer. Room,
 // participant, route, and recovery authority remain in the Browser/server.
 type Session struct {
@@ -117,17 +120,23 @@ func (session *Session) AcceptOffer(
 	offer webrtc.SessionDescription,
 	iceServers []webrtc.ICEServer,
 	reuse bool,
+	punched bool,
 ) (OfferResult, error) {
 	if connectionID == "" || len(connectionID) > 256 {
 		return OfferResult{}, errors.New("native Viewer receiver identity is invalid")
 	}
 	session.mu.Lock()
 	closed := session.closed
+	receiver := session.receivers[connectionID]
+	atCapacity := len(session.receivers) >= receiverCapacity && receiver == nil
 	session.mu.Unlock()
 	if closed {
 		return OfferResult{}, errors.New("native Viewer session is closed")
 	}
-	if receiver := session.receiver(connectionID); reuse && receiver != nil {
+	if atCapacity {
+		return OfferResult{}, errors.New("native Viewer receiver capacity reached")
+	}
+	if reuse && receiver != nil {
 		answer, reused, err := receiver.Renegotiate(offer, iceServers)
 		if err != nil {
 			return OfferResult{}, err
@@ -136,12 +145,20 @@ func (session *Session) AcceptOffer(
 			return OfferResult{Answer: answer, Audio: receiver.HasAudio(), Codec: receiver.Codec(), Reused: true}, nil
 		}
 	}
+	var punchedSocket *mediaedge.PunchedSocket
+	if punched {
+		punchedSocket = session.engine.TakePunchedSocket(connectionID, nil)
+		if punchedSocket == nil {
+			return OfferResult{}, errors.New("prepared connection is unavailable")
+		}
+	}
 	session.CloseReceiver(connectionID)
 	receiver, answer, err := session.engine.NewReceiver(mediaedge.ReceiverOptions{
-		Offer:        offer,
-		ICEServers:   iceServers,
-		EdgeCapacity: session.edgeCapacity,
-		Relay:        session.relay,
+		Offer:         offer,
+		ICEServers:    iceServers,
+		EdgeCapacity:  session.edgeCapacity,
+		Relay:         session.relay,
+		PunchedSocket: punchedSocket,
 		Events: mediaedge.ReceiverEvents{
 			LocalCandidate: func(candidate *webrtc.ICECandidateInit, current func() bool) {
 				session.emit(Event{
@@ -173,7 +190,7 @@ func (session *Session) AcceptOffer(
 		return OfferResult{}, err
 	}
 	session.mu.Lock()
-	if session.closed || session.receivers[connectionID] != nil {
+	if session.closed || session.receivers[connectionID] != nil || len(session.receivers) >= receiverCapacity {
 		session.mu.Unlock()
 		_ = receiver.Close()
 		return OfferResult{}, errors.New("native Viewer receiver is unavailable")
@@ -203,25 +220,39 @@ func (session *Session) AddReceiverCandidate(
 
 func (session *Session) PrepareLocalEdge(
 	sourceConnectionID string,
-	connectionID string,
+	connectionID, offerID string,
+	restart bool,
 ) (webrtc.SessionDescription, error) {
-	return session.prepareEdge(sourceConnectionID, connectionID, nil, true)
+	if restart {
+		session.mu.Lock()
+		current := session.edges[connectionID]
+		available := !session.closed && current.edge != nil && current.sourceConnectionID == sourceConnectionID
+		session.mu.Unlock()
+		if !available {
+			return webrtc.SessionDescription{}, errors.New("native local Viewer edge does not exist")
+		}
+		return current.edge.CreateLocalOffer(session.ctx, offerID, true)
+	}
+	return session.prepareEdge(sourceConnectionID, connectionID, nil, offerID, false)
 }
 
 func (session *Session) PrepareEdge(
 	sourceConnectionID string,
 	connectionID string,
 	iceServers []webrtc.ICEServer,
+	punched bool,
 ) (webrtc.SessionDescription, error) {
-	return session.prepareEdge(sourceConnectionID, connectionID, iceServers, false)
+	return session.prepareEdge(sourceConnectionID, connectionID, iceServers, "", punched)
 }
 
 func (session *Session) prepareEdge(
 	sourceConnectionID string,
 	connectionID string,
 	iceServers []webrtc.ICEServer,
-	local bool,
+	localOfferID string,
+	punched bool,
 ) (webrtc.SessionDescription, error) {
+	local := localOfferID != ""
 	receiver := session.receiver(sourceConnectionID)
 	if receiver == nil {
 		return webrtc.SessionDescription{}, errors.New("native Viewer source does not exist")
@@ -241,6 +272,7 @@ func (session *Session) prepareEdge(
 		ICEServers:   iceServers,
 		Audio:        receiver.AudioSource(),
 		Local:        local,
+		Punched:      punched,
 		Events: mediaedge.EdgeEvents{
 			LocalCandidate: func(candidate *webrtc.ICECandidateInit) {
 				session.emit(Event{
@@ -279,7 +311,12 @@ func (session *Session) prepareEdge(
 		edge: edge, sourceConnectionID: sourceConnectionID,
 	}
 	session.mu.Unlock()
-	offer, err := edge.CreateOffer()
+	var offer webrtc.SessionDescription
+	if local {
+		offer, err = edge.CreateLocalOffer(session.ctx, localOfferID, false)
+	} else {
+		offer, err = edge.CreateOffer()
+	}
 	if err != nil {
 		session.CloseEdge(connectionID)
 		return webrtc.SessionDescription{}, err
@@ -287,12 +324,12 @@ func (session *Session) prepareEdge(
 	return offer, nil
 }
 
-func (session *Session) SetAnswer(connectionID string, answer webrtc.SessionDescription) error {
+func (session *Session) SetAnswer(connectionID string, answer webrtc.SessionDescription, offerID string) error {
 	edge := session.edge(connectionID)
 	if edge == nil {
 		return errors.New("native Viewer edge does not exist")
 	}
-	return edge.SetAnswer(answer)
+	return edge.SetAnswer(answer, offerID)
 }
 
 func (session *Session) AddCandidate(connectionID string, candidate *webrtc.ICECandidateInit) error {
@@ -304,6 +341,7 @@ func (session *Session) AddCandidate(connectionID string, candidate *webrtc.ICEC
 }
 
 func (session *Session) CloseReceiver(connectionID string) {
+	session.engine.ClosePunch(connectionID)
 	session.mu.Lock()
 	receiver := session.receivers[connectionID]
 	delete(session.receivers, connectionID)
@@ -324,6 +362,7 @@ func (session *Session) CloseReceiver(connectionID string) {
 }
 
 func (session *Session) CloseEdge(connectionID string) {
+	session.engine.ClosePunch(connectionID)
 	session.mu.Lock()
 	edge := session.edges[connectionID].edge
 	delete(session.edges, connectionID)

@@ -65,9 +65,11 @@ func TestOutputPlanRetiresOnlyFailedLayerConsumers(t *testing.T) {
 	lowerTracker, higherTracker := trackers.AddTracker(0), trackers.AddTracker(1)
 	lowerTracker.Observe(0, 1200, 1188, true, 90000, nil)
 	higherTracker.Observe(0, 1200, 1188, true, 90000, nil)
-	if err = source.DisableLayer(0); err != nil {
+	retire, err := source.MarkLayerUnavailable(0)
+	if err != nil {
 		t.Fatal(err)
 	}
+	retire()
 	if low.State() != webrtc.PeerConnectionStateClosed || high.State() != webrtc.PeerConnectionStateConnected {
 		t.Fatalf("failed/sibling state = %s/%s", low.State(), high.State())
 	}
@@ -123,12 +125,11 @@ func TestRelayFailureCannotRetireReconfiguredProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Close() })
-	source, err := engine.NewSource("vp8", 1, 2, nil)
+	source, err := engine.newSource("vp8", 1, 2, &RelayOptions{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = source.Close() })
-	source.relay = &relayDerivation{source: source}
 	_ = source.SetFormat(1, 640, 360)
 	profile := nativecapture.VideoProfile{Width: 1280, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"}
 	if err = source.SetRelayProfile(profile); err != nil {
@@ -171,6 +172,58 @@ func TestRelayFailureCannotRetireReconfiguredProfile(t *testing.T) {
 	retire()
 	if source.outputBitrates[0] != 0 || low.State() != webrtc.PeerConnectionStateClosed {
 		t.Fatal("current decoder failure was not retired")
+	}
+}
+
+func TestRetiredRelayFailureCannotDisableLaterDemand(t *testing.T) {
+	engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", IncludeLoopback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	source, err := engine.newSource("vp8", 2, 2, &RelayOptions{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = source.Close() })
+	if err = source.SetFormat(1, 640, 360); err != nil {
+		t.Fatal(err)
+	}
+	if err = source.SetRelayProfile(nativecapture.VideoProfile{
+		Width: 1280, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	high, _, _ := connectedReceiver(t, engine, source, "retiring-relay-high")
+	low, _, _ := connectedReceiver(t, engine, source, "retiring-relay-low")
+	if err = low.SetTargetLayer(0); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	run := &relayRun{owner: source.relay, ctx: ctx, cancel: cancel, done: done,
+		plan: relayPlan{profile: source.relayProfile, format: source.formats[1].Load()}}
+	source.relay.run = run
+	if err = low.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(context.Cause(ctx), context.Canceled) {
+		t.Fatal("last lower consumer did not retire the derivation normally")
+	}
+	// A failure already read from the old process can reach the source lock
+	// after cancellation, before the process exits and the next run starts.
+	retire, err := source.markLayerUnavailable(0, run)
+	if err != nil || retire != nil || source.outputBitrates[0] == 0 {
+		t.Fatal("normal retirement disabled a reusable output slot")
+	}
+	rejoined, _, _ := connectedReceiver(t, engine, source, "retiring-relay-rejoined")
+	if err = rejoined.SetTargetLayer(0); err != nil {
+		t.Fatalf("later lower demand was rejected: %v", err)
+	}
+	if rejoined.State() != webrtc.PeerConnectionStateConnected || high.State() != webrtc.PeerConnectionStateConnected {
+		t.Fatal("late failure retired a current consumer or healthy sibling")
 	}
 }
 
@@ -224,7 +277,7 @@ func TestShutdownClosesSiblingTransportsBeforeWaitingForWrites(t *testing.T) {
 func TestPortMappingCandidateUsesObservedPublicAddress(t *testing.T) {
 	var emitted []*webrtc.ICECandidateInit
 	gathering := &localCandidateGathering{
-		engine:           &Engine{localPort: 43210},
+		socket:           &iceSocket{localPort: 43210},
 		mappedPort:       43211,
 		mappedCandidates: make(map[string]struct{}),
 		emit: func(candidate *webrtc.ICECandidateInit) {
@@ -278,7 +331,7 @@ func testEncodedSourceFanout(t *testing.T, codec string) {
 	edgeB, receiverB, packetB := connectedReceiver(t, engine, source, "edge-b")
 	t.Cleanup(func() { _ = receiverA.Close() })
 	t.Cleanup(func() { _ = receiverB.Close() })
-	if edgeA.connection == edgeB.connection || engine.ListenAddress() == "" {
+	if edgeA.connection == edgeB.connection || edgeA.socket == edgeB.socket || edgeA.socket.localPort == edgeB.socket.localPort {
 		t.Fatal("media edges did not keep independent transports")
 	}
 	if edgeA.transport == edgeB.transport {
@@ -412,7 +465,7 @@ func TestRepeatedAnswerIsIdempotent(t *testing.T) {
 	if answer == nil {
 		t.Fatal("receiver did not retain its answer")
 	}
-	if err = edge.SetAnswer(*answer); err != nil {
+	if err = edge.SetAnswer(*answer, ""); err != nil {
 		t.Fatalf("repeated answer was not idempotent: %v", err)
 	}
 }
@@ -430,7 +483,7 @@ func TestCaptureTimestampsDriveTheRTPClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = source.Close() })
-	_, receiver, packets := connectedReceiver(t, engine, source, "timed-edge")
+	edge, receiver, packets := connectedReceiver(t, engine, source, "timed-edge")
 	t.Cleanup(func() { _ = receiver.Close() })
 	accessUnit := sfu.VP8KeyFrame8x8
 	start := 10 * time.Second
@@ -439,18 +492,18 @@ func TestCaptureTimestampsDriveTheRTPClock(t *testing.T) {
 	if err = writeSourceFrame(source, accessUnit, start, frameDuration); err != nil {
 		t.Fatal(err)
 	}
-	first := waitPacket(t, packets)
+	first := waitPacket(t, packets, edge)
 	if err = writeSourceFrame(source, accessUnit, start+frameDuration, frameDuration); err != nil {
 		t.Fatal(err)
 	}
-	second := waitPacket(t, packets)
+	second := waitPacket(t, packets, edge)
 	if got := second.Timestamp - first.Timestamp; got < 2_999 || got > 3_001 {
 		t.Fatalf("steady timestamp delta = %d", got)
 	}
 	if err = writeSourceFrame(source, accessUnit, start+5*time.Second, frameDuration); err != nil {
 		t.Fatal(err)
 	}
-	third := waitPacket(t, packets)
+	third := waitPacket(t, packets, edge)
 	if got := third.Timestamp - second.Timestamp; got < 446_999 || got > 447_001 {
 		t.Fatalf("sparse timestamp delta = %d", got)
 	}
@@ -466,19 +519,19 @@ func TestNewCaptureGenerationKeepsTheRTPClockContinuous(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, receiver, packets := connectedReceiver(t, engine, source, "generation-edge")
+	edge, receiver, packets := connectedReceiver(t, engine, source, "generation-edge")
 	t.Cleanup(func() { _ = receiver.Close() })
 	accessUnit := sfu.VP8KeyFrame8x8
 	frameDuration := time.Second / 30
 	if err = writeSourceFrame(source, accessUnit, 50*time.Second, frameDuration); err != nil {
 		t.Fatal(err)
 	}
-	first := waitPacket(t, packets)
+	first := waitPacket(t, packets, edge)
 	source.BeginGeneration()
 	if err = writeSourceFrame(source, accessUnit, 100*time.Millisecond, frameDuration); err != nil {
 		t.Fatal(err)
 	}
-	second := waitPacket(t, packets)
+	second := waitPacket(t, packets, edge)
 	if got := second.Timestamp - first.Timestamp; got < 2_999 || got > 3_001 {
 		t.Fatalf("generation timestamp delta = %d", got)
 	}
@@ -641,11 +694,11 @@ func TestAudioSourceDeliversOpusOnTheVideoPeerConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Close() })
-	video, err := engine.NewSource("h264", 1, 1, nil)
+	video, err := engine.NewSource("h264", 2, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	audio, err := engine.NewAudioSource(1, 128_000)
+	audio, err := engine.NewAudioSource(2, 128_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,6 +720,39 @@ func TestAudioSourceDeliversOpusOnTheVideoPeerConnection(t *testing.T) {
 		}
 	})
 	connectEdgeToReceiver(t, edge, receiver)
+	limited, err := engine.NewEdge(video, EdgeOptions{ConnectionID: "limited-audio-edge", Audio: audio})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = limited.Close() })
+	limitedReceiver := newAudioReceiver(t)
+	t.Cleanup(func() { _ = limitedReceiver.Close() })
+	offer, err := limited.CreateOffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = limitedReceiver.SetRemoteDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := (&Receiver{connection: limitedReceiver}).createAnswer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer.SDP = strings.ReplaceAll(answer.SDP, "maxaveragebitrate=510000", "maxaveragebitrate=192000")
+	if err = limited.SetAnswer(answer, ""); err == nil {
+		t.Fatal("shared audio accepted an insufficient receiver limit")
+	}
+	if limited.connection.RemoteDescription() != nil {
+		t.Fatal("rejected answer was applied before admission")
+	}
+	if err = limited.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Rejecting and retiring this edge must leave the shared audio source and
+	// the first receiver usable, without reducing the source's live setting.
+	if audio.configuredBitrate() != 128_000 {
+		t.Fatal("receiver admission changed the shared audio setting")
+	}
 	if err = audio.WritePCM(make([]byte, nativeaudio.FrameBytes), 20*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
@@ -687,7 +773,17 @@ func connectedReceiver(
 	connectionID string,
 ) (*Edge, *webrtc.PeerConnection, <-chan *rtp.Packet) {
 	t.Helper()
-	edge, err := engine.NewEdge(source, EdgeOptions{ConnectionID: connectionID})
+	connected := make(chan struct{}, 1)
+	edge, err := engine.NewEdge(source, EdgeOptions{ConnectionID: connectionID, Events: EdgeEvents{
+		ConnectionState: func(state webrtc.PeerConnectionState, _ *SelectedPair) {
+			if state == webrtc.PeerConnectionStateConnected {
+				select {
+				case connected <- struct{}{}:
+				default:
+				}
+			}
+		},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -710,6 +806,9 @@ func connectedReceiver(
 	})
 
 	connectEdgeToReceiver(t, edge, receiver)
+	// Pion publishes Connected before our callback activates the media output.
+	// A one-frame test must await that callback, not race it with its only frame.
+	waitSignal(t, connected, "media activation")
 	return edge, receiver, packets
 }
 
@@ -728,15 +827,13 @@ func connectEdgeToReceiver(
 		t.Fatal(err)
 	}
 	gatherAnswer := webrtc.GatheringCompletePromise(receiver)
-	answer, err := receiver.CreateAnswer(nil)
+	// Use the product's receive preferences rather than Pion's generic defaults.
+	_, err := (&Receiver{connection: receiver}).createAnswer()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = receiver.SetLocalDescription(answer); err != nil {
-		t.Fatal(err)
-	}
 	waitSignal(t, gatherAnswer, "answer ICE gathering")
-	if err = edge.SetAnswer(*receiver.LocalDescription()); err != nil {
+	if err = edge.SetAnswer(*receiver.LocalDescription(), ""); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -773,9 +870,6 @@ func newReceiverWithAudio(t *testing.T, includeAudio bool, bindAddress string) *
 		}
 	}
 	registry := &interceptor.Registry{}
-	if err := webrtc.ConfigureTWCCSender(mediaEngine, registry); err != nil {
-		t.Fatal(err)
-	}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, registry); err != nil {
 		t.Fatal(err)
 	}
@@ -821,12 +915,22 @@ func waitSignal(t *testing.T, signal <-chan struct{}, label string) {
 	}
 }
 
-func waitPacket(t *testing.T, packets <-chan *rtp.Packet) *rtp.Packet {
+func waitPacket(t *testing.T, packets <-chan *rtp.Packet, edges ...*Edge) *rtp.Packet {
 	t.Helper()
 	select {
 	case packet := <-packets:
 		return packet
 	case <-time.After(5 * time.Second):
+		for _, edge := range edges {
+			t.Logf("edge=%s output=%+v egress=%+v source=%+v", edge.State(),
+				edge.transport.Output.State(), edge.transport.Egress(), edge.source.media.DebugInfo())
+			t.Logf("forwarder=%+v", edge.transport.Output.DebugInfo())
+			for index, input := range edge.source.media.GetAllBuffers() {
+				if input != nil {
+					t.Logf("input=%d stats=%+v", index, input.GetStats())
+				}
+			}
+		}
 		t.Fatal("timed out waiting for RTP")
 		return nil
 	}

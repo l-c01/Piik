@@ -1,16 +1,28 @@
 # 部署 Piik Server
 
-[English](./self-hosting.md) · 简体中文 · [文档导航](../README.md)
+[English](./self-hosting.md) · 简体中文 · [文档导航](../guide/README.zh-CN.md)
 
 Piik Server 将网页、房间管理和可选的媒体转发打包在**一个服务端程序**中。
 解压后即可运行，房间数据保存在 SQLite 中。
 
+默认的 P2P 配置由服务器负责房间管理、信令和 STUN，画面与声音在参与者之间传输。
+启用 SFU 后，服务器还会承担媒体转发的带宽和处理开销。配置较低的服务器可以先用默认设置，
+按预计的房间数和观众数观察 CPU、内存与网络占用，再决定是否开启 SFU。
+降低画面分辨率主要减轻参与者设备的采集和编码负担。
+
 ## 先在本机试用
 
-以下服务端操作在 Linux x64 环境中执行。
+以下操作适用于 Linux x64 和 ARM64 服务器。
 
 从 [GitHub Releases](https://github.com/TNTcraftHIM/Piik/releases) 或
-[Gitee 镜像](https://gitee.com/TNTcraftHIM/Piik/releases)下载 **`piik-<revision>-runtime.tar.gz`**，即 Linux x64 服务端程序包。
+[Gitee 镜像](https://gitee.com/TNTcraftHIM/Piik/releases)下载对应架构的服务端程序包。
+可运行 `uname -m` 查看架构：
+
+| 架构 | 程序包 |
+| --- | --- |
+| `x86_64`（x64） | `piik-<revision>-runtime.tar.gz` |
+| `aarch64`（ARM64） | `piik-<revision>-linux-arm64-runtime.tar.gz` |
+
 解压后，在该目录运行：
 
 ```sh
@@ -22,7 +34,7 @@ Piik Server 将网页、房间管理和可选的媒体转发打包在**一个服
 
 ## 使用 Docker Compose
 
-在已安装 Docker Compose v2 的 Linux x64 服务器上，将两个部署文件下载到空目录中：
+在已安装 Docker Compose v2 的 Linux x64 或 ARM64 服务器上，将两个部署文件下载到空目录中：
 
 ```sh
 curl -fsSLo compose.yaml https://raw.githubusercontent.com/TNTcraftHIM/Piik/main/deploy/container/compose.yaml
@@ -37,6 +49,7 @@ docker compose up -d
 ```
 
 `ghcr.io/tntcrafthim/piik:latest` 镜像包含网页、信令、STUN 和可选 SFU。
+Docker 会自动选择对应架构的镜像。
 接着完成下方的 [HTTPS 配置](#2-配置-https)和[端口放行](#3-放行端口并检查)。
 默认使用 P2P；如需 SFU 兜底，按 `.env` 中的说明启用即可。
 请保留 `piik-data` 数据卷，房间数据和可选诊断文件都保存在其中。
@@ -44,7 +57,7 @@ docker compose up -d
 
 ## 对外提供服务
 
-准备一台 Linux x64 服务器，以及一个指向服务器公网 IP 的域名。
+准备一台 Linux x64 或 ARM64 服务器，以及一个指向服务器公网 IP 的域名。
 下文以 `share.example.com` 为例，请替换成自己的域名。
 
 ### 1. 配置并启动 Piik
@@ -79,6 +92,11 @@ SITE_ACCESS_PASSWORD=
 人数越多，对网络和转发资源的需求也可能增加。默认值及 App 房间的区别见
 [人数限制](../standards/configuration.md#room-capacity)。
 
+公开站点可选设 `ROOM_EMPTY_TIMEOUT_SECONDS=3600`，重启后，无人在线的房间会在空置一小时后
+回收；房间号用满时，会提前回收最早创建的空房间，仍有人在线的房间不受影响。
+被回收的房间需要重新创建并发送邀请。不设置或设为 `0` 则保持默认的长期保留行为，
+详见[房间保留策略](../standards/configuration.md#room-retention)。
+
 ### 2. 配置 HTTPS
 
 如果已有 HTTPS 反向代理，将请求转发到 `127.0.0.1:8787`，并启用 WebSocket 支持。
@@ -101,6 +119,8 @@ nginx 可参考[配置示例](../../deploy/nginx/piik.conf.example)。如果沿�
 
 在服务器防火墙和云平台安全组中放行 **TCP 80/443**（HTTPS）和 **UDP 3478**（STUN）。
 TCP 8787 仅供本机反向代理访问。STUN 域名需要直接解析到服务器，不能只经过 CDN 的 HTTP 代理。
+可选服务的端口见[完整端口表](../standards/configuration.md#public-and-private-ports)。
+内置 SFU 的媒体流复用 `SFU_UDP_PORT` 指定的单个 UDP 端口。
 
 打开 `https://share.example.com/healthz`，应返回 `{"status":"ok"}`。
 随后打开站点，分享一个画面，并用另一台设备加入验证。
@@ -110,9 +130,15 @@ TCP 8787 仅供本机反向代理访问。STUN 域名需要直接解析到服务
 
 在 `.env` 中添加 `SFU_UDP_PORT=7882`，放行 UDP 7882，再重启 Piik，即可启用自动 SFU 兜底。
 如果服务器处于 NAT 后方，还需将 `SFU_PUBLIC_IP` 设置为外部可达的公网 IPv4 地址。
+公网和内部映射的 UDP 端口都应与 `SFU_UDP_PORT` 一致。
 这项功能由同一个服务端程序提供。
+服务器需要为实际经由 SFU 观看的观众承担转发负载和出口带宽。
 房主需要在开始分享前关闭 **隐私模式**，才会允许使用这条线路。
 直连和 SFU 媒体都需要可用的 UDP 通路。
+
+如需所有房间都通过服务器转发，再设置 `SFU_ONLY=true` 并重启。
+分享设置中会显示 **服务器转发**。请为每位观众预留服务器带宽；
+服务器线路失败时，此模式不会改走 P2P。
 
 ## 长期运行与更新
 

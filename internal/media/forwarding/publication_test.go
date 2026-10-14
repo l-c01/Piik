@@ -9,13 +9,15 @@ import (
 	"time"
 
 	"github.com/TNTcraftHIM/Piik/internal/media/encoded"
+	"github.com/TNTcraftHIM/Piik/internal/thirdparty/livekit/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/bwe"
-	"github.com/livekit/livekit-server/pkg/sfu/bwe/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
 	"github.com/livekit/protocol/logger"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/twcc"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -23,26 +25,24 @@ import (
 
 func TestPublicationEmptyProbeCannotIncreaseCapacity(t *testing.T) {
 	const target = int64(1_000_000)
-	const audio = int64(64_000)
 	log := logger.GetDiscardLogger()
 	bandwidth := &publicationBWE{SendSideBWE: sendsidebwe.NewSendSideBWE(sendsidebwe.SendSideBWEParams{
 		Config: sendsidebwe.DefaultSendSideBWEConfig, Logger: log,
 	})}
 	bandwidth.target.Store(target)
-	bandwidth.audio.Store(audio)
-	bandwidth.pacer = &publicationPacer{bandwidth: bandwidth, boundedPacer: newBoundedPacer(
-		pacer.NewLeakyBucket(log, nil, 5*time.Millisecond, int(target)), log, 500,
+	queue := &publicationPacer{boundedPacer: newBoundedPacer(
+		pacer.NewNoQueue(log, nil), log, 500,
 	)}
-	defer bandwidth.pacer.Stop()
+	defer queue.Stop()
 	info := ccutils.ProbeClusterInfo{Id: 1, CreatedAt: time.Now(), Goal: ccutils.ProbeClusterGoal{
-		AvailableBandwidthBps: int(target), ExpectedUsageBps: int(target - audio),
+		AvailableBandwidthBps: int(target), ExpectedUsageBps: int(target),
 		DesiredBps: int(target * 2), Duration: bandwidth.ProbeDuration(),
 	}}
 	info.Goal.DesiredBytes = int(float64(info.Goal.DesiredBps) * info.Goal.Duration.Seconds() / 8)
 	bandwidth.ProbeClusterStarting(info)
-	bandwidth.pacer.StartProbeCluster(info)
+	queue.StartProbeCluster(info)
 	time.Sleep(info.Goal.Duration)
-	info = bandwidth.pacer.EndProbeCluster(info.Id)
+	info = queue.EndProbeCluster(info.Id)
 	if info.Result.Bytes() != 0 || sendsidebwe.DefaultSendSideBWEConfig.CongestionDetector.ProbeSignal.IsValid(info) {
 		t.Fatal("fixture did not complete an empty invalid probe")
 	}
@@ -51,11 +51,8 @@ func TestPublicationEmptyProbeCannotIncreaseCapacity(t *testing.T) {
 	for {
 		signal, capacity, done := bandwidth.ProbeClusterFinalize()
 		if done {
-			if signal != ccutils.ProbeSignalInconclusive || capacity > target-audio || bandwidth.target.Load() != target {
+			if signal != ccutils.ProbeSignalInconclusive || capacity > target || bandwidth.target.Load() != target {
 				t.Fatalf("empty probe raised publication capacity: signal=%v capacity=%d target=%d", signal, capacity, bandwidth.target.Load())
-			}
-			if bandwidth.completedProbe.Id != ccutils.ProbeClusterIdInvalid {
-				t.Fatal("completed probe was retained after finalization")
 			}
 			break
 		}
@@ -63,6 +60,99 @@ func TestPublicationEmptyProbeCannotIncreaseCapacity(t *testing.T) {
 			t.Fatal("empty probe did not finalize within the library settle bound")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestPublicationProbeUsesAcknowledgedCapacity(t *testing.T) {
+	for _, received := range []bool{true, false} {
+		t.Run(map[bool]string{true: "received", false: "no-feedback"}[received], func(t *testing.T) {
+			checkPublicationProbeCapacity(t, received)
+		})
+	}
+}
+
+func checkPublicationProbeCapacity(t *testing.T, received bool) {
+	t.Helper()
+	const target = int64(100_000)
+	bandwidth := &publicationBWE{SendSideBWE: sendsidebwe.NewSendSideBWE(sendsidebwe.SendSideBWEParams{
+		Config: sendsidebwe.DefaultSendSideBWEConfig, Logger: logger.GetDiscardLogger(),
+	})}
+	bandwidth.target.Store(target)
+	bandwidth.SetBWEListener(&publicationCapacityRecorder{})
+	// A real non-congesting probe after reset still carries the library's
+	// initial capacity. A successful 800 kbps probe cannot prove 100 Mbps.
+	start := time.Now().Add(-time.Second)
+	recorder := twcc.NewRecorder(42)
+	// Establish transport history before the idle interval. The initial packet
+	// has relative time zero, so include a subsequent packet as in a live stream.
+	for _, age := range []time.Duration{6 * time.Second, 5 * time.Second} {
+		previous := start.Add(-age).UnixMicro()
+		sequence := bandwidth.RecordPacketSendAndGetSequenceNumber(previous, 200, false, ccutils.ProbeClusterIdInvalid, false)
+		recorder.Record(42, sequence, previous+10_000)
+	}
+	for _, packet := range recorder.BuildFeedbackPacket() {
+		bandwidth.HandleTWCCFeedback(packet.(*rtcp.TransportLayerCC))
+	}
+	bandwidth.Reset()
+	info := ccutils.ProbeClusterInfo{Id: 1, CreatedAt: start, Goal: ccutils.ProbeClusterGoal{
+		AvailableBandwidthBps: int(target), DesiredBps: 800_000,
+		Duration: 200 * time.Millisecond, DesiredBytes: 20_000,
+	}}
+	bandwidth.ProbeClusterStarting(info)
+	for index := range 100 {
+		at := start.Add(time.Duration(index) * 2 * time.Millisecond).UnixMicro()
+		sequence := bandwidth.RecordPacketSendAndGetSequenceNumber(at, 200, false, info.Id, true)
+		recorder.Record(42, sequence, at+10_000)
+	}
+	info.Result = ccutils.ProbeClusterResult{StartTime: start.UnixNano(),
+		EndTime: start.Add(info.Goal.Duration).UnixNano(), PacketsProbe: 100, BytesProbe: 20_000, IsCompleted: true}
+	bandwidth.ProbeClusterDone(info)
+	if received {
+		for _, packet := range recorder.BuildFeedbackPacket() {
+			bandwidth.HandleTWCCFeedback(packet.(*rtcp.TransportLayerCC))
+		}
+	}
+	deadline := time.Now().Add(sendsidebwe.DefaultSendSideBWEConfig.CongestionDetector.ProbePacketGroup.SettleWaitMax + time.Second)
+	for {
+		signal, capacity, done := bandwidth.ProbeClusterFinalize()
+		if done {
+			if received {
+				// Allow the first-packet/time-window difference in the library's
+				// acknowledged rate, but never its untouched 100 Mbps initial value.
+				if signal != ccutils.ProbeSignalNotCongesting || capacity <= target || capacity > 1_000_000 {
+					t.Fatalf("unexpected acknowledged probe capacity: signal=%v committed=%d sent=%.0f", signal, capacity, info.Result.Bitrate())
+				}
+			} else if signal != ccutils.ProbeSignalInconclusive || capacity != target {
+				t.Fatalf("unacknowledged probe changed capacity: signal=%v committed=%d", signal, capacity)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("probe did not finalize within the library settle bound")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type publicationCapacityRecorder struct{ capacity int64 }
+
+func (recorder *publicationCapacityRecorder) OnCongestionStateChange(_, _ bwe.CongestionState, capacity int64) {
+	recorder.capacity = capacity
+}
+
+func TestPublicationCongestionUsesCommittedCapacity(t *testing.T) {
+	recorder := &publicationCapacityRecorder{}
+	bandwidth := &publicationBWE{listener: recorder}
+	bandwidth.target.Store(1_200_000)
+	bandwidth.OnCongestionStateChange(bwe.CongestionStateNone, bwe.CongestionStateEarlyWarning, 100_000_000)
+	bandwidth.OnCongestionStateChange(bwe.CongestionStateEarlyWarning, bwe.CongestionStateCongested, 100_000_000)
+	if bandwidth.target.Load() != 1_200_000 || recorder.capacity != 1_200_000 {
+		t.Fatalf("publication promoted an unverified capacity: target=%d allocation=%d", bandwidth.target.Load(), recorder.capacity)
+	}
+	bandwidth.OnCongestionStateChange(bwe.CongestionStateCongested, bwe.CongestionStateCongested, 500_000)
+	bandwidth.OnCongestionStateChange(bwe.CongestionStateCongested, bwe.CongestionStateNone, 800_000)
+	if bandwidth.target.Load() != 500_000 || recorder.capacity != 500_000 {
+		t.Fatalf("publication disagrees with its committed video budget: target=%d allocation=%d", bandwidth.target.Load(), recorder.capacity)
 	}
 }
 
@@ -92,9 +182,8 @@ func TestPublicationSimulcastReuseAudioDemandAndClose(t *testing.T) {
 	publication, err := NewPublication(TransportOptions{Source: source.Source, Settings: settings, ConnectionID: "publication", InitialBitrate: 1_000_000, Audio: audio})
 	check(err)
 	defer publication.Close()
-	publication.SetAudioBitrate(64_000)
-	if publication.VideoBudget() != 936_000 {
-		t.Fatal("audio did not reserve the shared budget")
+	if publication.VideoBudget() != 1_000_000 {
+		t.Fatal("audio changed the video capacity estimate")
 	}
 	if len(publication.PC.GetSenders()) != 2 || len(publication.PC.GetSenders()[0].GetParameters().Encodings) != 2 {
 		t.Fatal("publication must use one simulcast video sender and one audio sender")
@@ -105,7 +194,6 @@ func TestPublicationSimulcastReuseAudioDemandAndClose(t *testing.T) {
 	check(mediaEngine.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: "urn:ietf:params:rtp-hdrext:sdes:mid"}, webrtc.RTPCodecTypeVideo))
 	registry := &interceptor.Registry{}
 	check(webrtc.RegisterDefaultInterceptors(mediaEngine, registry))
-	check(webrtc.ConfigureTWCCSender(mediaEngine, registry))
 	receiver, err := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(registry), webrtc.WithSettingEngine(settings)).NewPeerConnection(webrtc.Configuration{})
 	check(err)
 	defer receiver.Close()
@@ -199,7 +287,7 @@ func TestPublicationSimulcastReuseAudioDemandAndClose(t *testing.T) {
 		t.Fatalf("successful RTP writes were not accounted per encoding: %+v", counters)
 	}
 	// Once real bitrate measurements exist, one shared capacity update must
-	// constrain the sum of both RID allocations after reserving Opus.
+	// constrain the sum of both video RID allocations.
 	for {
 		_, rates := source.GetLayeredBitrate()
 		if rates[0][0] > 0 && rates[1][0] > 0 {
@@ -212,12 +300,12 @@ func TestPublicationSimulcastReuseAudioDemandAndClose(t *testing.T) {
 			t.Fatal("publication did not measure both available encodings")
 		}
 	}
-	publication.bandwidth.OnCongestionStateChange(bwe.CongestionStateNone, bwe.CongestionStateCongested, 65_000)
+	publication.bandwidth.OnCongestionStateChange(bwe.CongestionStateNone, bwe.CongestionStateCongested, 1_000)
 	for publication.tracks[0].BandwidthRequested()+publication.tracks[1].BandwidthRequested() > 1_000 {
 		select {
 		case <-time.After(5 * time.Millisecond):
 		case <-ctx.Done():
-			t.Fatal("simulcast allocations exceeded their shared post-audio capacity")
+			t.Fatal("simulcast allocations exceeded their shared video capacity")
 		}
 	}
 	if publication.LowestLayerBudget() != 1_000 {
@@ -226,7 +314,10 @@ func TestPublicationSimulcastReuseAudioDemandAndClose(t *testing.T) {
 	if publication.bandwidth.CongestionState() != bwe.CongestionStateNone || !publication.Counters().Limited {
 		t.Fatalf("clear transport feedback hid the committed publication allocation deficit: state=%v counters=%+v low=%v high=%v", publication.bandwidth.CongestionState(), publication.Counters(), publication.tracks[0].IsDeficient(), publication.tracks[1].IsDeficient())
 	}
-	publication.bandwidth.OnCongestionStateChange(bwe.CongestionStateCongested, bwe.CongestionStateCongested, 1_000_000)
+	// Restore this allocation fixture's capacity explicitly. A congestion event
+	// cannot prove an increase; this test covers RID reuse, not bandwidth probing.
+	publication.bandwidth.target.Store(1_000_000)
+	publication.allocator.SetChannelCapacity(1_000_000)
 	check(publication.SetActiveCount(1))
 	if publication.RequiredActiveCount() != 1 {
 		t.Fatal("publication did not reduce its direct demand")

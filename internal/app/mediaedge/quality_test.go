@@ -7,6 +7,7 @@ import (
 	"github.com/TNTcraftHIM/Piik/internal/media/encoded"
 	"github.com/TNTcraftHIM/Piik/internal/media/forwarding"
 	"github.com/livekit/livekit-server/pkg/sfu"
+	"github.com/pion/rtcp"
 )
 
 type qualityAllocationReceiver struct{ sfu.TrackReceiver }
@@ -53,8 +54,11 @@ func TestQualityDimensionsFollowAssignedSource(t *testing.T) {
 		}
 		time.Sleep(time.Second / 30)
 	}
-	_, _, format := edge.videoCounters()
-	t.Fatalf("quality dimensions still refer to original source: %dx%d", uint32(format>>32), uint32(format))
+	frames, _, format := edge.videoCounters()
+	available, rates := assigned.GetLayeredBitrate()
+	t.Fatalf("assigned quality: %dx%d, frames=%d, source=%t, state=%+v, layers=%v, rates=%v",
+		uint32(format>>32), uint32(format), frames, edge.transport.CurrentSource() == assigned.Source,
+		edge.transport.Output.State(), available, rates)
 }
 
 func TestQualitySampleUsesEstimatorCapacityAgainstEncodedPayload(t *testing.T) {
@@ -100,11 +104,14 @@ func TestQualitySampleUsesEstimatorCapacityAgainstEncodedPayload(t *testing.T) {
 
 	// Real library allocation remains deficient after selecting a layer that
 	// fits the link; steady low delivery must not cancel quality convergence.
+	// This fixture supplies observed capacity, beyond first-feedback bootstrap.
+	edge.transport.OnTransportCCFeedback(nil, &rtcp.TransportLayerCC{})
 	output := edge.transport.Output
 	output.SetReceiver(qualityAllocationReceiver{TrackReceiver: output.Receiver()})
 	output.UpTrackMaxPublishedLayerChange(1)
 	output.UpTrackMaxTemporalLayerSeenChange(0)
 	output.SetMaxSpatialLayer(1)
+	edge.audioSource = &AudioSource{}
 	for index, check := range []struct {
 		budget, sent int
 		layer        int32
@@ -128,8 +135,11 @@ func TestQualitySampleUsesEstimatorCapacityAgainstEncodedPayload(t *testing.T) {
 			stats.Update(started.Add(time.Duration(number)*time.Second/30).UnixNano(), number,
 				number*3000, true, 12, size, 0, false)
 		}
+		// Audio remains in total traffic diagnostics, but cannot turn a healthy
+		// 900 kbps video into an apparent overrun of its 1 Mbps video estimate.
+		edge.audioSource.bytes.Add(80_000) // 320 kbps during this two-second window.
 		sample, ok = edge.QualitySample(started.Add(time.Duration(index+2) * 2 * time.Second))
-		if !ok || sample.State != check.state || sample.BitrateKbps != float64(check.sent)/1000 {
+		if !ok || sample.State != check.state || sample.BitrateKbps != float64(check.sent)/1000+320 {
 			t.Fatalf("allocation %d quality = %+v, %v", index, sample, ok)
 		}
 	}

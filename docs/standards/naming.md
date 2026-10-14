@@ -15,8 +15,13 @@ Role labels describe permission; a person's chosen nickname stays unchanged.
 | Product capability | Screen sharing | 屏幕共享 |
 | Start sending a chosen screen/window | Start sharing | 开始分享 |
 | Enter another person's room | Join a room | 加入房间 |
+| Open the browser-provided screen/window/tab chooser | Browser | 浏览器 |
 | Site-wide access secret | Site passphrase | 站点口令 |
 | Room-specific access secret | Room password | 房间密码 |
+
+The browser picker names a capture method, not a browser-tab-only source. Its
+short explanation includes screens, application windows and tabs; available
+choices remain owned by the browser and operating system.
 
 Write each language for its own audience. Chinese headings and welcomes may
 sound like friends inviting each other: “叫朋友来一起看。” or “沙发给你留着呢。”
@@ -40,6 +45,7 @@ Set the register by the reader's task:
 | Surface | Register |
 | --- | --- |
 | Website | Light, everyday language in introductions and illustration captions; keep the current restraint |
+| App and Web controls | Direct feature and action names, including panel titles and settings; “聊天” / “Chat” rather than an invitation or joke |
 | README | A friendly introduction, followed by direct explanations of features, limits and first steps |
 | Documentation index | Clear topic names and short descriptions that help readers choose a guide |
 | Deployment, configuration and maintenance guides | Formal, precise instructions: prerequisites, actions, expected results and recovery steps |
@@ -97,11 +103,15 @@ Download/availability labels, platform requirements, instructions, permission
 prompts, status and errors stay plain and specific. Use the exact visible action
 names in tutorials; a playful caption never replaces “Download”, “Join a room”
 or a platform/connection limitation. Explain what happened, what the user can do
-next, and any real limitation. Jokes belong
+next, and any real limitation. Keep inline errors to the observed problem and
+one useful next action; put longer checks in the existing help dialog or guide.
+Automatic recovery states describe progress, not a request to reload. Jokes belong
 in the welcome or illustration caption. Do not soften a failure into a joke,
 invent connection progress or promise guaranteed connectivity or absolute privacy.
 Screen sharing includes games, creative work and showing a useful discovery.
 
+Playfulness belongs in optional welcome/waiting lines, empty-state captions and
+illustration reactions; it does not rename the control that performs the action.
 Operational pages omit introductory sentences that repeat their controls.
 Helper text should explain a meaningful choice or prevent an error.
 

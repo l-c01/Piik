@@ -6,10 +6,11 @@
 //
 // Server.mu is the one lock of the effect layer: it guards every field of
 // the server and the router, the room.Store and the route controllers. Every
-// handler, timer callback and goroutine takes it; it is released only around
-// I/O (the password KDF and media transport), after which current session,
+// handler, timer callback and goroutine takes it; password KDF and media
+// transport work run unlocked, after which current session,
 // room and operation identities must be revalidated. Router methods and hooks are
-// called with mu held and never lock.
+// called with mu held and never lock. Room persistence and the optional route
+// diagnostic sink are synchronous and belong in this lock's latency budget.
 package signal
 
 import (
@@ -35,19 +36,17 @@ import (
 // Connection admission, queue and timeout bounds limit the signaling resources
 // a stalled or unauthenticated peer can retain.
 const (
-	// maxBufferedSignalBytes is MAX_BUFFERED_SIGNAL_BYTES: once a connection's
-	// unsent queue passes it the peer is not draining and the connection is
-	// terminated, so one stalled reader cannot grow the server's heap.
+	// maxBufferedSignalBytes bounds unsent data per connection; exceeding it
+	// terminates a stalled reader before it can grow the server's heap.
 	maxBufferedSignalBytes = 256 * 1024
 	// defaultMaxSignalConnections and defaultMaxUnauthenticatedConnections are
-	// the DEFAULT_MAX_* admission ceilings: 20 viewers plus a host across 9_000
+	// admission ceilings: 20 viewers plus a host across 9_000
 	// room codes is far above either, so they bound abuse, not capacity.
 	defaultMaxSignalConnections          = 2_048
 	defaultMaxUnauthenticatedConnections = 256
-	// minSignalingChallengeIntervalMs is MIN_SIGNALING_CHALLENGE_INTERVAL_MS:
-	// the floor between two password challenges on one connection.
+	// minSignalingChallengeIntervalMs bounds liveness challenge frequency.
 	minSignalingChallengeIntervalMs = int64(1_000)
-	// serviceRestartCloseGrace is SERVICE_RESTART_CLOSE_GRACE_MS: how long a
+	// serviceRestartCloseGrace is how long a
 	// peer has to acknowledge close{1012} before the socket is terminated.
 	serviceRestartCloseGrace = 1_000 * time.Millisecond
 
@@ -72,6 +71,8 @@ type Options struct {
 	EndpointMediaCopyCapacity int
 	// SfuFallback is nil when embedded SFU media is disabled.
 	SfuFallback *SfuFallback
+	// SfuOnly restricts the existing controller to server media candidates.
+	SfuOnly bool
 	// Ice is the derived wire ICE configuration (config.IceConfig).
 	Ice protocol.IceConfig
 	// NATPredictionEnabled is the server capability that clamps a Host's
@@ -83,20 +84,23 @@ type Options struct {
 	SiteAccessAtUpgrade  func(*http.Request) bool
 	PublicBaseURL        *url.URL
 	// Now returns Unix milliseconds; nil uses the wall clock.
-	Now                           func() int64
-	AuthenticationTimeoutMs       int
-	ViewerDisconnectGraceMs       int
-	HeartbeatIntervalMs           int
+	Now                     func() int64
+	AuthenticationTimeoutMs int
+	ViewerDisconnectGraceMs int
+	HeartbeatIntervalMs     int
+	// Zero retains room authority indefinitely. Otherwise empty rooms expire
+	// and allocation pressure may reclaim the oldest empty room early.
+	RoomEmptyTimeoutMs            int64
 	MaxConnections                int
 	MaxUnauthenticatedConnections int
 	// AfterFunc is the timer factory; nil uses time.AfterFunc.
 	AfterFunc func(time.Duration, func()) func() bool
-	// Logger receives the three console.error records; nil uses slog.Default().
+	// Logger receives signaling failures; nil uses slog.Default().
 	Logger *slog.Logger
 }
 
-// viewerQualityEvidenceGate is ViewerQualityEvidenceGate; upstreamPeerID is
-// "" where the TS had null.
+// viewerQualityEvidenceGate rejects stale or repeated evidence for the current
+// edge and presentation epoch. upstreamPeerID is empty for SFU.
 type viewerQualityEvidenceGate struct {
 	viewerSessionID   string
 	upstreamKind      string
@@ -106,32 +110,16 @@ type viewerQualityEvidenceGate struct {
 	sequence          int64
 }
 
-// viewerQualityEvidenceAttempt is viewerQualityEvidenceAttemptAtMs plus the
-// committed-edge connection the stamp was taken under. Tagging replaces the
-// TS setViewerConnectionId reset: a viewer whose media identity changed is
-// never held back by the previous route's stamp.
-//
-// Deviation: it does not replace the deleteViewerConnectionId reset, which
-// broadcastActive also ran when a viewer's path stopped being physical. A
-// viewer whose path breaks and heals on the same committed connection without
-// sending evidence in between keeps its stamp here, where the TypeScript had
-// cleared it, so one frame inside the 2 s window can be dropped that the
-// TypeScript accepted. Unobservable: the reporter's own
-// VIEWER_QUALITY_EVIDENCE_INTERVAL_MS gate means its next send is already at
-// least that far from the last accepted one. The epoch/sequence gate below
-// cannot be affected the same way, because a committed edge that loses
-// physicalActive is never reactivated - its replacement carries a new
-// connectionID, so sameEdge is false.
+// viewerQualityEvidenceAttempt scopes the rate window to a committed connection.
+// A replacement connection is not held back by its predecessor's timestamp.
+// Reports for the same connection remain subject to the existing window.
 type viewerQualityEvidenceAttempt struct {
 	connectionID string
 	atMs         int64
 }
 
-// roomShare is one Host share of one room. Its zero value is the TS state
-// where none of the four per-room share maps had an entry, so reads need no
-// presence check: generation and pausedGeneration are never stored empty
-// (authenticate falls back to the session id), which is what made the TS
-// `undefined === undefined` comparisons meaningful.
+// roomShare owns one room's Host publication intent. Its zero value means no
+// intent; active generations are nonempty, falling back to the Host session ID.
 type roomShare struct {
 	// generation survives stopSharing; only closeRoom drops the whole
 	// record.
@@ -144,19 +132,18 @@ type roomShare struct {
 	pausedGeneration string
 }
 
-// senderQualityRateWindow is SenderQualityRateWindow.
 type senderQualityRateWindow struct {
 	startedAtMs int64
 	count       int
 }
 
-// graceTimer is one viewerGraceTimers entry; the callback compares the
-// registered pointer with its own (a cleared TS timer never fired).
+// graceTimer callbacks compare their registered pointer so replacement or
+// cancellation invalidates a callback even after its timer has fired.
 type graceTimer struct {
 	stop func() bool
 }
 
-// Server is SignalingServer.
+// Server owns room signaling and serializes its effects.
 type Server struct {
 	// ponytail: global lock, per-room locks if throughput matters
 	mu sync.Mutex
@@ -176,6 +163,7 @@ type Server struct {
 	authenticationTimeoutMs       int
 	viewerDisconnectGraceMs       int
 	heartbeatIntervalMs           int
+	roomEmptyTimeoutMs            int64
 	maxConnections                int
 	maxUnauthenticatedConnections int
 
@@ -193,9 +181,7 @@ type Server struct {
 	viewerQualityEvidenceGates    map[string]viewerQualityEvidenceGate
 	viewerQualityEvidenceAttempts map[string]viewerQualityEvidenceAttempt
 	senderQualityRateBySession    map[string]*senderQualityRateWindow
-	// shares owns the whole per-room share lifecycle (TS
-	// shareGenerationsByRoom, qualitySettingsByRoom, routePolicyByRoom and
-	// pausedShareGenerationsByRoom).
+	// shares keeps generation, settings, route policy and pause intent together.
 	shares                      map[string]roomShare
 	deferredViewerPresenceRooms map[string]struct{}
 
@@ -203,8 +189,7 @@ type Server struct {
 	closing       bool
 }
 
-// New is the SignalingServer constructor. It performs no I/O; the heartbeat
-// ticker starts immediately.
+// New creates the signaling owner and starts its heartbeat timer.
 func New(options Options) (*Server, error) {
 	if err := protocol.AssertEndpointMediaCopyCapacity(options.EndpointMediaCopyCapacity); err != nil {
 		return nil, err
@@ -214,6 +199,9 @@ func New(options Options) (*Server, error) {
 	}
 	if options.SfuFallback != nil && (options.SfuFallback.Media == nil || options.SfuFallback.Admission == nil) {
 		return nil, errors.New("SFU fallback requires media and resource admission")
+	}
+	if options.SfuOnly && options.SfuFallback == nil {
+		return nil, errors.New("SFU-only routing requires SFU media and resource admission")
 	}
 	s := &Server{
 		store:                         options.Store,
@@ -230,6 +218,7 @@ func New(options Options) (*Server, error) {
 		authenticationTimeoutMs:       orDefault(options.AuthenticationTimeoutMs, defaultAuthenticationTimeoutMs),
 		viewerDisconnectGraceMs:       orDefault(options.ViewerDisconnectGraceMs, defaultViewerDisconnectGraceMs),
 		heartbeatIntervalMs:           orDefault(options.HeartbeatIntervalMs, defaultHeartbeatIntervalMs),
+		roomEmptyTimeoutMs:            options.RoomEmptyTimeoutMs,
 		maxConnections:                orDefault(options.MaxConnections, defaultMaxSignalConnections),
 		maxUnauthenticatedConnections: orDefault(options.MaxUnauthenticatedConnections, defaultMaxUnauthenticatedConnections),
 		sessionsByID:                  map[string]*session{},
@@ -271,6 +260,7 @@ func New(options Options) (*Server, error) {
 		store:                     s.store,
 		endpointMediaCopyCapacity: s.endpointMediaCopyCapacity,
 		sfu:                       fallback,
+		sfuOnly:                   options.SfuOnly,
 		hooks: routerHooks{
 			sendToSession:   s.sendToSession,
 			shareGeneration: func(roomID string) string { return s.shares[roomID].generation },
@@ -306,9 +296,8 @@ func orDefault(value, fallback int) int {
 	return value
 }
 
-// InviteURL is viewerInviteUrl / the inviteUrl of createRoomResponse:
-// new URL(`/r/${roomId}`, publicBaseUrl) with the Viewer grant in the
-// fragment only. viewerGrant "" is the TypeScript null.
+// InviteURL adds an optional Viewer grant only in the URL fragment, keeping it
+// out of HTTP requests. Existing base URL query/fragment values are discarded.
 func InviteURL(publicBaseURL *url.URL, roomID, viewerGrant string) string {
 	invite := *publicBaseURL
 	invite.Opaque = ""
@@ -328,20 +317,16 @@ func InviteURL(publicBaseURL *url.URL, roomID, viewerGrant string) string {
 // upgrade
 // ---------------------------------------------------------------------------
 
-// ServeHTTP is the "upgrade" listener: the TS rejection ladder, then the
-// accept.
+// ServeHTTP validates the signaling endpoint, origin and capacity before upgrade.
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	// accepts a scheme-relative target such as "//[" as a plain path, so
-	// the WHATWG authority parse is re-run on the raw target.
+	// HTTP parsing accepts scheme-relative targets as paths; reject malformed
+	// authorities such as "//[" before checking the endpoint.
 	if _, err := url.Parse(request.RequestURI); err != nil {
 		rejectUpgrade(writer, http.StatusBadRequest)
 		return
 	}
-	// EscapedPath, not Path: the WHATWG pathname the TS compared is not
-	// percent-decoded, so "/%73ignal" was a 404 there, while URL.Path decodes
-	// it to "/signal" and would give the endpoint an alias the TS never had.
-	// This is the path notion the sibling HTTP router already uses
-	// (app/json.go requestPath), with the same dot-segment deviation.
+	// Match the literal endpoint, rejecting encoded aliases such as "/%73ignal",
+	// just as the sibling HTTP router's requestPath does.
 	if request.URL.EscapedPath() != "/signal" || request.URL.RawQuery != "" {
 		rejectUpgrade(writer, http.StatusNotFound)
 		return
@@ -362,15 +347,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		rejectUpgrade(writer, http.StatusServiceUnavailable)
 		return
 	}
-	// The TS counted the slot synchronously inside handleUpgrade; Accept
-	// performs I/O, so the slot is reserved across it.
+	// Reserve capacity before Accept performs I/O outside the lock.
 	s.pendingConnections++
 	s.mu.Unlock()
 
 	siteAccessAuthenticated := s.siteAccessAtUpgrade(request)
 	var sess *session
 	// Origin was verified above with the exact isAllowedOrigin rule, so the
-	// library's own check is skipped; the TS ws server never compressed.
+	// library's own check is skipped.
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 		CompressionMode:    websocket.CompressionDisabled,
@@ -491,6 +475,14 @@ func (s *Server) Close(ctx context.Context) error {
 	return routeCloseError
 }
 
+// CloseStorage follows HTTP draining. A timed-out drain can leave admitted
+// mutations running, so database closure still takes the store's owning lock.
+func (s *Server) CloseStorage() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.store.Close()
+}
+
 // EndAllRooms closes rooms in store order.
 func (s *Server) EndAllRooms() error {
 	s.mu.Lock()
@@ -560,10 +552,9 @@ func (s *Server) UpdateRoomAccess(
 	return nil, fmt.Errorf("unknown room access request %T", request)
 }
 
-// deriveViewerPasswordMaterial is the unlocked KDF window of replaceRoom and
-// setViewerPassword; mayStart is the TS `rooms.get(roomId) === current &&
-// verifyDigest(hostToken)` closure. mu must be held; it is released only
-// while the derivation runs. A nil password derives nothing.
+// deriveViewerPasswordMaterial releases mu for password derivation, rechecking
+// exact room/Host authority when the gate admits the work. The caller holds mu;
+// a nil or empty password derives nothing.
 func (s *Server) deriveViewerPasswordMaterial(
 	roomID, hostToken string, password *string, current *room.Room,
 ) (material []byte, derived error) {
@@ -593,6 +584,13 @@ func (s *Server) ReplaceRoom(
 	}
 	material, derived := s.deriveViewerPasswordMaterial(roomID, hostToken, roomPassword, current)
 	replacement, err := s.store.ReplaceRoom(roomID, hostToken, codeEntryPolicy, material, derived, current)
+	if derived == nil {
+		if candidate := s.roomCapacityCandidate(err, roomID); candidate != "" {
+			if err = s.abandonRoom(candidate); err == nil {
+				replacement, err = s.store.ReplaceRoom(roomID, hostToken, codeEntryPolicy, material, derived, current)
+			}
+		}
+	}
 	if err != nil {
 		return room.CreatedRoom{}, err
 	}
@@ -600,8 +598,8 @@ func (s *Server) ReplaceRoom(
 	return replacement.Created, nil
 }
 
-// CreateRoom is the roomStore.createRoom call of app.ts, run under mu with
-// the KDF unlocked (the room package's documented sequence).
+// CreateRoom serializes room admission and commit, releasing mu for password
+// derivation according to the room package's locking contract.
 func (s *Server) CreateRoom(
 	codeEntryPolicy protocol.CodeEntryPolicy,
 	roomPassword *string,
@@ -609,7 +607,7 @@ func (s *Server) CreateRoom(
 ) (room.CreatedRoom, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.store.BeginCreateRoom(); err != nil {
+	if err := s.store.BeginCreateRoom(); err != nil && s.roomCapacityCandidate(err, "") == "" {
 		return room.CreatedRoom{}, err
 	}
 	var material []byte
@@ -621,7 +619,15 @@ func (s *Server) CreateRoom(
 			material, derived = s.store.DeriveViewerPasswordMaterial(*roomPassword, nil)
 		}()
 	}
-	return s.store.CreateRoom(codeEntryPolicy, material, derived, preferredRoomID)
+	created, err := s.store.CreateRoom(codeEntryPolicy, material, derived, preferredRoomID)
+	if derived == nil {
+		if candidate := s.roomCapacityCandidate(err, ""); candidate != "" {
+			if err = s.abandonRoom(candidate); err == nil {
+				created, err = s.store.CreateRoom(codeEntryPolicy, material, derived, preferredRoomID)
+			}
+		}
+	}
+	return created, err
 }
 
 // armHeartbeat is the heartbeat setInterval: each tick re-arms the
@@ -635,6 +641,7 @@ func (s *Server) armHeartbeat() {
 			return
 		}
 		pings := s.heartbeat()
+		s.expireEmptyRooms()
 		s.armHeartbeat()
 		s.mu.Unlock()
 		for _, sess := range pings {
@@ -700,47 +707,48 @@ func (s *Server) handleMessage(sess *session, encoded []byte) {
 // fields authenticate() and authenticationErrorCode() read. Empty strings
 // and nil pointers are absent keys.
 type authRequest struct {
-	role                       protocol.Role
-	roomID                     string
-	clientID                   string
-	token                      string
-	viewerGrant                string
-	viewerPassword             string
-	shareGeneration            string
-	sharingPaused              bool
-	qualitySettings            *protocol.QualitySettings
-	routePolicy                protocol.RoutePolicy
-	viewerPresence             bool
-	connectionAttemptProgress4 bool
-	displayName                *string
+	role            protocol.Role
+	roomID          string
+	clientID        string
+	token           string
+	viewerGrant     string
+	viewerPassword  string
+	shareGeneration string
+	sharingPaused   bool
+	qualitySettings *protocol.QualitySettings
+	routePolicy     protocol.RoutePolicy
+	viewerPresence  bool
+	displayName     *string
+	roomOnly        bool
+	roomSession     bool
 }
 
 func authRequestOf(message protocol.ClientMessage) (authRequest, bool) {
 	switch m := message.(type) {
 	case protocol.AuthenticateHostMessage:
 		return authRequest{
-			role:                       protocol.RoleHost,
-			roomID:                     m.RoomID,
-			clientID:                   m.ClientID,
-			token:                      m.Token,
-			shareGeneration:            m.ShareGeneration,
-			sharingPaused:              m.SharingPaused != nil && *m.SharingPaused,
-			qualitySettings:            m.QualitySettings,
-			routePolicy:                m.RoutePolicy,
-			viewerPresence:             m.ViewerPresence,
-			connectionAttemptProgress4: m.ConnectionAttemptProgress4,
-			displayName:                displayNameString(m.DisplayName),
+			role:            protocol.RoleHost,
+			roomID:          m.RoomID,
+			clientID:        m.ClientID,
+			token:           m.Token,
+			shareGeneration: m.ShareGeneration,
+			sharingPaused:   m.SharingPaused != nil && *m.SharingPaused,
+			qualitySettings: m.QualitySettings,
+			routePolicy:     m.RoutePolicy,
+			viewerPresence:  m.ViewerPresence,
+			displayName:     displayNameString(m.DisplayName),
+			roomOnly:        m.RoomOnly,
+			roomSession:     m.RoomSession,
 		}, true
 	case protocol.AuthenticateViewerMessage:
 		return authRequest{
-			role:                       protocol.RoleViewer,
-			roomID:                     m.RoomID,
-			clientID:                   m.ClientID,
-			viewerGrant:                m.ViewerGrant,
-			viewerPassword:             m.ViewerPassword,
-			viewerPresence:             m.ViewerPresence,
-			connectionAttemptProgress4: m.ConnectionAttemptProgress4,
-			displayName:                displayNameString(m.DisplayName),
+			role:           protocol.RoleViewer,
+			roomID:         m.RoomID,
+			clientID:       m.ClientID,
+			viewerGrant:    m.ViewerGrant,
+			viewerPassword: m.ViewerPassword,
+			viewerPresence: m.ViewerPresence,
+			displayName:    displayNameString(m.DisplayName),
 		}, true
 	}
 	return authRequest{}, false
@@ -758,6 +766,14 @@ func displayNameString(name *protocol.DisplayName) *string {
 // section. Password checks run in a goroutine so the reader can keep reading
 // while the KDF runs.
 func (s *Server) authenticate(sess *session, request authRequest) {
+	// Reject the conflicting preference before acquiring room or media authority,
+	// including reconnects from older pages. Never turn peer-only into SFU consent.
+	if request.role == protocol.RoleHost && !request.roomOnly && s.router.sfuOnly && request.routePolicy.PeerOnly {
+		s.sendError(sess, "FORBIDDEN", "This site requires server media; turn off Privacy mode or use another site")
+		sess.close(websocket.StatusCode(protocol.SignalCloseAuthenticationFailed), "Route policy conflict")
+		s.finishAuthenticating(sess)
+		return
+	}
 	if request.role == protocol.RoleHost && !sess.siteAccessAuthenticated {
 		s.sendError(sess, "AUTH_REQUIRED", "Site access is required")
 		sess.close(websocket.StatusCode(protocol.SignalCloseAuthenticationFailed), "Authentication failed")
@@ -867,7 +883,7 @@ func (s *Server) authenticationFailed(sess *session, request authRequest, err er
 func (s *Server) completeAuthentication(sess *session, request authRequest, participant room.ConnectedParticipant) {
 	if s.closing || !s.sessions.Has(sess) || sess.revoked || !sess.open() {
 		if _, err := s.store.DisconnectParticipant(participant.RoomID, participant.PeerID, sess.sessionID); err != nil {
-			// The TS threw out of the async function; there is no catcher.
+			// Failing to retire the aborted admission is an internal invariant failure.
 			panic(fmt.Errorf("room store failed while releasing an aborted authentication: %w", err))
 		}
 		return
@@ -882,35 +898,38 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 	}
 	displayName := authenticatedDisplayName(request)
 	authenticated := &authenticatedSession{
-		roomID:                     roomID,
-		role:                       participant.Role,
-		peerID:                     participant.PeerID,
-		shareGeneration:            shareGeneration,
-		displayName:                displayName,
-		viewerPresence:             request.viewerPresence,
-		connectionAttemptProgress4: request.connectionAttemptProgress4,
+		roomID:          roomID,
+		role:            participant.Role,
+		peerID:          participant.PeerID,
+		shareGeneration: shareGeneration,
+		displayName:     displayName,
+		viewerPresence:  request.viewerPresence,
+		roomSession:     request.roomSession,
 	}
 	sess.authenticated = authenticated
 	if participant.Role == protocol.RoleViewer {
 		s.clearViewerEvidence(roomID, participant.PeerID)
 	}
 	s.clearViewerGrace(roomID, participant.PeerID)
-	routeParticipant := authenticatedRouteParticipant{
-		roomID:    roomID,
-		role:      participant.Role,
-		peerID:    participant.PeerID,
-		sessionID: sess.sessionID,
+	mediaActive := participant.Role == protocol.RoleHost && shareGeneration != ""
+	if participant.Role == protocol.RoleViewer {
+		mediaActive = s.activeHostShareGeneration(roomID) != ""
 	}
-	if participant.Role == protocol.RoleHost {
+	routeParticipant := routeParticipant(sess, authenticated)
+	if participant.Role == protocol.RoleHost && mediaActive {
 		policy := s.routePolicyOf(roomID)
 		routeParticipant.routePolicy = &policy
 	}
-	hybridState, assigned := s.connectRouteParticipant(routeParticipant)
-	if !assigned {
-		s.logger.Error("Media router did not assign an authenticated participant")
-		s.sendError(sess, "SERVER_ERROR", "Media assignment failed")
-		sess.close(websocket.StatusInternalError, "Media assignment failed")
-		return
+	hybridState := hybridAuthenticationState{routeAssignment: emptyAssignment()}
+	if participant.Role == protocol.RoleViewer || mediaActive {
+		var assigned bool
+		hybridState, assigned = s.connectRouteParticipant(routeParticipant)
+		if !assigned {
+			s.logger.Error("Media router did not assign an authenticated participant")
+			s.sendError(sess, "SERVER_ERROR", "Media assignment failed")
+			sess.close(websocket.StatusInternalError, "Media assignment failed")
+			return
+		}
 	}
 	// The viewer's media identity is derived from the committed edge, never
 	// stored beside it; connectParticipant has just settled the graph.
@@ -934,8 +953,11 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 		qualitySettings = *share.qualitySettings
 	}
 	var roomShareGeneration *string
-	if share.generation != "" {
-		generation := share.generation
+	if participant.Role == protocol.RoleHost && mediaActive {
+		generation := shareGeneration
+		roomShareGeneration = &generation
+	} else if participant.Role == protocol.RoleViewer && mediaActive {
+		generation := s.activeHostShareGeneration(roomID)
 		roomShareGeneration = &generation
 	}
 	if participant.Role == protocol.RoleHost {
@@ -960,15 +982,15 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 			ViewerPasswordEnabled:         participant.ViewerPasswordEnabled,
 		})
 	} else {
-		hostPaused := participant.HostOnline &&
-			share.pausedGeneration == share.generation
+		hostOnline := participant.HostOnline && mediaActive
+		hostPaused := hostOnline && share.pausedGeneration == share.generation
 		s.send(sess, protocol.AuthenticatedViewerMessage{
 			Type:                          "authenticated",
 			Protocol:                      protocol.SignalingProtocol,
 			PeerID:                        participant.PeerID,
 			MaxViewers:                    protocol.Int(s.store.MaxViewersPerRoom()),
 			EndpointMediaCopyCapacity:     protocol.Int(s.endpointMediaCopyCapacity),
-			HostOnline:                    participant.HostOnline,
+			HostOnline:                    hostOnline,
 			HostPaused:                    &hostPaused,
 			ConnectionID:                  connectionID,
 			IceConfig:                     s.ice,
@@ -989,12 +1011,14 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 		}
 	}
 
-	if participant.Role == protocol.RoleHost {
+	if participant.Role == protocol.RoleHost && mediaActive {
 		s.router.setPaused(roomID, s.shares[roomID].pausedGeneration == shareGeneration)
 	}
-	s.router.completeAuthentication(routeParticipant, hybridState)
+	if participant.Role == protocol.RoleViewer || mediaActive {
+		s.router.completeAuthentication(routeParticipant, hybridState)
+	}
 
-	if participant.Role == protocol.RoleHost && shareGeneration != "" &&
+	if participant.Role == protocol.RoleHost && mediaActive &&
 		s.shares[roomID].pausedGeneration == shareGeneration {
 		s.sendToSession(sess.sessionID, protocol.PauseSharingSourceMessage{
 			Type:            "pause-sharing-source",
@@ -1004,7 +1028,7 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 
 	s.sendViewerPresence(roomID)
 
-	if participant.Role == protocol.RoleHost {
+	if participant.Role == protocol.RoleHost && mediaActive {
 		for _, viewer := range connectedViewers {
 			s.sendToSession(viewer.SessionID, protocol.HostStatusMessage{
 				Type:   "host-status",
@@ -1021,6 +1045,15 @@ func (s *Server) completeAuthentication(sess *session, request authRequest, part
 // with. It returns the settled generation and must run with mu held, before the
 // `authenticated` message is built from the record it writes.
 func (s *Server) settleHostShare(roomID, sessionID string, request authRequest) string {
+	if request.roomOnly {
+		// A room-only reconnect must not resurrect a stale publication. The
+		// stop path normally already cleared it; this guard covers a socket
+		// loss between the client cleanup and the server's stop message.
+		if s.shares[roomID].generation != "" {
+			s.stopSharing(roomID)
+		}
+		return ""
+	}
 	current := s.shares[roomID]
 	currentGeneration := current.generation
 	shareGeneration := request.shareGeneration
@@ -1035,8 +1068,7 @@ func (s *Server) settleHostShare(roomID, sessionID string, request authRequest) 
 	if currentGeneration != "" && currentGeneration != shareGeneration {
 		s.stopSharing(roomID)
 	}
-	// stopSharing may have cleared the record, so the survivors are read
-	// after it, exactly as the TS map reads were.
+	// stopSharing may have cleared fields, so read the surviving intent afterwards.
 	share := s.shares[roomID]
 	if request.shareGeneration != "" &&
 		(currentGeneration != shareGeneration || share.qualitySettings == nil) {
@@ -1092,9 +1124,8 @@ func authenticatedDisplayName(request authRequest) *string {
 	return &name
 }
 
-// connectRouteParticipant is the try/catch around
-// hybridMediaRouter.connectParticipant: a controller assertion panics with
-// the TS message, which the TS catch swallowed.
+// connectRouteParticipant leaves the participant unassigned if a controller
+// assertion prevents route admission.
 func (s *Server) connectRouteParticipant(participant authenticatedRouteParticipant) (state hybridAuthenticationState, assigned bool) {
 	defer func() {
 		if recover() != nil {
@@ -1111,10 +1142,33 @@ func (s *Server) routePolicyOf(roomID string) protocol.RoutePolicy {
 	return s.configuredRoutePolicy(protocol.DefaultRoutePolicy)
 }
 
+// activeHostShareGeneration is the media truth for a room. The room share
+// record intentionally keeps its generation as a stale reconnect fence after
+// stopSharing, so membership or that fence alone cannot mean "publishing".
+// Callers hold Server.mu.
+func (s *Server) activeHostShareGeneration(roomID string) string {
+	host, ok := s.store.GetConnectedHost(roomID)
+	if !ok {
+		return ""
+	}
+	hostSession := s.sessionsByID[host.SessionID]
+	if hostSession == nil || hostSession.authenticated == nil ||
+		hostSession.authenticated.role != protocol.RoleHost ||
+		hostSession.authenticated.roomID != roomID {
+		return ""
+	}
+	generation := hostSession.authenticated.shareGeneration
+	if generation == "" || s.shares[roomID].generation != generation {
+		return ""
+	}
+	return generation
+}
+
 // configuredRoutePolicy restricts share preferences to the services this runtime owns.
 func (s *Server) configuredRoutePolicy(policy protocol.RoutePolicy) protocol.RoutePolicy {
 	policy.PeerOnly = s.router.sfu == nil || policy.PeerOnly
-	policy.NatPrediction = s.natPredictionEnabled && policy.NatPrediction
+	policy.NatPrediction = s.natPredictionEnabled && !s.router.sfuOnly && policy.NatPrediction
+	policy.TopologyOptimization = !s.router.sfuOnly && policy.TopologyOptimization
 	return policy
 }
 
@@ -1131,6 +1185,12 @@ func routeParticipant(sess *session, authenticated *authenticatedSession) authen
 
 func (s *Server) handleAuthenticatedMessage(sess *session, authenticated *authenticatedSession, message protocol.ClientMessage) {
 	switch m := message.(type) {
+	case protocol.SubscribeRoomInteractionsMessage:
+		// Explicit opt-in protects older v23 readers from unknown events.
+		sess.roomInteractions = true
+		s.send(sess, protocol.RoomInteractionsReadyMessage{Type: "room-interactions-ready", ServerTime: protocol.Int(s.now())})
+	case protocol.SendRoomInteractionMessage:
+		s.handleRoomInteraction(sess, authenticated, m)
 	case protocol.SignalingChallengeMessage:
 		if !s.sessions.Has(sess) || sess.authenticated != authenticated {
 			return
@@ -1163,6 +1223,10 @@ func (s *Server) handleAuthenticatedMessage(sess *session, authenticated *authen
 	case protocol.SetQualitySettingsMessage:
 		if authenticated.role != protocol.RoleHost {
 			s.sendError(sess, "FORBIDDEN", "Only the host may set quality settings")
+			return
+		}
+		if authenticated.shareGeneration == "" ||
+			s.shares[authenticated.roomID].generation != authenticated.shareGeneration {
 			return
 		}
 		share := s.shares[authenticated.roomID]
@@ -1246,28 +1310,39 @@ func (s *Server) handleAuthenticatedMessage(sess *session, authenticated *authen
 		s.shares[authenticated.roomID] = share
 		s.router.setPaused(authenticated.roomID, m.Paused)
 		s.broadcastHostStatus(authenticated.roomID, true, m.Paused)
+	case protocol.StartSharingMessage:
+		s.startSharing(sess, authenticated, m)
 	case protocol.StopSharingMessage:
 		if authenticated.role != protocol.RoleHost {
 			s.sendError(sess, "FORBIDDEN", "只有当前房主可以停止分享")
 			return
 		}
-		if authenticated.shareGeneration == "" ||
-			s.shares[authenticated.roomID].generation != authenticated.shareGeneration ||
+		if authenticated.shareGeneration == "" {
+			return
+		}
+		if s.shares[authenticated.roomID].generation != authenticated.shareGeneration ||
 			(m.ShareGeneration != "" && m.ShareGeneration != authenticated.shareGeneration) {
 			sess.close(websocket.StatusCode(protocol.SignalCloseSessionReplaced), "Sharing generation replaced")
 			return
 		}
-		// The participant leaves the store before stopSharing()
-		// so the sharing-stopped / host-status pair is what viewers see.
-		if s.sessions.Has(sess) && sess.authenticated == authenticated {
-			if _, err := s.store.DisconnectParticipant(authenticated.roomID, authenticated.peerID, sess.sessionID); err != nil {
-				// The TS threw out of the message handler; nothing caught it.
-				panic(fmt.Errorf("room store failed while stopping sharing: %w", err))
+		if !authenticated.roomSession {
+			// Older clients treat stopping media as leaving the Host session.
+			// Keep that contract until the client explicitly opts into the
+			// persistent room-session lifecycle.
+			if s.sessions.Has(sess) && sess.authenticated == authenticated {
+				if _, err := s.store.DisconnectParticipant(authenticated.roomID, authenticated.peerID, sess.sessionID); err != nil {
+					panic(fmt.Errorf("room store failed while stopping sharing: %w", err))
+				}
 			}
+			s.stopSharing(authenticated.roomID)
+			sess.close(websocket.StatusNormalClosure, "Sharing stopped")
+			return
 		}
 		s.stopSharing(authenticated.roomID)
+		// Room membership and its interaction stream outlive the media
+		// publication. The next start-sharing message claims a fresh generation.
+		authenticated.shareGeneration = ""
 		s.sendViewerPresence(authenticated.roomID)
-		sess.close(websocket.StatusNormalClosure, "Sharing stopped")
 	case protocol.AbandonRoomMessage:
 		if authenticated.role != protocol.RoleHost {
 			s.sendError(sess, "FORBIDDEN", "Only the host may abandon the room")
@@ -1278,6 +1353,76 @@ func (s *Server) handleAuthenticatedMessage(sess *session, authenticated *authen
 			s.sendError(sess, "SERVER_ERROR", "Room could not be abandoned")
 		}
 	}
+}
+
+// startSharing claims a new publication generation without replacing the
+// authenticated Host participant. Room interactions therefore keep the same
+// session while the media graph is rebuilt for the new source.
+func (s *Server) startSharing(sess *session, authenticated *authenticatedSession, message protocol.StartSharingMessage) {
+	if authenticated.role != protocol.RoleHost {
+		s.sendError(sess, "FORBIDDEN", "Only the host may start sharing")
+		return
+	}
+	if !authenticated.roomSession {
+		s.sendError(sess, "FORBIDDEN", "Persistent room session is not enabled")
+		return
+	}
+	if !s.sessions.Has(sess) || sess.authenticated != authenticated ||
+		authenticated.shareGeneration != "" || message.ShareGeneration == s.shares[authenticated.roomID].generation ||
+		(s.router.sfuOnly && message.RoutePolicy.PeerOnly) {
+		s.send(sess, protocol.SharingStartFailedMessage{Type: "sharing-start-failed",
+			ShareGeneration: message.ShareGeneration, Code: "FORBIDDEN"})
+		return
+	}
+
+	// stop-sharing deliberately leaves the previous generation as a stale
+	// fence for reconnect validation. A fresh start supersedes that fence
+	// without emitting a second sharing-stopped event.
+	share := s.shares[authenticated.roomID]
+	share.generation = ""
+	share.pausedGeneration = ""
+	s.shares[authenticated.roomID] = share
+	request := authRequest{
+		role:            protocol.RoleHost,
+		roomID:          authenticated.roomID,
+		shareGeneration: message.ShareGeneration,
+		sharingPaused:   message.SharingPaused,
+		qualitySettings: message.QualitySettings,
+		routePolicy:     message.RoutePolicy,
+	}
+	shareGeneration := s.settleHostShare(authenticated.roomID, sess.sessionID, request)
+	authenticated.shareGeneration = shareGeneration
+	routeParticipant := routeParticipant(sess, authenticated)
+	policy := s.routePolicyOf(authenticated.roomID)
+	routeParticipant.routePolicy = &policy
+	routeState, assigned := s.connectRouteParticipant(routeParticipant)
+	if !assigned {
+		authenticated.shareGeneration = ""
+		s.stopSharing(authenticated.roomID)
+		s.send(sess, protocol.SharingStartFailedMessage{Type: "sharing-start-failed",
+			ShareGeneration: message.ShareGeneration, Code: "SERVER_ERROR"})
+		return
+	}
+
+	share = s.shares[authenticated.roomID]
+	qualitySettings := protocol.DefaultQualitySettings
+	if share.qualitySettings != nil {
+		qualitySettings = *share.qualitySettings
+	}
+	s.send(sess, protocol.SharingStartedMessage{
+		Type:            "sharing-started",
+		ShareGeneration: shareGeneration,
+		RoutePolicy:     s.routePolicyOf(authenticated.roomID),
+		RouteRevision:   protocol.Int(routeState.routeRevision),
+		RouteAssignment: routeState.routeAssignment,
+		QualitySettings: qualitySettings,
+		Paused:          share.pausedGeneration == shareGeneration,
+	})
+	// Acknowledge publication authority before any media effects use it.
+	s.router.setPaused(authenticated.roomID, share.pausedGeneration == shareGeneration)
+	s.router.completeAuthentication(routeParticipant, routeState)
+	s.sendViewerPresence(authenticated.roomID)
+	s.broadcastHostStatus(authenticated.roomID, true, share.pausedGeneration == shareGeneration)
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,7 +1444,7 @@ func (s *Server) handleViewerQualityEvidence(sess *session, source *authenticate
 	}
 
 	// The committed edge owns the viewer's media identity; connectionID is
-	// "" while the viewer has no physical path (the TS mirror was absent).
+	// empty while the viewer has no physical path.
 	edge, hasEdge := s.router.resolveActiveViewerMediaEdge(source.roomID, source.peerID)
 	connectionID := ""
 	if hasEdge {
@@ -1481,6 +1626,10 @@ func (s *Server) routePeerAssistedSignal(sess *session, source *authenticatedSes
 	if payload.Kind == "description" && payload.Description != nil {
 		descriptionType = payload.Description.Type
 	}
+	punchPhase := ""
+	if payload.Punch != nil {
+		punchPhase = payload.Punch.Phase
+	}
 	candidateAuthorized := s.router.peerSignalAuthorization(peerSignalInput{
 		roomID:          source.roomID,
 		sourcePeerID:    source.peerID,
@@ -1490,6 +1639,8 @@ func (s *Server) routePeerAssistedSignal(sess *session, source *authenticatedSes
 		connectionID:    payload.ConnectionID,
 		signalKind:      payload.Kind,
 		descriptionType: descriptionType,
+		punchPhase:      punchPhase,
+		punched:         payload.Punched,
 	})
 	debugInput := peerSignalDebugInput{
 		roomID:          source.roomID,
@@ -1529,8 +1680,7 @@ func (s *Server) routePeerAssistedSignal(sess *session, source *authenticatedSes
 		return
 	}
 
-	// TS setViewerConnectionId here only ever restated the committed edge:
-	// an authorized non-probe offer either matches edge.connectionId or was
+	// An authorized non-probe offer either matches the committed connection or was
 	// adopted into it by peerSignalAuthorization.
 	s.sendToSession(target.SessionID, protocol.ServerSignalMessage{
 		Type:       "signal",

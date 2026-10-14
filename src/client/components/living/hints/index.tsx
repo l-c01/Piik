@@ -1,13 +1,13 @@
 // Control hint scenes (操作提示漫画): small explanatory scenes used
 // as hover/focus tooltips in every mode, with captions added by Tooltip.
 // Same cast, palette, 320x96 canvas, and motion
-// constitution as the state comics. Sets live in set1..set4.tsx;
-// each must define exactly its SetNKind keys — the merge below then proves
+// constitution as the state comics. Each scene group defines exactly its
+// own HintKind subset — the merge below then proves
 // completeness at compile time. JSX-free shell: this module is also loaded
 // by the tsx preview harness, which uses the classic JSX runtime.
 
 import { createElement, memo, type CSSProperties } from "react";
-import type { HintKind, HintScene, MetricHintKind } from "../../../ui/visual-kinds";
+import type { HintKind, HintScene, MetricHintKind, InteractionHintKind } from "../../../ui/visual-kinds";
 import { SET1_SCENES } from "./set1";
 import { SET2_SCENES } from "./set2";
 import { SET3_SCENES } from "./set3";
@@ -16,6 +16,7 @@ import { PLAYBACK_SCENES } from "./playback";
 import { CONTROL_SCENES } from "./controls";
 import { METRIC_SCENES } from "./metrics";
 import { ADMISSION_SCENES } from "./admission";
+import { INTERACTION_SCENES } from "./interactions";
 import { comicStyle, getComicPresentation, type ComicTone, type ComicMotion } from "../comic-presentation";
 
 export type { HintKind, HintScene };
@@ -26,6 +27,7 @@ export const HINT_KINDS: readonly HintKind[] = [
   "hint-microphone-on",
   "hint-microphone-off",
   "hint-microphone-volume",
+  "hint-microphone-processing",
   "hint-pause",
   "hint-resume",
   "hint-switch-source",
@@ -49,6 +51,7 @@ export const HINT_KINDS: readonly HintKind[] = [
   "hint-admission-invite",
   "hint-quality",
   "hint-audio-quality",
+  "hint-exclude-audio",
   "hint-degrade-pref",
   "hint-prefer-resolution",
   "hint-prefer-framerate",
@@ -80,6 +83,7 @@ export const HINT_KINDS: readonly HintKind[] = [
   "hint-nat-prediction",
   "hint-nat-unavailable",
   "hint-client-local",
+  "hint-app-ready",
   "hint-client-site",
   "hint-capture-browser",
   "hint-capture-camera",
@@ -99,6 +103,7 @@ export const HINT_KINDS: readonly HintKind[] = [
   "hint-pip-exit",
   "hint-pip-unavailable",
   ...Object.keys(METRIC_SCENES) as MetricHintKind[],
+  ...Object.keys(INTERACTION_SCENES) as InteractionHintKind[],
 ];
 
 export const HINT_SCENES: Record<HintKind, HintScene> = {
@@ -110,6 +115,7 @@ export const HINT_SCENES: Record<HintKind, HintScene> = {
   ...CONTROL_SCENES,
   ...METRIC_SCENES,
   ...ADMISSION_SCENES,
+  ...INTERACTION_SCENES,
 };
 
 const HINT_KIND_SET: ReadonlySet<string> = new Set(HINT_KINDS);

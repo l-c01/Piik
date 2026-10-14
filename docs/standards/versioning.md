@@ -25,6 +25,11 @@ Keep those internal values at the first public release: resetting schema or
 authorization counters for visual consistency can invalidate data or stale-work
 fences. A room number is a user-facing address, not a software version.
 The private tooling-only npm package carries no independent product version.
+The App launcher displays its installed version from the existing launcher state;
+Server startup logs retain the running version and revision. The website may
+display GitHub's latest stable tag and `published_at` as optional metadata, never
+a manually maintained version or the installed App's identity. Publication time
+is distinct from build time; an unavailable check must not block downloads.
 
 ## Public Compatibility Promise
 
@@ -56,10 +61,19 @@ baseline contract; introduce a small optional capability only for a concrete
 new feature. Do not add a version-range solver, general adapter framework,
 parallel authority writers or blanket old-client fallback paths.
 
+Keep the 2.x baseline long-lived. Substantial new functionality can remain a
+minor release when older peers retain established behavior and new behavior is
+explicitly opted into. A small feature can still be breaking if it unconditionally
+changes a strict message, existing semantics or durable authority. Review those
+boundaries before choosing the version; neither feature count nor a desire to
+avoid a major justifies mislabeling an incompatible release.
+
 ## Extending Interfaces
 
-Command/event JSON objects still reject unknown keys and enums, and required
-fields reject omissions. Therefore even adding a field can break the other side.
+Command/event JSON objects still reject unknown keys, and required fields reject
+omissions. Most enums remain closed; the bounded display-only reaction identifier
+has an explicit [receive-side exception](./rooms-access.md#room-interactions).
+Therefore even adding a field can break the other side.
 The former required `sfu` addition to strict `/api/capabilities` demonstrated
 both directions of this problem; an unchanged signaling identifier does not
 cover HTTP compatibility.
@@ -70,7 +84,15 @@ capability means unavailable. Commands, credentials and authority checks remain
 strict. A new
 message type, enum value or behavior-changing field is emitted only after the
 other side advertises support; accepting unknown metadata is not permission to
-execute unknown commands. Verify both readers before calling a change additive.
+execute unknown commands. A more tolerant reader does not update already-released
+readers: do not emit a new reaction to legacy pages merely because current pages
+can skip it. Verify both readers before calling a change additive.
+
+In the 2.0 contract, numeric media descriptions and retry progress
+are independent of current implementation limits and retry policy. Extending
+those policies does not require another count-specific capability flag.
+Representation acceptance still requires local operation/resource admission;
+it is not a promise that every same-major peer can produce a new media format.
 
 Native discovery distinguishes an incompatible Piik App from an absent App and
 reports protocol numbers to local diagnostics; the source picker offers update/
@@ -94,8 +116,8 @@ release descriptor. Fixed names allow GitHub's native latest-asset links;
 [website operations](../operations/website.md#preview) owns download presentation
 and verification of the matching Gitee mirror.
 
-Public Release attachments contain the three App ZIPs and the Server runtime
-archive. Package descriptors (`.release.json`), file manifests (`.manifest.tsv`)
+Public Release attachments contain the App ZIPs and Server runtime archives
+for the registered package targets. Package descriptors (`.release.json`), file manifests (`.manifest.tsv`)
 and standalone `.sha256` files remain build/deployment inputs in the local output
 and CI artifacts; publishers validate them but do not upload them to GitHub or
 Gitee Releases. The release body includes a collapsed full source SHA and
@@ -116,6 +138,29 @@ manual choice; it makes no ordering claim. Older releases never cause an update
 notice. Unknown SHA is not inferred from a branch name in GitHub metadata.
 The publisher records a full SHA in `target_commitish` and verifies actual tag
 identity separately. Stable update notices ignore prereleases.
+
+### Major-Upgrade Guidance
+
+The App update notice keeps a separate link to the selected provider's exact
+release page. A newer major adds a short, visible breaking-change notice; the
+Server logs the same distinction while preserving its checker JSON and exit
+codes. This is release guidance, not a replacement for actual wire checks.
+Updates remain a manual action. Release prose stays on GitHub/Gitee; the App
+does not fetch or render remote Markdown or add a second changelog store.
+Direct download remains the primary action; reading notes is optional. Keep the
+major warning inline, without a confirmation dialog or mandatory website detour.
+
+Older installed Apps cannot acquire new warning UI from release metadata.
+Their historical download behavior is accepted; do not split release feeds or
+force a stepping-stone release solely to make advisory presentation identical.
+Before a major release, put bilingual upgrade guidance near the top of its
+release notes and on the website download entry. Name the actual incompatible
+App/Site combinations, required upgrade order, interruptions and any persistent
+data implications. Do not assume everyone installed the preceding minor/patch.
+Verify the oldest relevant public App/page and the last preceding-major release
+against the candidate: actual mismatches must fail clearly at their owning
+contract. Keep historical packages available through GitHub releases. A major
+preparation change does not itself authorize a wire bump, migration or release.
 
 ## Automatic Publication
 
@@ -148,7 +193,9 @@ after all required artifacts and checks pass. The publisher verifies matching
 version, source SHA and checksums, then creates/uploads/publishes one GitHub draft.
 When there are no unpublished product changes, CI validates a development build
 and skips packaging and publication; it never assigns an old release version to
-a new source SHA. The separate Website workflow updates the static site after CI.
+a new source SHA. The separate Website and Gitee mirror workflows follow successful
+main CI independently. Mirror failure must remain visible without blocking GitHub
+publication or Website deployment; retries use the original publishing artifacts.
 Failed draft uploads can resume; published artifacts are never overwritten.
 An older draft retried after a newer release cannot take over `latest`.
 
@@ -170,12 +217,15 @@ introduced by this policy.
 
 ## Container Distribution
 
-`ghcr.io/tntcrafthim/piik` wraps the same verified linux/amd64 Server archive as
-the GitHub release. The packager's optional `--container-image <tag>` builds from
-that extraction; CI checks its Compose recipe and transfers the verified image
+`ghcr.io/tntcrafthim/piik` wraps the same verified linux/amd64 and linux/arm64
+Server archives as the GitHub release. The packager's optional
+`--container-image <tag>` builds from that architecture's extraction;
+CI checks its Compose recipe on the matching native runner and transfers the verified image
 between jobs as a CI artifact, outside public Release attachments.
 `publish-container.mjs` requires matching published GitHub source, version and
-Server digest in the image labels. Existing version tags are retained; `latest`
+Server digest in each image's labels. A standard multi-platform image index
+selects the matching architecture; platform tags are immutable inputs to that
+index. Existing version tags are retained; `latest`
 moves only when that version is GitHub's latest. Manual candidates never publish.
 The [release approval boundary](#automatic-publication) and
 [first-publication visibility check](../operations/github.md#container-registry)
@@ -194,11 +244,11 @@ first-parent commits since the previous stable tag. Standalone website and
 documentation phases need no product release notes. The first release uses
 only its launch commit's product introduction; private development history is
 not a launch changelog. Missing, empty, duplicate or visibly encoding-damaged
-sections fail validation before packaging/publication. GitHub Actions shows the generated text in its
-run summary. A manual candidate with an explicit version also previews it, so
-prepare its commit text before dispatching a release rehearsal. A manual
-candidate with no product changes may still be built; its summary reports that
-there are no product release notes, and publication remains disabled.
+sections fail PR and publishing validation. GitHub Actions shows the generated
+release text in its publishing run summary. Manual candidates validate and build
+the requested revision without requiring release copy in branch checkpoints;
+their version labels artifacts and never enables publication. The PR body remains
+the review surface until integration preserves it in the squash commit.
 
 Supply multiline PR/release copy through a UTF-8 file and read back the stored
 body before integration. A terminal preview alone does not prove that Chinese

@@ -25,14 +25,15 @@ connection acquisition reuses the route controller's existing opportunity ledger
    switch defaults on, remains Host-controllable, locks while sharing, and is not
    persisted beyond that share generation.
 2. An enabled Site derives ports 3479 and 3480 from its first ordinary STUN
-   authority on UDP 3478. Public-link App mode instead supplies one ordinary
-   public STUN destination and two fixed public survey destinations; pure LAN
-   mode supplies none. The same share switch and ICE configuration cover every
+   authority on UDP 3478. Public-link App mode supplies three ordinary public
+   STUN destinations, reusing the same set for its prediction survey; disabling
+   prediction retains ordinary discovery redundancy. Pure LAN mode supplies
+   none. The same share switch and ICE configuration cover every
    Browser or Native P2P edge. SFU PeerConnections remain unchanged.
 3. For one ICE gathering generation, the adapter observes only UDP `srflx`
    candidates belonging to the exact three-destination survey set. Browser
-   candidates are matched by their reported STUN URL. Native Pion uses its
-   `UniversalUDPMux` to perform the survey on the media socket and emits standard
+   candidates are matched by their reported STUN URL. Native uses Pion's STUN
+   client through its ordinary UDP mux to survey the media socket and emits standard
    srflx-shaped observations marked with an `ns` foundation. Only those explicit
    survey observations feed prediction; port-mapped candidates remain ordinary
    ICE inputs. If three or more distinct survey candidates for
@@ -42,8 +43,8 @@ connection acquisition reuses the route controller's existing opportunity ledger
    Every host and observed srflx candidate keeps normal Trickle ICE timing; no ordinary
    candidate is delayed, rejected, or replaced. A Browser that does not expose
    candidate source URLs keeps ordinary ICE without prediction. Rejection of a
-   predicted remote candidate discards only that optional candidate; ordinary
-   candidate errors retain their normal connection error semantics.
+   remote candidate discards only that candidate; ICE connection state remains
+   the authority for transport failure.
 4. Candidate observations remain in memory for that connection only. They do
    not create persistent NAT labels, endpoint addresses, routing scores, hard
    candidate skips, or periodic probes. Sanitized diagnostics record only
@@ -57,13 +58,34 @@ connection acquisition reuses the route controller's existing opportunity ledger
    peer-only rooms can exhaust that budget without SFU, while mixed rooms use
    the remaining attempts behind a working SFU route. A new connection can
    provide another mapping opportunity, not guaranteed independent randomness:
-   in particular, Native connections may retain the same shared UDP socket.
+   Native replacements allocate an independent socket, while an ICE restart on
+   the same connection retains its socket. Neither promises an independent
+   public NAT mapping.
    A committed Browser P2P edge uses its existing two-request automatic-recovery
    budget: first ICE restart on the same connection, then connection rebuild.
    Recovery does not choose a new parent or add a route candidate; unsuccessful
    recovery follows the normal route-failed path. A prepared candidate remains owned by the route
    operation and is reported failed to that operation instead of starting a
    separate ICE-restart loop.
+6. In the 2.0 candidate, a server-issued retry (never the first attempt) may
+   prepare an authenticated Native socket at both ends before creating its one
+   PeerConnection. It reuses the current peer/session/connection authorization
+   and the same share switch; Browser peers decline immediately. Each Engine
+   permits one preparation: an ordered three-destination observation, then
+   checks against one bounded peer endpoint. Three equal observations retain
+   that exact socket; a positive sequential observation closes it before opening
+   at most eight temporary sockets. These cases can pair in either direction;
+   neither observation establishes a permanent NAT classification. The bound
+   remains 64 requests and 64 authenticated replies. Survey readers, writers
+   and cancellation callbacks retire before socket reuse or transfer. The page
+   waits at most 3.5 seconds; the App
+   expires unconsumed work after five seconds. Mutual success and the existing
+   SDP offer commit one proved socket and peer tuple to Pion. Other sockets and
+   workers retire before reuse. Missing observations or unsuccessful preparation
+   resume ordinary ICE within that same route operation; a lost commit fails
+   only that operation. No route deadline, copy capacity or media protocol is
+   replaced. This is a bounded Native extension, not a Magicsock tunnel or a
+   mechanism for random-port NATs or blocked UDP.
 
 ## Consequences
 
@@ -71,8 +93,8 @@ Positive:
 
 - Sites with their own listeners and self-contained public-link Apps can use
   the same bounded mechanism while pure Browser/LAN operation stays unchanged;
-- normal ICE remains immediately available, so an unavailable auxiliary STUN
-  listener or unsuccessful prediction cannot delay direct or SFU fallback;
+- the first ordinary ICE attempt remains immediately available; optional Native
+  preparation occupies only part of an existing retry's unchanged deadline;
 - prediction is bounded to one connection generation and one small candidate
   set; and
 - selected-foundation attribution can validate actual field benefit without
@@ -82,8 +104,9 @@ Negative:
 
 - the Browser may still reject synthetic candidates or the NAT may not have a
   matching mapping;
-- enabled P2P connections perform two extra STUN transactions and
-  may add connectivity checks for up to eight adjacent UDP ports;
+- Hosted prediction adds two survey destinations; public-link Apps reuse their
+  ordinary destinations. Prediction may add connectivity checks for up to eight
+  adjacent UDP ports;
 - two endpoint-dependent NATs remain sensitive to candidate scheduling and
   intervening mappings, so room-wide coverage is not a success guarantee; and
 - enabled acquisition can occupy up to four ordinary operation windows when

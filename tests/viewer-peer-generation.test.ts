@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { IceConfig, SignalPayload } from "../src/shared/protocol.ts";
 import type { PeerSnapshot } from "../src/client/types.ts";
-import { ViewerPeer } from "../src/client/webrtc/viewer-peer.ts";
+import { ViewerPeer, type ViewerPeerEvents } from "../src/client/webrtc/viewer-peer.ts";
 import { ViewerSfuRoute } from "../src/client/media/viewer-sfu-route";
+import { NativeCapableViewerPeer } from "../src/client/native/native-viewer-peer";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -34,6 +35,7 @@ const ANSWER_SDP = [
 interface ConnectionPlan {
   constructorError?: Error;
   answerError?: Error;
+  answerSdp?: string;
   candidateGates?: Promise<void>[];
   localDescriptionGate?: Promise<void>;
   statsGate?: Promise<RTCStatsReport>;
@@ -74,6 +76,7 @@ class FakePeerConnection extends EventTarget {
   private readonly candidateGates: Promise<void>[];
   private readonly localDescriptionGate: Promise<void> | null;
   private readonly answerError: Error | null;
+  private readonly answerSdp: string;
 
   readonly addIceCandidate = vi.fn(async (_candidate: RTCIceCandidateInit | null) => {
     const gate = this.candidateGates.shift();
@@ -106,6 +109,7 @@ class FakePeerConnection extends EventTarget {
     this.candidateGates = [...(plan.candidateGates ?? [])];
     this.localDescriptionGate = plan.localDescriptionGate ?? null;
     this.answerError = plan.answerError ?? null;
+    this.answerSdp = plan.answerSdp ?? ANSWER_SDP;
     this.statsGate = plan.statsGate ?? null;
     FakePeerConnection.instances.push(this);
   }
@@ -122,7 +126,7 @@ class FakePeerConnection extends EventTarget {
     }
     return {
       type: "answer",
-      sdp: ANSWER_SDP,
+      sdp: this.answerSdp,
     };
   }
 
@@ -304,9 +308,9 @@ describe("ViewerPeer connection generations", () => {
       expect(peer.hasConnectionId(id)).toBe(true);
       return true;
     });
-    const peer = new ViewerPeer({ iceServers: [] }, { sendSignal, sendRestartRequest,
+    const peer = new NativeCapableViewerPeer({ iceServers: [] }, { sendSignal, sendRestartRequest,
       onStream: () => undefined, onUpdate: () => undefined, onRecoveryExhausted: exhausted },
-      { recoveryOwner });
+      { recoveryOwner }, async () => null, () => undefined, "session", 2);
     FakePeerConnection.plans.push({ constructorError: new DOMException("Allocation failed", "UnknownError") });
     await expect(peer.acceptSignal("host", offer("first"))).resolves.toBeUndefined();
     expect(peer.hasConnection()).toBe(false);
@@ -339,6 +343,23 @@ describe("ViewerPeer connection generations", () => {
     await peer.acceptSignal("host", offer("prepared"));
     expect(restart).not.toHaveBeenCalled();
     expect(exhausted).toHaveBeenCalledExactlyOnceWith("host", "prepared");
+    expect(timeoutCallbacks.size).toBe(0);
+    peer.dispose();
+  });
+
+  it("returns rejected video to the existing route owner with its receiving cause", async () => {
+    const restart = vi.fn(() => true), exhausted = vi.fn(() => true), sendSignal = vi.fn(() => true);
+    const updates: PeerSnapshot[] = [];
+    const peer = new ViewerPeer({ iceServers: [] }, { sendSignal, sendRestartRequest: restart,
+      onStream: () => undefined, onUpdate: value => updates.push(value), onRecoveryExhausted: exhausted },
+      { recoveryOwner: "route" });
+    FakePeerConnection.plans.push({ answerSdp: "m=video 0 UDP/TLS/RTP/SAVPF 120\r\n" });
+    await peer.acceptSignal("host", { kind: "description", connectionId: "rejected",
+      description: { type: "offer", sdp: "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\n" } });
+    expect(updates.at(-1)?.error).toEqual({ key: "viewer.msg.videoRejected" });
+    expect(exhausted).toHaveBeenCalledExactlyOnceWith("host", "rejected");
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
     expect(timeoutCallbacks.size).toBe(0);
     peer.dispose();
   });
@@ -454,7 +475,7 @@ describe("ViewerPeer connection generations", () => {
       expect(description).toEqual(expect.objectContaining({
         type: "answer",
         sdp: expect.stringContaining(
-          "a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;maxaveragebitrate=192000",
+          "a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;maxaveragebitrate=510000",
         ),
       }));
       expect(answers[index]?.description.sdp).toBe(description.sdp);
@@ -724,29 +745,30 @@ describe("ViewerPeer connection generations", () => {
     expect(timeoutDelays).toEqual(new Map());
   });
 
-  it("reports one exhausted edge after bounded restart and rebuild attempts", async () => {
+  it.each([false, true])("bounds recovery across rebuilt Browser connections (native wrapper=%s)", async (wrapped) => {
     const restartRequests: Array<{
       peerId: string;
       connectionId: string;
       rebuild: boolean;
     }> = [];
     const exhausted: Array<{ peerId: string; connectionId: string }> = [];
-    const peer = new ViewerPeer(
-      { iceServers: [] },
-      {
-        sendSignal: () => true,
-        sendRestartRequest: (peerId, connectionId, rebuild) => {
-          restartRequests.push({ peerId, connectionId, rebuild });
-          return true;
-        },
-        onStream: () => undefined,
-        onUpdate: () => undefined,
-        onRecoveryExhausted: (peerId, connectionId) => {
-          exhausted.push({ peerId, connectionId });
-          return true;
-        },
+    const events: ViewerPeerEvents = {
+      sendSignal: () => true,
+      sendRestartRequest: (peerId, connectionId, rebuild) => {
+        restartRequests.push({ peerId, connectionId, rebuild });
+        return true;
       },
-    );
+      onStream: () => undefined,
+      onUpdate: () => undefined,
+      onRecoveryExhausted: (peerId, connectionId) => {
+        exhausted.push({ peerId, connectionId });
+        return true;
+      },
+    };
+    const peer = wrapped
+      ? new NativeCapableViewerPeer({ iceServers: [] }, events, {}, async () => null,
+          () => undefined, "session", 2)
+      : new ViewerPeer({ iceServers: [] }, events);
     await peer.acceptSignal("relay-parent", offer("failed-connection"));
     const connection = FakePeerConnection.instances[0]!;
     connection.connectionState = "failed";
@@ -765,14 +787,25 @@ describe("ViewerPeer connection generations", () => {
       connectionId: "failed-connection",
       rebuild: true,
     });
-    timeoutCallbacks.get(3)!();
+    await peer.acceptSignal("relay-parent", offer("rebuilt-connection"));
+    expect(timeoutCallbacks.has(3)).toBe(false);
+    connection.connectionState = "connected";
+    connection.dispatchEvent(new Event("connectionstatechange"));
+    const rebuilt = FakePeerConnection.instances.at(-1)!;
+    rebuilt.connectionState = "failed";
+    rebuilt.dispatchEvent(new Event("connectionstatechange"));
     expect(exhausted).toEqual([
-      { peerId: "relay-parent", connectionId: "failed-connection" },
+      { peerId: "relay-parent", connectionId: "rebuilt-connection" },
     ]);
 
-    connection.dispatchEvent(new Event("connectionstatechange"));
+    rebuilt.dispatchEvent(new Event("connectionstatechange"));
     expect(restartRequests).toHaveLength(2);
     expect(exhausted).toHaveLength(1);
+    expect(peer.requestRecovery(true)).toBe(true);
+    [...timeoutCallbacks.values()].at(-1)!();
+    expect(restartRequests).toHaveLength(3);
+    expect(exhausted).toHaveLength(2);
+    peer.dispose();
   });
 
   it("retries delivery of an exhausted edge after signaling reconnects", async () => {

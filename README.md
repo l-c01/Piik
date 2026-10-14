@@ -15,9 +15,10 @@
 </p>
 <p align="center">English · <a href="./README.zh-CN.md">简体中文</a></p>
 
-Piik is a free, open-source screen sharing tool for games, movie nights,
-drawings and photos. Choose what to share and send an invitation. Your friends
-watch in their browsers.
+Piik is a free, open-source screen sharing tool for private live streams with
+friends: games, movie nights, drawings and photos. Choose what to share and send
+an invitation. Your friends watch in their browsers. You can also self-host Piik
+on your own server.
 
 <details open>
 <summary>A little room · Show / hide animation</summary>
@@ -34,13 +35,14 @@ watch in their browsers.
 - **Share from Piik App or an existing Piik site.** Choose a screen, window, browser tab or camera; available sources and audio depend on the platform.
 - **Direct connections first.** Media travels between participants where possible (P2P). A self-hosted server can provide automatic media forwarding (SFU) as a fallback.
 - **Rooms you control.** Invitations, room codes and optional room passwords, for one host and up to 20 viewers.
+- **Chat while watching.** Send messages and reactions to friends, with optional on-screen chat.
 - **Flexible viewing.** Light and dark themes, playback controls, picture-in-picture and a connection topology view.
 - **One program to host a site.** Web UI, room management and optional media forwarding are packaged together.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/room-en-dark.png">
-    <img src="./docs/assets/room-en-light.png" width="860" alt="Piik room: a shared game, playback controls and friends on a sofa. The host wears a small gold crown.">
+    <img src="./docs/assets/room-en-light.png" width="860" alt="Piik room: a shared game, playback controls, chat and friends on a sofa. The host wears a small gold crown.">
   </picture><br>
   <sub>Interface preview · Sample room with a generated game scene</sub>
 </p>
@@ -57,7 +59,7 @@ you can also create a room in the online version.
 | --- | --- |
 | [Use Piik online](https://demo.piik.tv) | Share from a desktop browser, or choose Camera on a phone with browser camera support. |
 | [Download Piik App](https://piik.tv/#download) | Extract and open the App, choose **Public invite**, then **Open Piik** to create a temporary room. |
-| [Host your own site](./docs/operations/self-hosting.md) | Advanced: deploy Piik Server on a Linux x64 server with your own domain, then connect through Piik App or a browser. |
+| [Host your own site](./docs/operations/self-hosting.md) | Advanced: deploy Piik Server on a Linux x64 or ARM64 server with your own domain, then connect through Piik App or a browser. |
 
 <p align="center"><img src="./docs/assets/quickstart.svg" width="640" alt="Choose a screen, send an invitation, watch together."></p>
 
@@ -69,8 +71,8 @@ device and adjust your voice volume.
 
 Piik follows your system language: Chinese or English, with English as the fallback.
 Use **中 / EN / ✦** in the header to switch language or try the visual mode.
-The App offers a local room, a temporary public link, or a connection to your own
-site. Keep the App running while sharing through it.
+The App can create a local room or temporary public invitation, and stays
+available to supply capture for an approved site. Keep it running while sharing.
 
 Download a ZIP beginning with **`piik-app`**. The filename also identifies the platform:
 
@@ -78,20 +80,23 @@ Download a ZIP beginning with **`piik-app`**. The filename also identifies the p
 | --- | --- |
 | `windows-amd64` | Windows x64 |
 | `darwin-arm64` | Apple silicon; native capture requires macOS 13+ |
+| `darwin-amd64` | Intel Mac; native capture requires macOS 13+ |
 | `linux-amd64` | Linux x64 |
+| `linux-arm64` | Linux ARM64 |
 
 [**Full setup guide →**](./docs/guide/getting-started.md) · [**Open online →**](https://demo.piik.tv)
 
 Browser capture requires HTTPS or `localhost`. Windows App and desktop browser
-sharing are the primary tested paths. The macOS and Linux apps have not yet been
-tested on physical devices; [test results and feedback are welcome](https://github.com/TNTcraftHIM/Piik/issues).
+sharing are the primary tested paths. Physical-device coverage for the macOS and
+Linux apps is still limited; [test results and feedback are welcome](https://github.com/TNTcraftHIM/Piik/issues).
 P2P-only modes, including the App's temporary public
 link and the online version, may not connect on restrictive networks.
 
 ## Self-hosting
 
 Piik Server is a standalone binary with the web interface built in.
-Download the Linux x64 Server package (`piik-<revision>-runtime.tar.gz`),
+Download the Server package for Linux x64 (`piik-<revision>-runtime.tar.gz`)
+or ARM64 (`piik-<revision>-linux-arm64-runtime.tar.gz`),
 extract it, and run:
 
 ```sh

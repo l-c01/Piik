@@ -27,41 +27,50 @@ import {
 const token = "a".repeat(43);
 const roomId = "1234";
 const viewerGrant = `${"b".repeat(21)}g`;
+
+it("accepts bounded future reaction events while keeping commands and known prop targets strict", () => {
+  const event = { type: "room-interaction", id: "event_future_1234", requestId: "request_future_1234", occurredAt: 1,
+    sender: { peerId: "sender_peer_1234", role: "viewer", displayName: "Friend" },
+    payload: { kind: "reaction", reaction: "future-effect", targetPeerId: "target_peer_1234" } };
+  expect(serverMessageSchema.safeParse(event).success).toBe(true);
+  for (const role of ["host", "viewer", "", "HOST", "admin"]) {
+    expect(serverMessageSchema.safeParse({ ...event, sender: { ...event.sender, role } }).success)
+      .toBe(role === "host" || role === "viewer");
+  }
+  expect(clientMessageSchema.safeParse({ type: "send-room-interaction", requestId: event.requestId, payload: event.payload }).success).toBe(false);
+  for (const payload of [
+    { kind: "reaction", reaction: "" }, { kind: "reaction", reaction: "a".repeat(33) },
+    { kind: "reaction", reaction: "future effect" }, { kind: "reaction", reaction: "👋" },
+    { kind: "reaction", reaction: "future-effect", targetPeerId: "bad" },
+    { kind: "reaction", reaction: "future-effect", text: "hidden command" },
+    { kind: "reaction", reaction: "tomato" }, { kind: "future-kind", reaction: "wave" },
+  ]) expect(serverMessageSchema.safeParse({ ...event, payload }).success).toBe(false);
+  expect(serverMessageSchema.safeParse({ ...event, sender: { ...event.sender, peerId: "bad" } }).success).toBe(false);
+});
 const qualitySettings = {
-  resolution: "1080p",
+  resolution: { width: 1920, height: 1080 },
   maxFramerate: 60,
   maxBitrate: 8_000_000,
   degradationPreference: "maintain-resolution",
 } as const;
 
 describe("runtime capabilities", () => {
-  it("keeps progress opt-in optional and strict for either signaling role", () => {
-    for (const role of ["host", "viewer"] as const) {
-      const identity = { type: "authenticate", protocol: SIGNALING_PROTOCOL, roomId,
-        clientId: "client_12345678", role, ...(role === "host" ? { token } : {}) };
-      expect(clientMessageSchema.safeParse(identity).success).toBe(true);
-      for (const connectionAttemptProgress4 of [true, false, null, 4, "true"]) {
-        expect(clientMessageSchema.safeParse({ ...identity, connectionAttemptProgress4 }).success)
-          .toBe(connectionAttemptProgress4 === true);
-      }
-    }
-  });
   it("defaults missing capabilities off and ignores unknown descriptors", () => {
-    expect(runtimeCapabilitiesSchema.parse({})).toEqual({ sfu: false, natPrediction: false });
+    expect(runtimeCapabilitiesSchema.parse({})).toEqual({ sfu: false, natPrediction: false, roomInteractions: false, hostRoomSession: false });
     expect(runtimeCapabilitiesSchema.parse({ sfu: true, extra: { enabled: true } }))
-      .toEqual({ sfu: true, natPrediction: false });
+      .toEqual({ sfu: true, natPrediction: false, roomInteractions: false, hostRoomSession: false });
     expect(runtimeCapabilitiesSchema.parse({ natPrediction: true, SFU: true }))
-      .toEqual({ sfu: false, natPrediction: true });
+      .toEqual({ sfu: false, natPrediction: true, roomInteractions: false, hostRoomSession: false });
     expect(runtimeCapabilitiesSchema.parse({ sfu: true, natPrediction: true }))
-      .toEqual({ sfu: true, natPrediction: true });
-    expect(runtimeCapabilitiesSchema.parse({ connectionAttemptProgress4: true }))
-      .toEqual({ sfu: false, natPrediction: false, connectionAttemptProgress4: true });
+      .toEqual({ sfu: true, natPrediction: true, roomInteractions: false, hostRoomSession: false });
+    expect(runtimeCapabilitiesSchema.parse({ sfu: true, sfuOnly: true }).sfuOnly).toBe(true);
+
   });
 
   it("rejects malformed known capabilities and non-object responses", () => {
     for (const value of [null, [], true, { sfu: null }, { sfu: "true" },
-      { natPrediction: null }, { natPrediction: 1 },
-      { connectionAttemptProgress4: null }, { connectionAttemptProgress4: 4 }]) {
+      { natPrediction: null }, { natPrediction: 1 }, { sfuOnly: null }, { sfuOnly: "true" },
+    ]) {
       expect(runtimeCapabilitiesSchema.safeParse(value).success).toBe(false);
     }
   });
@@ -69,7 +78,7 @@ describe("runtime capabilities", () => {
 
 const qualitySettingsWithAudio = {
   ...qualitySettings,
-  screenAudioQuality: "music",
+  maxAudioBitrate: 128000,
 } as const;
 
 const legacyCodecQualitySettings = {
@@ -120,8 +129,25 @@ const qualityEvidence = {
 } as const;
 
 describe("client signaling protocol", () => {
+  it("keeps full observations with wide numeric values within the message budget", () => {
+    for (const floating of [Number.MAX_SAFE_INTEGER, 1.2345678901234567e-100]) {
+      const metrics = Object.fromEntries(Object.entries(qualityEvidence.metrics).map(([key, value]) => [key,
+        typeof value !== "number" ? value : key.endsWith("Percent") ? 99.99999999999999 :
+          ["width", "height", "packetsReceivedDelta", "packetsLostDelta", "framesDecodedDelta",
+            "framesDroppedDelta", "freezeCountDelta", "pauseCountDelta", "audioConcealmentEventsDelta"].includes(key)
+            ? Number.MAX_SAFE_INTEGER : floating,
+      ]));
+      const message = { ...qualityEvidence, sequence: Number.MAX_SAFE_INTEGER,
+        guard: { connectionId: "a".repeat(128), routeRevision: MAX_MEDIA_ROUTE_REVISION,
+          presentationEpoch: Number.MAX_SAFE_INTEGER },
+        metrics: { ...metrics, audioCodec: `audio/${"a".repeat(32)}` } };
+      expect(clientMessageSchema.safeParse(message).success).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(message))).toBeLessThanOrEqual(MAX_VIEWER_QUALITY_EVIDENCE_BYTES);
+    }
+  });
+
   it("uses the current strict signaling generation", () => {
-    expect(SIGNALING_PROTOCOL).toBe("piik-v23");
+    expect(SIGNALING_PROTOCOL).toBe("piik-v24");
   });
 
   it("keeps signaling challenges strict and sequence-only", () => {
@@ -168,6 +194,53 @@ describe("client signaling protocol", () => {
         roomId,
       }).success,
     ).toBe(false);
+  });
+
+  it("gates persistent Host room sessions behind an explicit opt-in", () => {
+    const host = {
+      type: "authenticate" as const,
+      protocol: SIGNALING_PROTOCOL,
+      roomId,
+      role: "host" as const,
+      token,
+      clientId: "host_12345678",
+      roomSession: true as const,
+      roomOnly: true as const,
+      routePolicy: DEFAULT_ROUTE_POLICY,
+    };
+    expect(clientMessageSchema.parse(host)).toMatchObject({
+      roomSession: true,
+      roomOnly: true,
+    });
+    expect(clientMessageSchema.safeParse({ ...host, roomSession: false }).success).toBe(false);
+    expect(clientMessageSchema.safeParse({
+      ...host,
+      roomSession: undefined,
+    }).success).toBe(false);
+    expect(clientMessageSchema.safeParse({
+      type: "start-sharing",
+      shareGeneration: "share_12345678",
+      routePolicy: DEFAULT_ROUTE_POLICY,
+    }).success).toBe(true);
+    expect(serverMessageSchema.safeParse({
+      type: "sharing-started",
+      shareGeneration: "share_12345678",
+      routePolicy: DEFAULT_ROUTE_POLICY,
+      routeRevision: 0,
+      routeAssignment: {
+        upstream: { kind: "none" },
+        childPeerIds: [],
+        sfuPublicationGeneration: null,
+      },
+      qualitySettings: DEFAULT_QUALITY_SETTINGS,
+      paused: false,
+    }).success).toBe(true);
+    expect(serverMessageSchema.safeParse({
+      type: "sharing-start-failed", shareGeneration: "share_12345678", code: "SERVER_ERROR",
+    }).success).toBe(true);
+    expect(serverMessageSchema.safeParse({
+      type: "sharing-start-failed", code: "SERVER_ERROR",
+    }).success).toBe(false);
   });
 
   it("keeps Viewer route status as a strict crossed union", () => {
@@ -687,7 +760,7 @@ describe("client signaling protocol", () => {
     ).toBe(false);
   });
 
-  it("accepts only strict, bounded quality settings", () => {
+  it("separates numeric requests from capture implementation limits", () => {
     expect(DEFAULT_QUALITY_SETTINGS).not.toHaveProperty("videoCodec");
     expect(
       clientMessageSchema.safeParse({
@@ -704,33 +777,47 @@ describe("client signaling protocol", () => {
     expect(
       clientMessageSchema.safeParse({
         type: "set-quality-settings",
-        qualitySettings: { ...qualitySettings, resolution: "480p" },
+        qualitySettings: { ...qualitySettings, resolution: { width: 854, height: 480 } },
       }).success,
     ).toBe(true);
-    for (const screenAudioQuality of [
-      "saver",
-      "music",
-      "very-high",
+    for (const maxAudioBitrate of [
+      6_000, 96_000, 256_000, 320_000, 510_000,
     ] as const) {
       expect(
         clientMessageSchema.safeParse({
           type: "set-quality-settings",
-          qualitySettings: { ...qualitySettings, screenAudioQuality },
+          qualitySettings: { ...qualitySettings, maxAudioBitrate },
         }).success,
       ).toBe(true);
     }
-    for (const invalid of [
-      { ...qualitySettings, resolution: "2160p" },
+    for (const next of [
+      { ...qualitySettings, resolution: { width: 16384, height: 8192 } },
+      { ...qualitySettings, resolution: { width: 1921, height: 1081 } },
       { ...qualitySettings, maxFramerate: 14 },
       { ...qualitySettings, maxFramerate: 61 },
       { ...qualitySettings, maxFramerate: 30.5 },
       { ...qualitySettings, maxBitrate: 1_999_999 },
       { ...qualitySettings, maxBitrate: 12_000_001 },
+    ]) expect(clientMessageSchema.safeParse({ type: "set-quality-settings", qualitySettings: next }).success).toBe(true);
+    for (const invalid of [
+      { ...qualitySettings, resolution: "2160p" },
+      { ...qualitySettings, resolution: { width: 0x1_0000_0000, height: 1080 } },
+      { ...qualitySettings, maxFramerate: 0 },
+      { ...qualitySettings, maxFramerate: Infinity },
+      { ...qualitySettings, maxFramerate: Number.MAX_SAFE_INTEGER + 1 },
+      { ...qualitySettings, maxBitrate: 0 },
+      { ...qualitySettings, maxBitrate: 0x1_0000_0000 },
       { ...qualitySettings, maxBitrate: 5_000_000.5 },
       { ...qualitySettings, degradationPreference: "automatic" },
       legacyCodecQualitySettings,
-      { ...qualitySettings, screenAudioQuality: "lossless" },
-      { ...qualitySettings, screenAudioQuality: 960_000 },
+      { ...qualitySettings, maxAudioBitrate: "lossless" },
+      { ...qualitySettings, maxAudioBitrate: "music" },
+      { ...qualitySettings, maxAudioBitrate: 0 },
+      { ...qualitySettings, maxAudioBitrate: 5_999 },
+      { ...qualitySettings, maxAudioBitrate: 510_001 },
+      { ...qualitySettings, maxAudioBitrate: 128_000.5 },
+      { ...qualitySettings, maxAudioBitrate: null },
+      { ...qualitySettings, maxAudioBitrate: 960_000 },
       { ...qualitySettings, codec: "video/VP9" },
     ]) {
       expect(
@@ -1474,7 +1561,7 @@ describe("server signaling protocol", () => {
     expect(
       serverMessageSchema.safeParse({
         ...peerAssisted,
-        qualitySettings: { ...qualitySettings, maxBitrate: 20_000_000 },
+        qualitySettings: { ...qualitySettings, maxBitrate: 0x1_0000_0000 },
       }).success,
     ).toBe(false);
     const missingMode = {
@@ -1486,7 +1573,7 @@ describe("server signaling protocol", () => {
       serverMessageSchema.safeParse({
         type: "quality-settings",
         qualitySettings: {
-          resolution: "720p",
+          resolution: { width: 1280, height: 720 },
           maxFramerate: 30,
           maxBitrate: 3_000_000,
           degradationPreference: "balanced",
@@ -1506,7 +1593,7 @@ describe("server signaling protocol", () => {
       childPeerId: "child_12345678", connectionId: "connection_12345678",
       transport: "direct", qualityProbe: false,
     };
-    for (const total of [3, 4]) {
+    for (const total of [1, 3, 4, 5, 20]) {
       for (let current = 1; current <= total; current++) {
         expect(preparedRouteCandidateSchema.safeParse({
           ...candidate, connectionAttempt: { current, total },
@@ -1515,7 +1602,7 @@ describe("server signaling protocol", () => {
     }
     for (const connectionAttempt of [
       { current: 0, total: 3 }, { current: 4, total: 3 },
-      { current: 5, total: 4 }, { current: 1, total: 5 }, { current: 1.5, total: 3 },
+      { current: 5, total: 4 }, { current: 1, total: 0 }, { current: 1, total: Number.MAX_SAFE_INTEGER + 1 }, { current: 1.5, total: 3 },
     ]) {
       expect(preparedRouteCandidateSchema.safeParse({
         ...candidate, connectionAttempt,

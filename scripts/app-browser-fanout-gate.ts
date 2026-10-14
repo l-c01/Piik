@@ -8,6 +8,7 @@ import {
   waitForSample, waitForVersion, type PageHandle,
 } from "./browser-gate-harness";
 import { readAppEndpoint } from "./app-gate-endpoint";
+import { fittedCaptureSize, matchesCaptureSize, parseVideoGateSize } from "./media-gate-geometry";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const BUILD_ROOT = join(ROOT, "build/go-check");
@@ -17,6 +18,8 @@ const BUILD_ROOT = join(ROOT, "build/go-check");
 const LAN_ADDRESS = "192.0.2.1";
 
 const initialAudio = process.env.PIIK_CLIENT_GATE_AUDIO !== "false";
+const punchRetry = process.env.PIIK_CLIENT_PUNCH_GATE === "true";
+const captureSize = parseVideoGateSize(process.env.PIIK_CLIENT_GATE_VIDEO_SIZE || "1920x1080");
 const probe = String.raw`(() => {
   localStorage.setItem('piik:ui-lang', 'en');
   localStorage.setItem('piik:ui-mode', 'text');
@@ -28,18 +31,33 @@ const probe = String.raw`(() => {
     catch (error) { errors.push(String(error)); throw error; }
   };
   const PC = RTCPeerConnection, WS = WebSocket;
+  let rejectFirstEdge = ${punchRetry};
   window.RTCPeerConnection = class extends PC { constructor(...args) { super(...args); pcs.push(this); } };
   window.WebSocket = class extends WS {
     constructor(...args) { super(...args); if (String(args[0]).includes('/control')) {
       sockets.push(this);
     } }
-    send(raw) { if (this.url.includes('/control')) { const value = JSON.parse(raw); requests.push(value.type); } super.send(raw); }
+    send(raw) {
+      if (this.url.includes('/control')) {
+        const value = JSON.parse(raw); requests.push(value.type);
+        // Fail one candidate through the ordinary operation-error boundary.
+        // The real room controller must authorize the next preparation.
+        if (rejectFirstEdge && value.type === 'prepare-edge') {
+          rejectFirstEdge = false;
+          queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', {data: JSON.stringify({
+            version:value.version, id:value.id, type:'request-failed', code:'operation-failed',
+          })})));
+          return;
+        }
+      }
+      super.send(raw);
+    }
   };
   let audio = ${initialAudio}, captures = 0;
   navigator.mediaDevices.getDisplayMedia = async () => {
     captures++;
-    const canvas = document.createElement('canvas'); canvas.width = 1920; canvas.height = 1080;
-    const context = canvas.getContext('2d'); let frame = 0;
+    const canvas = document.createElement('canvas'); canvas.width = ${captureSize.width}; canvas.height = ${captureSize.height};
+    const context = canvas.getContext('2d'); context.scale(canvas.width/1920,canvas.height/1080); let frame = 0;
     const draw = () => { context.fillStyle = '#14242a'; context.fillRect(0,0,1920,1080);
       context.fillStyle = '#68dab3'; context.fillRect((frame++ * 17)%1800,100,120,400);
       context.fillStyle = '#ffffff'; context.font = '80px sans-serif'; context.fillText(String(frame),100,700); };
@@ -80,7 +98,7 @@ const probe = String.raw`(() => {
           }
         }); }
       const video = document.querySelector('video');
-      return { outbound, encoded, received, captures, videoStats, feedback, width: video?.videoWidth || 0,
+      return { outbound, encoded, received, captures, videoStats, feedback, width: video?.videoWidth || 0, height: video?.videoHeight || 0,
         requests, errors, peers: pcs.map((p) => ({state:p.connectionState, tracks:p.getSenders().map((s)=>s.track?.kind)})),
         frames: video?.getVideoPlaybackQuality().totalVideoFrames || 0,
         sharing: Boolean(document.querySelector('button[aria-label="Stop sharing"]')),
@@ -134,6 +152,8 @@ async function startRoomServer(
       LISTEN_HOST: "127.0.0.1",
       PUBLIC_BASE_URL: `http://${LAN_ADDRESS}:${port}`,
       ALLOWED_ORIGINS: origins.join(","),
+      ...(punchRetry ? { STUN_URLS: "stun:127.0.0.1:3478", STUN_LISTEN_HOST: "127.0.0.1",
+        NAT_PREDICTION_ENABLED: "true" } : {}),
     },
   });
   child.stdout.resume();
@@ -206,6 +226,12 @@ async function main(): Promise<void> {
     await click(host, 'button[aria-controls="host-advanced-door"]');
     stage = "share-codec";
     await click(host, 'button[aria-label^="H264"]');
+    await evaluate(cdp, host, `(() => {
+      const width = document.querySelector('.lr-video-size input[name="width"]');
+      const height = document.querySelector('.lr-video-size input[name="height"]');
+      width.focus(); width.value = '${captureSize.width}';
+      height.focus(); height.value = '${captureSize.height}'; height.blur();
+    })()`, Date.now()+5000);
     stage = "share-picker";
     await click(host, 'button.lr-tv-big.is-action');
     // This arm measures Native ingress. Browser capture can start without App
@@ -240,10 +266,21 @@ async function main(): Promise<void> {
       await waitForSample(() => read(viewer), (s) => s.width > 0 && s.frames >= 30, 30000);
     }
     stage = "shared-encode";
-    await waitForSample(() => read(viewers[0]!), (s) => s.width===1920 && s.outbound===0, 30000);
-    await waitForSample(() => read(viewers[1]!), (s) => s.width===1920 && s.outbound===0, 30000);
+    for (const viewer of viewers) await waitForSample(() => read(viewer),
+      (s) => matchesCaptureSize(s.width, s.height, captureSize) && s.outbound===0, 30000);
     checks.host = await read(host);
     checks.viewers = await Promise.all(viewers.map(read));
+    if (punchRetry) {
+      // Loopback mappings are deliberately ineligible. Both real App controls
+      // must prepare, decline and continue ordinary ICE without losing media.
+      const source = checks.host as Awaited<ReturnType<typeof read>>;
+      const target = (checks.viewers as Awaited<ReturnType<typeof read>>[])[0];
+      if (!source.requests.includes("prepare-punch") || !target.requests.includes("prepare-punch") ||
+        source.requests.includes("run-punch") || target.requests.includes("run-punch")) {
+        throw new Error("Authorized retry did not decline its ineligible Native preparation");
+      }
+      checks.nativePreparationDeclined = true;
+    }
     if ((checks.host as any).outbound !== 1 || !(checks.viewers as any[]).every((v) => v.outbound === 0)) {
       throw new Error("Shared encode count did not match the Native fanout");
     }
@@ -255,7 +292,12 @@ async function main(): Promise<void> {
     if (!(checks.viewerFps as number[]).every((fps) => fps>=27)) throw new Error("Viewer delivery did not sustain the 30 fps source");
     stage = "quality";
     await click(host, 'button[aria-label="720p"]');
-    await waitForSample(() => read(viewers[0]!), (s) => s.width === 1280, 20000);
+    // Canvas capture can crop when applyConstraints changes its aspect. This
+    // gate checks fanout of the actual input; --display in the pool probe owns
+    // real display-capture geometry.
+    await waitForSample(async () => ({ source: await read(host), viewer: await read(viewers[0]!) }),
+      ({ source, viewer }) => source.width > 0 && source.height > 0 &&
+        matchesCaptureSize(viewer.width, viewer.height, fittedCaptureSize(source, 1280, 720)), 20000);
     checks.liveQuality = true;
     stage = "pause-resume";
     await click(host, 'button[aria-label="Pause sharing"]');
@@ -297,7 +339,7 @@ async function main(): Promise<void> {
     const cleanup = await cleanupRun({cdp, native:app, chrome, server, profile, ports:[appPort,debugPort,...(nativePort?[nativePort]:[])]});
     const result = {passed: error===null && Object.values(cleanup).every(Boolean) && relayCleanup.nativeExited && relayCleanup.portsClosed, stage, checks, error, cleanup};
     await mkdir(BUILD_ROOT,{recursive:true});
-    await writeFile(join(BUILD_ROOT,"browser-fanout.json"), JSON.stringify(result,null,2));
+    await writeFile(join(BUILD_ROOT,punchRetry ? "browser-fanout-punch.json" : "browser-fanout.json"), JSON.stringify(result,null,2));
     process.stdout.write(JSON.stringify(result)+"\n");
     if (!result.passed) process.exitCode=1;
   }

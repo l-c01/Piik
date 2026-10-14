@@ -1,16 +1,27 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Btn, Chip, NameTag, Pill, SwitchItem } from "../components/living/primitives";
-import { RoomChip, RoomAdmissionBadge } from "../components/living/RoomChip";
+import { RoomChip, RoomCodePlaceholder, RoomAdmissionBadge } from "../components/living/RoomChip";
 import { CaptureSourcePicker, type NativeSourceList } from "../components/living/CaptureSourcePicker";
 import { LedStrip } from "../components/living/Header";
 import { StageTv } from "../components/living/Stage";
 import { HostMicrophone, HostMicrophoneSettings } from "../components/living/HostMicrophone";
+import { LiveAudioExclusion } from "../components/living/AudioExclusionSelect";
+import type { NativeCaptureTarget } from "../native/wire";
+import { RoomInteractions } from "../components/living/RoomInteractions";
+import { RoomChatOverlay, RoomChatToggle } from "../components/living/RoomChatOverlay";
+import { RoomInteractionSession } from "../lib/room-interactions";
+import { createOpaqueId } from "../lib/opaque-id";
+import type { InteractionPayload } from "../../shared/protocol";
+import { REACTION_IDS, type ReactionId } from "../../shared/room-interactions";
 import { PlaybackControls } from "../components/living/PlaybackControls";
 import { SharingSettings } from "../components/living/SharingSettings";
 import { LauncherForm, type AppMode } from "../components/living/LauncherForm";
-import { QualityPresets } from "../components/living/QualityPresets";
+import { AppReleaseNotice } from "../components/living/AppReleaseNotice";
+import { useTheaterMode } from "../components/living/use-theater-mode";
+
+import { AudioBitrateControl, PicturePreferenceControl, QualityPresets, ResolutionControl, VideoRateControls } from "../components/living/QualityPresets";
 import { RoomCodeInput } from "../components/living/RoomCodeInput";
-import type { QualityProfileId } from "../media/quality";
+import { MAX_SCREEN_AUDIO_BITRATE, VIDEO_CAPTURE_LIMITS, QUALITY_PROFILES, captureFramerateCeiling, matchingQualityProfileId, type QualityProfile } from "../media/quality";
 import type { loadCameraPreviews } from "../media/camera-previews";
 import { Tooltip } from "../components/living/Tooltip";
 import { StatusIndicator } from "../components/living/StatusIndicator";
@@ -21,9 +32,10 @@ import { PeoplePreview } from "./PeoplePreview";
 import "./controls-preview.css";
 
 const POSTER = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" fill="#e8eee6"/><rect x="100" y="60" width="440" height="240" rx="20" fill="#fffdf6"/><path d="M100 100h440" stroke="#c9d7cf" stroke-width="2"/><circle cx="128" cy="81" r="6" fill="#ed9e65"/><circle cx="320" cy="190" r="46" fill="#65b099"/><path d="m310 191 9 9 16-22" fill="none" stroke="#fffdf6" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>')}`;
-const SOURCES = { kind: "ready", processAudio: true, systemAudio: true, captureBorderControl: true, sources: [
+const SOURCES = { kind: "ready", processAudio: true, systemAudio: true, processAudioExclusion: true, captureBorderControl: true, sources: [
   { kind: "window", sourceId: "101", pid: 1, creationTime: "1", title: "Sketchbook" },
   { kind: "window", sourceId: "102", pid: 2, creationTime: "2", title: "A short film" },
+  { kind: "window", sourceId: "104", pid: 3, creationTime: "3", title: "Voice call" },
   { kind: "display", sourceId: "103", title: "Display 1" },
 ] } satisfies NativeSourceList;
 const previewSource = async () => POSTER;
@@ -32,20 +44,27 @@ const previewCameras: typeof loadCameraPreviews = async (_signal, publish) => pu
   { id: "usb", label: "USB Camera", preview: `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><rect width="320" height="180" fill="#e2c5a8"/><path d="M0 25h320M0 157h320" stroke="#cda987" stroke-width="2"/><rect x="53" y="27" width="163" height="124" rx="5" fill="#fffaf0" transform="rotate(-8 135 89)"/><path d="m97 112 30-35 23 25 18-12 18 19" fill="none" stroke="#689b8a" stroke-width="5" stroke-linejoin="round"/><circle cx="166" cy="57" r="11" fill="#ebbd63"/><path d="m245 64 8 77" stroke="#477b73" stroke-width="7" stroke-linecap="round"/><circle cx="266" cy="35" r="19" fill="#f9f5df"/><circle cx="266" cy="35" r="12" fill="#8c6651"/></svg>')}` },
 ]);
 const previewMicrophones = async () => [{ id: "headset", label: "USB Headset" }, { id: "desk", label: "Desk Microphone" }];
+const previewApplications = async () => SOURCES.sources;
 
 export function ControlsPreview() {
   const { t, lang, vis } = useCopy();
   const en = lang === "en";
+  const displayPreview = new URLSearchParams(window.location.search).get("source") === "display";
   const [sound, setSound] = useState(true);
+  const [excludedAudio, setExcludedAudio] = useState<NativeCaptureTarget | undefined>(SOURCES.sources[2]);
   const [microphone, setMicrophone] = useState(false);
   const [microphoneVolume, setMicrophoneVolume] = useState(1);
+  const [voiceProcessing, setVoiceProcessing] = useState(true);
   const [microphoneDevice, setMicrophoneDevice] = useState("");
   const [sharingSettings, setSharingSettings] = useState(false);
+  const [quality, setQuality] = useState<QualityProfile>(QUALITY_PROFILES["1080p30"]);
   const [launchMode, setLaunchMode] = useState<AppMode>("link");
+  const [majorUpdate, setMajorUpdate] = useState(true);
+  const releaseVersion = majorUpdate ? "v2.0.0" : "v1.1.0";
+  const releaseURL = `https://github.com/TNTcraftHIM/Piik/releases/tag/${releaseVersion}`;
   const [launchSite, setLaunchSite] = useState("");
   const [launchPassword, setLaunchPassword] = useState("");
   const [launchLan, setLaunchLan] = useState("192.0.2.10");
-  const [preset, setPreset] = useState<QualityProfileId>("1080p30");
   const [policy, setPolicy] = useState<"open" | "private">("open");
   const [roomPassword, setRoomPassword] = useState(false);
   const [includeCredential, setIncludeCredential] = useState(true);
@@ -54,7 +73,7 @@ export function ControlsPreview() {
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [name, setName] = useState("Piik friend");
   const [invalid, setInvalid] = useState(false);
-  const [sourceOpen, setSourceOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(displayPreview);
   const [sourceState, setSourceState] = useState<NativeSourceList["kind"] | "empty">("ready");
   const [captureBorderAvailable, setCaptureBorderAvailable] = useState(true);
   const [showCaptureBorder, setShowCaptureBorder] = useState(false);
@@ -92,14 +111,32 @@ export function ControlsPreview() {
             hint={paused ? "hint-resume" : "hint-pause"} onClick={() => setPaused(!paused)} />
           <Btn icon="switchSource" title="host.switchSource" cap="host.switchSource" hint="hint-switch-source" onClick={notify} />
           <Btn icon="sliders" cap="host.settings.button" title={sharingSettings ? "host.advanced.hide" : "host.advanced"}
+
             hint={sharingSettings ? "hint-collapse" : "hint-advanced"} tone={sharingSettings ? "on" : undefined}
             expanded={sharingSettings} controls="preview-sharing-settings" onClick={() => setSharingSettings(value => !value)} />
           <Btn id="host-stop-share" icon="stop" tone="danger" title="host.stop" cap="host.stop" hint="hint-share-stop" onClick={notify} />
         </div>
         <SharingSettings id="preview-sharing-settings" open={sharingSettings}
-          presets={<QualityPresets selected={preset} onSelect={setPreset} />}
-          audio={<HostMicrophoneSettings deviceId={microphoneDevice} onDevice={setMicrophoneDevice} loadDevices={previewMicrophones}
-            native enabled={microphone} disabled={paused} volume={microphoneVolume} onVolume={setMicrophoneVolume} />}
+          presets={<QualityPresets selected={matchingQualityProfileId(quality)}
+            onSelect={id => setQuality(current => ({ ...QUALITY_PROFILES[id], maxAudioBitrate: current.maxAudioBitrate }))} />}
+          picture={<><ResolutionControl value={quality.resolution} limits={VIDEO_CAPTURE_LIMITS} disabled={false}
+            onChange={resolution => setQuality(current => ({ ...current, resolution,
+              maxFramerate: Math.min(current.maxFramerate, captureFramerateCeiling(resolution)),
+            }))} />
+            <VideoRateControls value={quality} limits={VIDEO_CAPTURE_LIMITS} disabled={false}
+              onChange={change => setQuality(current => ({ ...current, ...change }))} />
+            <PicturePreferenceControl value={quality.degradationPreference} disabled={false}
+              onChange={degradationPreference => setQuality(current => ({ ...current, degradationPreference }))} /></>}
+          audio={<><AudioBitrateControl value={quality.maxAudioBitrate ?? QUALITY_PROFILES["1080p30"].maxAudioBitrate} max={MAX_SCREEN_AUDIO_BITRATE}
+              disabled={false} onChange={maxAudioBitrate => setQuality(current => ({ ...current, maxAudioBitrate }))} />
+          <div className="lr-door-group lr-source-audio-settings">
+            <SwitchItem checked={sound} onChange={setSound} label={t("host.sourcePicker.systemAudio")}
+              hint={sound ? "hint-stop-audio" : "hint-share-audio"} />
+            <LiveAudioExclusion load={previewApplications} value={excludedAudio} onChange={setExcludedAudio} disabled={!sound || paused} />
+          </div><HostMicrophoneSettings deviceId={microphoneDevice} onDevice={setMicrophoneDevice} loadDevices={previewMicrophones}
+            native enabled={microphone} disabled={paused} volume={microphoneVolume} onVolume={setMicrophoneVolume}
+            voiceProcessing={voiceProcessing} onVoiceProcessing={setVoiceProcessing} />
+          </>}
         />
       </section>
       <section id="option-preview" className="cp-card">
@@ -108,6 +145,8 @@ export function ControlsPreview() {
           <SwitchItem checked={sound} onChange={setSound} label={t("host.sourcePicker.audioOn")} hint="hint-share-audio" />
           <SwitchItem checked disabled locked onChange={() => undefined} label={t("host.advanced.route.peerOnly")}
             note={t("host.advanced.route.peerOnlyRequired")} hint="hint-route-p2p-required" />
+          <SwitchItem checked disabled locked onChange={() => undefined} label={t("host.advanced.route.sfuOnly")}
+            note={t("host.advanced.route.sfuOnlyHint")} hint="hint-route-sfu" />
         </div>
         <div className="cp-tools">
           <span className="lr-toggle" role="group" aria-label={t("host.policy")} data-selected={policy}>
@@ -153,7 +192,7 @@ export function ControlsPreview() {
           <SwitchItem checked={invalid} onChange={setInvalid} label={en ? "Show error" : "看看错误态"} />
         </div>
         {invalid ? <p id="preview-input-error" className="cp-input-error" role="alert">{en ? "That password did not match. Try again." : "密码没对上，再试一次。"}</p> : null}
-        <div className="cp-tools"><RoomChip roomId={roomCode} onReplace={() => setRoomCode(code => code === "6020" ? "2048" : "6020")} /></div>
+        <div className="cp-tools"><RoomCodePlaceholder /><RoomChip roomId={roomCode} onReplace={() => setRoomCode(code => code === "6020" ? "2048" : "6020")} /></div>
         <RoomCodeInput value={dial} onChange={setDial} />
       </section>
       <section id="feedback-preview" className="cp-card">
@@ -181,12 +220,16 @@ export function ControlsPreview() {
         {en ? ["Available", "Loading", "App unavailable", "Update needed", "Capture unavailable", "Read failed", "Empty list"][index] : ["正常", "读取中", "App 未连接", "需要更新", "无法采集", "读取失败", "空列表"][index]}</Chip>)}
         <SwitchItem checked={captureBorderAvailable} onChange={setCaptureBorderAvailable}
           label={en ? "Windows border control" : "Windows 边框控制"} />
+        <a className="lr-btn" href="/__tooltip-preview?source=display#source-preview" onClick={() => setSourceOpen(true)}>
+          <Glyph name="speakerOff" size={18} />{t("host.sourcePicker.excludeAudio")}
+        </a>
       </div>
       <div className="cp-stage"><StageTv hasEntry label={t("host.sourcePicker.title")}>
         <img className="cp-poster" src={POSTER} alt="" />
         {sourceOpen ? <CaptureSourcePicker nativeSources={sourceState === "empty" ? { ...SOURCES, sources: [], captureBorderControl: captureBorderAvailable }
           : sourceState === "ready" ? { ...SOURCES, captureBorderControl: captureBorderAvailable } : { kind: sourceState }}
           initialShowCaptureBorder={showCaptureBorder}
+          initialTab={displayPreview ? "display" : "window"}
           onBrowser={() => { setSourceOpen(false); notify(); }}
           onCamera={() => { setSourceOpen(false); notify(); }}
           loadCameras={previewCameras}
@@ -206,16 +249,91 @@ export function ControlsPreview() {
     </section>
     <section id="launcher-preview" className="cp-section">
       <header className="cp-section-head"><span className="cp-number">08</span><h2>{t("client.launch.title")}</h2></header>
+      <div className="cp-tools">
+        <button className="lr-btn" type="button" aria-pressed={majorUpdate} onClick={() => setMajorUpdate(value => !value)}>
+          {en ? "Preview major update" : "预览跨大版本更新"}
+        </button>
+      </div>
       <div className="lr-client-launch">
         <LauncherForm mode={launchMode} onModeChange={setLaunchMode}
-          site={launchSite} onSiteChange={setLaunchSite}
+          site={launchSite} onRemoveSite={() => setLaunchSite("")}
           lan={{ selected: launchLan, onChange: setLaunchLan, addresses: [
             { address: "192.0.2.10", name: "Wi-Fi" },
             { address: "192.0.2.20", name: "vEthernet (Example Virtual Network Adapter with a Long Name)" },
           ] }}
           localAccessPassword={launchPassword} onLocalAccessPasswordChange={setLaunchPassword}
-          onSubmit={event => event.preventDefault()} />
+          onSubmit={event => event.preventDefault()}>
+          <AppReleaseNotice update={{ kind: majorUpdate ? "major-update" : "update-available",
+            version: releaseVersion, revision: null,
+            url: `https://github.com/TNTcraftHIM/Piik/releases/download/${releaseVersion}/piik-app-windows-amd64.zip`,
+            releaseURL }} />
+        </LauncherForm>
       </div>
     </section>
+    <section id="interaction-preview" className="cp-section">
+      <header className="cp-section-head"><span className="cp-number">09</span><div><h2>{en ? "A little company" : "聊两句，丢个番茄。"}</h2>
+        <p>{en ? "Click a person for reactions. Move or resize either panel; supported browsers can pop chat out into an always-on-top window." : "点小人发表情；聊天与表情窗都能拖动、缩放。支持的浏览器还可将聊天弹出为置顶小窗。"}</p></div></header>
+      <InteractionControlsPreview />
+    </section>
   </>;
+}
+
+function InteractionControlsPreview() {
+  const [session, setSession] = useState<RoomInteractionSession | null>(null);
+  const [viewer, setViewer] = useState(false);
+  const [crowded, setCrowded] = useState(false);
+  const [reaction, setReaction] = useState<ReactionId>("heart");
+  const [theater, setTheater] = useTheaterMode();
+  const video = useRef<HTMLVideoElement>(null);
+  const { t, lang } = useCopy();
+  useEffect(() => {
+    const sender = viewer
+      ? { peerId: "preview-friend", role: "viewer" as const, displayName: "Piik friend" }
+      : { peerId: "preview-host", role: "host" as const, displayName: "Piik" };
+    const model = new RoomInteractionSession(message => {
+      queueMicrotask(() => {
+        if (message.type === "subscribe-room-interactions") model.receive({ type: "room-interactions-ready", serverTime: Date.now() });
+        if (message.type === "send-room-interaction") model.receive({ type: "room-interaction", id: createOpaqueId(),
+          requestId: message.requestId, occurredAt: Date.now(), sender, payload: message.payload });
+      });
+      return true;
+    });
+    model.authenticated(sender.peerId);
+    setSession(model);
+    return () => model.close();
+  }, [viewer]);
+  const receiveSample = (payload: InteractionPayload) => session?.receive({
+    type: "room-interaction", id: createOpaqueId(), requestId: createOpaqueId(), occurredAt: Date.now(),
+    sender: viewer ? { peerId: "preview-host", role: "host", displayName: "Piik" }
+      : { peerId: "preview-friend", role: "viewer", displayName: "Piik friend" }, payload,
+  });
+  return <><div className="cp-tools">
+    <SwitchItem checked={viewer} onChange={setViewer} label={lang === "en" ? "Viewer perspective" : "观众视角"} />
+    <SwitchItem checked={crowded} onChange={setCrowded} label={lang === "en" ? "20 viewers" : "20 位观众"} />
+    <button type="button" className="lr-btn" onClick={() => receiveSample({
+      kind: "chat", text: lang === "en" ? "I'm here. Save me a seat!" : "来了，给我留个位置！",
+    })}><Glyph name="chat" size={18} />{lang === "en" ? "Receive a sample message" : "模拟收到消息"}</button>
+    <label className="lr-input cp-reaction-select"><span>{lang === "en" ? "Reaction" : "表情"}</span>
+      <select value={reaction} onChange={event => setReaction(event.target.value as ReactionId)}>
+        {REACTION_IDS.map(id => <option key={id} value={id}>{t(`interaction.reaction.${id}`)}</option>)}
+      </select>
+    </label>
+    <button type="button" className="lr-btn" onClick={() => receiveSample({ kind: "reaction", reaction,
+      targetPeerId: viewer ? "preview-friend" : "preview-host",
+    })}><Glyph name="smile" size={18} />{lang === "en" ? "Receive a reaction" : "模拟收到表情"}</button>
+  </div><div className={theater ? "lr-room is-theater" : "cp-interaction-room"}><div className="lr-scene">
+  <StageTv label={t("interaction.title")}>
+    <video ref={video} poster={POSTER} playsInline />
+    <RoomChatOverlay session={session} visible />
+    <PlaybackControls videoRef={video} stream={null} canPlay={false} onPlay={() => {}}
+      theaterMode={theater} onToggleTheater={() => setTheater(value => !value)} onReconnect={() => {}} reconnectAvailable={false}
+      extraActions={<RoomChatToggle session={session} />} />
+  </StageTv><RoomInteractions session={session}
+    view={viewer ? "viewer" : "host"} host={{ key: "preview-host", name: "Piik", you: !viewer }} entries={
+      Array.from({ length: crowded ? 20 : 1 }, (_, index) => ({
+        key: index ? `preview-friend-${index}` : "preview-friend", name: index ? `Friend ${index + 1}` : "Piik friend",
+        you: viewer && index === 0,
+        status: deriveParticipantStatus({ upstream: { kind: "peer", peerId: "preview-host" }, mediaReady: true }, true),
+      }))
+    } /></div></div></>;
 }

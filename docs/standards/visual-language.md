@@ -55,6 +55,22 @@ the room code and its replacement confirmation. Let independent groups reflow;
 do not stretch short values to fill a phone row. Check actual control bounds
 around breakpoints, in both orientations and all presentation modes; page-level
 overflow clipping is not evidence that the content fits.
+Keep existing controls in their established positions as a room becomes active.
+Represent missing room identity with a passive placeholder in its own slot;
+do not move unrelated controls into that space to fill an empty state.
+
+Persistent room utilities use the shared floating panel without reflowing the
+living room. The shell owns visibility, focus return, movement, resizing and
+viewport/keyboard bounds; contents retain their domain state. Support title-bar
+dragging and keyboard placement. An interaction palette starts beside its chosen
+participant, stays open after sending and keeps its position when retargeted.
+One-shot settings and guidance retain their existing disclosures. Escape closes
+inner guidance first, then the most recently opened floating panel, then theater
+mode; an IME composition must not dismiss these surfaces.
+Detached chat uses the same content in the browser's own always-on-top frame.
+Close, return-to-tab, movement and resizing belong to that frame; do not duplicate
+its controls in the compact chat header. Keep messages and text contrast
+primary; do not simulate transparent desktop content with a washed-out panel.
 
 Keep the application language control's segmented Chinese, English and visual
 shortcuts. When additional catalogs exist, insert one language menu
@@ -144,9 +160,16 @@ the television, above the couch. Its disclosure groups quality presets and pictu
 parameters with sound and microphone settings; presets remain available before
 sharing starts. Separate the less frequent connection/codec options in a nested
 disclosure. Expand in page flow, pushing later content down instead of covering
-the picture or participants. Use two content groups on wide screens and stack
-them on narrow screens; avoid another permanent row of settings cards. Keep
-shared presentation separate from the existing setting/resource owners.
+the picture or participants. Keep picture and sound in distinct sections; place
+related adjustments side by side where space permits and stack them on narrow
+screens. Avoid another permanent row of settings cards. Numeric quality inputs
+retain the accepted capability range; sliders offer a labelled common range for
+quick adjustment. Values outside its range or steps show a custom-value row
+instead of an inaccurate slider position. Returning to the nearest available
+common step is an explicit action; rendering, focus or reopening never changes
+the value. Derive this presentation from the current value, without a second
+setting mode. Shared presentation stays separate
+from the existing setting/resource owners.
 The microphone comic depicts Host commentary gain;
 the Viewer's listening-volume comic remains a different action.
 
@@ -172,6 +195,8 @@ Participant characters should leave room for that distinctive presence.
 | Browser application | Browser chrome around content; not a second design of television |
 | A captured window or display | Window title bar or display stand, with the shared media metaphor kept distinct |
 | A camera source or Host commentary | `camera` identifies the alternative picture source; `microphone` identifies the enabled Host voice input and `microphoneOff` its muted state. Neither replaces the speaker metaphor for source/playback sound. |
+| Room text and reactions | `chat` opens the conversation, `danmaku` controls its optional picture overlay, `smile` identifies reactions and `send` submits the chosen content. These do not represent media transport or voice. |
+| Floating utility placement | `grip` marks a draggable title bar; `move` opens placement controls. Closing a panel hides its presentation, not its room session. |
 | Server forwarding media | A server on the media path; opening a Site alone does not imply SFU |
 
 These are **identity/object colours**, not status. A green pawn remains green
@@ -246,6 +271,7 @@ type checking rather than silently render a warning triangle.
 | Audio / 声音 | `speaker`, `speakerOff` | Audio and mute/no audio, qualified by the source or local playback label. A source track's presence does not establish delivered sound. |
 | Size and viewing mode / 尺寸与观看模式 | `expand`, `contract`, `pip`, `pipExit`, `theater`, `theaterExit` | Expand/restore, enter/leave picture in picture, enter/leave theatre mode. The same size symbol can accompany a resolution measurement. |
 | Local actions / 本地操作 | `copy`, `save`, `pencil`, `eye`, `eyeOff` | Copy, save, edit, reveal and conceal the named object. An action icon does not prove completion. |
+| Text appearance / 文字外观 | `textSize`, `opacity` | Relative text size and opacity. These are local display preferences, not message delivery states. |
 | Repeat and disclosure / 重试与展开 | `refresh`, `chevron`, `arrowRight` | Repeat/refresh, expand/collapse, proceed/enter. Direction follows the control's action; no arrow alone establishes delivery. |
 | Transfer and upgrade / 传输与更新 | `arrowUp`, `arrowDown` | Outbound/inbound or upload/download, qualified by the adjacent label. An explicit update label may use the upward arrow for upgrade; neither arrow is a connection-quality rating. |
 | Diagnostics / 诊断 | `cpu` | Technical diagnostics in the labelled diagnostic control; in metrics the same processor identifies encoding work. The surrounding control or measured field states the scope. |
@@ -296,15 +322,25 @@ not need a second mascot or decorative spinner. The header's brand mark remains
 navigation identity. Keep an actionable play symbol or an exact progress value
 when it helps the user proceed or understand the operation.
 
+Review the visible page as a composition, including open tooltips: give it one
+expressive focal illustration, rather than repeating the mascot in a heading,
+card and status. A small navigation mark may coexist with a contextual mascot;
+it is not another focal illustration. Remove decorative duplicates before
+changing the shared character or adding visibility state. This applies the
+[illustration guidance](https://atlassian.design/foundations/illustrations):
+support the task and use lighter icons or copy when another drawing adds noise.
+
 | Context | Illustration and literal content | Playful caption |
 | --- | --- | --- |
-| Page loading, site access check, App preparation | The shared wink mascot with the actual loading operation; no room or media-path claim | The current language's waiting pool |
+| Page loading or site access check | The shared wink mascot with the actual loading operation; no room or media-path claim | None |
+| App room startup | The shared wink mascot with the actual operation | One secondary waiting caption |
+| Confirmed App readiness | Wink mascot with literal readiness in dedicated feedback or its tooltip; an inline summary beside an existing main brand uses a status icon. Neither implies an active media route. | None |
 | Source listing/start/switch, room joining, media setup/recovery, waiting for the Host | The corresponding comic with the current status; only the existing state owner can declare waiting | The same waiting pool while the wait exists |
 | Error, limitation, pause, ended room or required user action | The corresponding comic and clear reason/action; settled movement keeps that verdict readable | None |
 | Small controls, tooltips and inline results | Existing action/status icon and contextual guidance when needed; retain direct actions | None |
 
 The shared `LoadingStatus`, `StageOverlay` and `WaitingCaption` apply this
-composition; source selection reuses the caption beside its existing comic.
+composition. Routine loading does not opt into playful copy automatically.
 Do not infer waiting from a chosen drawing, mascot visibility or animation flag.
 Healthy playback stays visible during control reconnection; this rule does not
 create another overlay. An idle room awaiting a new share differs from a closed
@@ -316,20 +352,26 @@ hidden captions; viewport size does not become product state.
 
 ### Playful Copy Lifecycle
 
-The shared [rotation owner](../../src/client/ui/text-rotation.ts) supplies the
-clock and visibility policy; its React adapter and the static website consume
-the same rule. Locale files own the independent pools.
+Locale files own independent pools; the shared
+[selection and rotation owner](../../src/client/ui/text-rotation.ts) and its
+React adapter provide selection, timing and visibility. Keep one secondary
+playful line in an operational page's main content, with no duplicates in
+subpanels. Review the whole composition before adding another caption.
 
-Website/App welcome lines, waiting captions and playful title variations share
-one lifecycle. Show an entry immediately, then change it every eight seconds
-while visible. Draw without replacement until the current pool is exhausted.
-An ordinary rerender or metric update does not restart the cycle. A new semantic
-context or language starts from that context's current-language pool; never
-reuse a cross-language array index. Hidden surfaces stop advancing. On return,
-keep the current line for a full interval; reduced motion retains a static line.
-Unmount or an ended context retires timers and listeners. Empty pools omit the
-decoration; one-entry pools stay static. Real completion never waits for copy
-or an animation to finish. This cadence is a product choice, not measured progress.
+Website/App welcomes select one entry immediately and keep it during that visit.
+Tab titles retain one variation per actual activity, without a timer. Ordinary
+rerenders and metric updates do not draw another entry. A welcome's text/visual
+switch preserves its selected entry. Language changes use that language's pool,
+never a cross-language array index.
+
+Only App room startup and media waits rotate their secondary caption: show one
+immediately, then change it every fifteen visible seconds. Changes of the literal
+status within a continuous wait do not redraw the caption or reset its clock.
+Draw without replacement until the pool is exhausted. Hidden surfaces stop
+advancing; on return, keep the line for a full interval. Reduced motion retains
+a static line. Unmount or an ended wait retires timers and listeners. Empty pools
+omit the decoration; one-entry pools stay static. Real completion never waits
+for copy or animation. This cadence is a product choice, not measured progress.
 
 Each language maintains independent contextual pools without equal counts,
 paired translation keys or a fixed total. Contributors can add a locally natural
@@ -347,9 +389,9 @@ review; this copy policy does not require a mascot or a new tooltip everywhere.
 
 | Existing surface | Copy coverage |
 | --- | --- |
-| Website welcome, App launcher, sharing entry | The current language's welcome pool; the App's visual mode renders that entry's cipher. |
-| Loading, source selection and media waiting | A secondary waiting caption according to [feedback composition](#feedback-composition). |
-| Browser tab | Sharing, watching, starting, ready-to-share, not-started and waiting states may append their own variations; room identity, literal activity and warnings remain visible. |
+| Website welcome, App launcher, sharing entry | One welcome per entry; the App's visual mode renders that entry's cipher. |
+| App room startup and media waiting | One slowly rotating caption according to [feedback composition](#feedback-composition). Ordinary page loading and access checks use literal status only. |
+| Browser tab | Sharing, watching, starting, ready-to-share, not-started and waiting states may append one stable variation; room identity, literal activity and warnings remain visible. |
 | Error, pause, ended state, required action, tooltip, small control | Keep the existing literal message and contextual graphic; no rotating caption is added. |
 
 ## Panel Composition
@@ -490,10 +532,13 @@ Entry screens may carry one quiet, original welcome line in Chinese or English
 text mode. Pure-visual mode pairs familiar pictograms with static pixel
 pseudo-lettering tied to the same line. Hide that visual cipher from assistive
 technology; the ordinary text sentence remains readable. Switching between text
-and visual mode preserves the selected welcome entry; rotation follows the
+and visual mode preserves the selected welcome entry; selection follows the
 [shared lifecycle](#playful-copy-lifecycle). The line never replaces an action,
-error, loading message or connection progress. Keep it on one line, apart from the actions; primary controls take
-precedence when space is tight.
+error, loading message or connection progress. Keep it on one line, apart from
+the actions; primary controls take precedence when space is tight. A clipped line
+may pan once to reveal its end; fitting text stays still.
+Pause with the copy's existing visibility owner. Reduced motion keeps the text
+stationary and manually scrollable instead of discarding the hidden words.
 
 ## Ownership And Incremental Review
 
@@ -533,5 +578,5 @@ moving the pointer away.
 
 [Carbon loading guidance](https://carbondesignsystem.com/components/loading/usage/)
 supports avoiding competing indicators and keeping required user actions distinct
-from passive loading. Piik's immediate captions and eight-second cadence are its
+from passive loading. Piik's selected waiting captions and fifteen-second cadence are its
 own presentation choice.

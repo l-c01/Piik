@@ -44,10 +44,11 @@ func TestRelayChainEncodedFixture(t *testing.T) {
 		t.Fatal("encoded chain fixture exceeds 64 MiB")
 	}
 	type fixtureFrame struct {
-		Index, Width, Height int
-		Recovery             bool
-		DataHex              string
-		Data                 []byte `json:"-"`
+		Index         int
+		Width, Height uint32
+		Recovery      bool
+		DataHex       string
+		Data          []byte `json:"-"`
 	}
 	var frames []fixtureFrame
 	identities := make(map[[sha256.Size]byte][]int)
@@ -59,7 +60,7 @@ func TestRelayChainEncodedFixture(t *testing.T) {
 		}
 		check(err)
 		if len(frames) >= 400 || frame.Index != len(frames) || frame.Width <= 0 || frame.Height <= 0 ||
-			frame.Width > 2560 || frame.Height > 1440 || len(frame.DataHex) == 0 || len(frame.DataHex) > 8<<20 ||
+			!nativecapture.ValidVideoSize(frame.Width, frame.Height) || len(frame.DataHex) == 0 || len(frame.DataHex) > 8<<20 ||
 			len(frame.DataHex)%2 != 0 {
 			t.Fatal("encoded chain fixture has invalid or excessive frames")
 		}
@@ -137,7 +138,7 @@ func TestRelayChainEncodedFixture(t *testing.T) {
 		check(createErr)
 		relays = append(relays, receiver)
 		waitSignal(t, webrtc.GatheringCompletePromise(receiver.connection), "chain answer gathering")
-		check(edge.SetAnswer(*receiver.connection.LocalDescription()))
+		check(edge.SetAnswer(*receiver.connection.LocalDescription(), ""))
 		waitConnected(t, edge.connection, "chain upstream")
 		waitConnected(t, receiver.connection, "chain native receiver")
 		check(receiver.Source().SetRelayProfile(nativecapture.VideoProfile{

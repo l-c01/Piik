@@ -9,17 +9,25 @@ audio is converted to stereo PCM16 for the existing Go Opus boundary. The Go
 session applies live profile changes by replacing that capture generation behind
 the same Pion source.
 
-Build on Apple Silicon macOS 13 or newer:
+Build on Apple silicon or Intel macOS 13 or newer; the helper uses the build
+machine's architecture:
 
 ```sh
 sh native/capture/darwin/build.sh /outside/repository/build
+/outside/repository/build/piik-capture --geometry-self-test
 /outside/repository/build/piik-capture --self-test
 /outside/repository/build/piik-capture --probe
 ```
 
-`--self-test` encodes one in-memory 420v frame through the same hardware-only
-VideoToolbox path and requires a constrained-baseline SPS/PPS/IDR. It needs no
-Screen Recording permission. Real source selection, capture, and recovery still
+`--geometry-self-test` checks content cropping, Retina scaling and rejection of
+invalid frame geometry, plus H.264 format/aperture admission, without requiring
+a hardware encoder. Go validates every raw SPS's coded size and reference budget
+before sending encoded input to the helper; CoreMedia can normalize SPS cropping
+in its format description. `--self-test`
+encodes successive landscape, portrait, ultrawide and small 420v buffers through
+one output worker, requiring the fitted dimensions and a constrained-baseline
+SPS/PPS/IDR after each size change. Neither needs Screen Recording permission.
+Real source selection, window resizing, display-scale changes and recovery still
 require a physical macOS gate.
 
 The first source-list or capture request is subject to the normal macOS Screen

@@ -10,6 +10,7 @@ import { mkdir, mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { fittedCaptureSize, matchesCaptureSize } from "./media-gate-geometry";
 
 import {
   CdpConnection,
@@ -31,10 +32,15 @@ const ROOT = resolve(import.meta.dirname, "..");
 const BUILD_ROOT = join(ROOT, "build", "go-check");
 export const SOURCE_TITLE = "Piik Native Gate Source";
 
-type GateMode = "local" | "cross-nat" | "one-link";
+type GateMode = "local" | "one-link";
 type VideoCodec = "h264" | "vp8";
 
 const CODEC_PROBE = `(() => {
+  const fitSize = ${fittedCaptureSize.toString()}, matchesSize = ${matchesCaptureSize.toString()};
+  window.__piikGateFitsProfile = (width, height) => {
+    const video = document.querySelector('video'), source = window.__piikGateSourceSize;
+    return Boolean(video && source && matchesSize(video.videoWidth, video.videoHeight, fitSize(source, width, height)));
+  };
   const peers = [], BrowserPeer = RTCPeerConnection;
   const sockets = [], BrowserSocket = WebSocket;
   window.WebSocket = class extends BrowserSocket {
@@ -76,6 +82,9 @@ interface GateResult {
   qualityControlsEnabled: boolean;
   livePresetChanges: number;
   liveQualityChanged: boolean;
+  fourKQualityChanged: boolean;
+  customQualityChanged: boolean;
+  rateQualityChanges: number;
   pausedQualityChanged: boolean;
   backgroundProfileRecovery: boolean | null;
   sourceWindowRecovery: boolean | null;
@@ -92,7 +101,6 @@ interface GateResult {
   remoteRemoteCandidateType: string;
   remoteNatPath: boolean;
   remotePeerExited: boolean | null;
-  reverseSignalTunnelClosed: boolean | null;
   sourceFailureEndedShare: boolean | null;
   replacementViewerConnected: boolean | null;
   replacementViewerFrames: number | null;
@@ -110,7 +118,6 @@ interface RemoteGateOptions {
   host: string;
   user: string;
   key: string;
-  signalPort: number;
   bindAddress: string | null;
 }
 
@@ -273,18 +280,15 @@ function remoteOptions(): RemoteGateOptions {
   const host = process.env.PIIK_REMOTE_HOST?.trim();
   const user = process.env.PIIK_REMOTE_USER?.trim() || "root";
   const key = process.env.PIIK_REMOTE_SSH_KEY?.trim();
-  const signalPortText = process.env.PIIK_REMOTE_SIGNAL_PORT?.trim() || "49721";
-  const signalPort = Number(signalPortText);
-  if (!host || !key || !Number.isInteger(signalPort) || signalPort < 1024 || signalPort > 65_535) {
+  if (!host || !key) {
     throw new Error(
-      "PIIK_REMOTE_HOST, PIIK_REMOTE_SSH_KEY, and a valid PIIK_REMOTE_SIGNAL_PORT are required",
+      "PIIK_REMOTE_HOST and PIIK_REMOTE_SSH_KEY are required",
     );
   }
   return {
     host,
     user,
     key,
-    signalPort,
     bindAddress: process.env.PIIK_REMOTE_BIND_ADDRESS?.trim() || null,
   };
 }
@@ -574,16 +578,8 @@ async function main(): Promise<void> {
   if (process.env.PIIK_CLIENT_NATIVE_HOST_GATE !== "true") {
     throw new Error("PIIK_CLIENT_NATIVE_HOST_GATE=true is required");
   }
-  const crossNat = process.env.PIIK_CLIENT_CROSS_NAT_GATE === "true";
   const linkMedia = process.env.PIIK_CLIENT_LINK_MEDIA_GATE === "true";
-  if (crossNat && linkMedia) {
-    throw new Error("Cross-NAT and one-link gate modes are mutually exclusive");
-  }
-  const mode: GateMode = linkMedia ? "one-link" : crossNat ? "cross-nat" : "local";
-  const gateStunUrls = process.env.PIIK_CLIENT_GATE_STUN_URLS?.trim();
-  if (mode === "cross-nat" && !gateStunUrls) {
-    throw new Error("PIIK_CLIENT_GATE_STUN_URLS is required for the cross-NAT gate");
-  }
+  const mode: GateMode = linkMedia ? "one-link" : "local";
   const crashGate =
     process.env.PIIK_CLIENT_NATIVE_HOST_CRASH_GATE === "true";
   if (crashGate && mode !== "local") {
@@ -597,7 +593,7 @@ async function main(): Promise<void> {
   if (requestedCodec !== "auto" && requestedCodec !== "h264" && requestedCodec !== "vp8") {
     throw new Error("PIIK_CLIENT_NATIVE_HOST_CODEC must be auto, h264, or vp8");
   }
-  const remote = mode === "cross-nat" || mode === "one-link" &&
+  const remote = mode === "one-link" &&
     Boolean(process.env.PIIK_REMOTE_HOST?.trim() || process.env.PIIK_REMOTE_SSH_KEY?.trim())
       ? remoteOptions() : null;
   const chromePath = process.env.CHROME_PATH?.trim();
@@ -627,7 +623,6 @@ async function main(): Promise<void> {
   let chrome: ChildProcessWithoutNullStreams | null = null;
   let cdp: CdpConnection | null = null;
   let nativePort = 0;
-  let remoteTunnel: ChildProcess | null = null;
   let stage = "setup";
   const result: GateResult = {
     passed: false,
@@ -640,6 +635,9 @@ async function main(): Promise<void> {
     qualityControlsEnabled: false,
     livePresetChanges: 0,
     liveQualityChanged: false,
+    fourKQualityChanged: false,
+    customQualityChanged: false,
+    rateQualityChanges: 0,
     pausedQualityChanged: false,
     backgroundProfileRecovery: mode === "local" && sourceKind === "window" ? false : null,
     sourceWindowRecovery: mode === "local" && sourceKind === "window" ? false : null,
@@ -656,7 +654,6 @@ async function main(): Promise<void> {
     remoteRemoteCandidateType: "",
     remoteNatPath: false,
     remotePeerExited: null,
-    reverseSignalTunnelClosed: mode === "cross-nat" ? false : null,
     sourceFailureEndedShare: mode === "local" ? false : null,
     replacementViewerConnected: mode === "local" ? false : null,
     replacementViewerFrames: mode === "local" ? 0 : null,
@@ -727,37 +724,12 @@ async function main(): Promise<void> {
         ...process.env,
         PIIK_DEBUG: "",
         PIIK_CLIENT_GATE_NO_BROWSER: "true",
-        // STUN_URLS reaches only the App's own Pion edge: the in-process
-        // room server never reads it, so the cross-NAT arm stays isolated.
-        ...(mode === "cross-nat" && gateStunUrls
-          ? { STUN_URLS: gateStunUrls }
-          : {}),
       },
     });
     app.stderr.resume();
     stage = "app-ready";
     const appInfo = await readAppEndpoint(app, mode === "one-link");
     nativePort = appInfo.endpoint.port;
-    if (mode === "cross-nat" && remote) {
-      stage = "signaling-tunnel";
-      const tunnel = spawn(
-        process.env.PIIK_SSH?.trim() || "ssh",
-        [
-          "-N", "-T",
-          ...remoteTransportOptions(remote),
-          "-o", "ExitOnForwardFailure=yes",
-          "-R", `127.0.0.1:${remote.signalPort}:127.0.0.1:${appPort}`,
-          `${remote.user}@${remote.host}`,
-        ],
-        { stdio: "ignore", windowsHide: true },
-      );
-      remoteTunnel = tunnel;
-      tunnel.on("error", () => undefined);
-      await new Promise((resolveTunnel) => setTimeout(resolveTunnel, 300));
-      if (tunnel.exitCode !== null) {
-        throw new Error("signaling tunnel could not start");
-      }
-    }
     stage = "local-server-ready";
     await waitForValue(
       async () => {
@@ -823,6 +795,10 @@ async function main(): Promise<void> {
       5_000,
     );
     stage = "pre-share-codec";
+    // Observe the source at the largest current ceiling before testing smaller
+    // ceilings. Native capture no longer pads/upscales every source to 16:9.
+    await clickHostControl(cdp, host, `document.querySelector('button.lr-chip[aria-label="1440p"]')`);
+    await clickHostControl(cdp, host, `document.querySelector('button[name="degradationPreference"][value="maintain-resolution"]')`);
     await clickHostControl(cdp, host, `document.querySelector('.lr-sharing-technical > summary')`);
     await clickHostControl(cdp, host,
       `([...document.querySelectorAll('button.lr-chip')].find((button) =>
@@ -893,19 +869,14 @@ async function main(): Promise<void> {
     }
     if (remote) {
       stage = "remote-viewer";
-      const signalUrl = mode === "one-link"
-        ? new URL("/signal", appInfo.publicOrigin!).toString().replace(/^http/, "ws")
-        : `ws://127.0.0.1:${remote.signalPort}/signal`;
-      const signalOrigin = mode === "one-link"
-        ? appInfo.publicOrigin!
-        : `http://localhost:${appPort}`;
+      const signalUrl = new URL("/signal", appInfo.publicOrigin!).toString().replace(/^http/, "ws");
       const remoteResult = await runRemotePeerGate(
         remoteBinary,
         remote,
         signalUrl,
         roomMatch[1],
         viewerGrant,
-        signalOrigin,
+        appInfo.publicOrigin!,
       );
       result.remoteViewerConnected = remoteResult.passed;
       result.remoteViewerPackets = remoteResult.packets;
@@ -951,13 +922,16 @@ async function main(): Promise<void> {
           deadline,
         ),
         (state) => state.connected && state.frames >= 30 &&
-          state.width === 1920 && state.height === 1080,
+          state.width >= 320 && state.width <= 2560 && state.height >= 240 && state.height <= 1440,
         40_000,
       );
       result.viewerConnected = viewerState.connected;
       result.viewerFrames = viewerState.frames;
       result.viewerWidth = viewerState.width;
       result.viewerHeight = viewerState.height;
+      await evaluate<void>(cdp, viewer,
+        `window.__piikGateSourceSize = ${JSON.stringify({ width: viewerState.width, height: viewerState.height })}`,
+        Date.now() + 5_000);
       await assertVideoCodec(cdp, viewer, actualCodec);
       if (mode === "one-link") {
         result.codecPreserved = true;
@@ -988,9 +962,7 @@ async function main(): Promise<void> {
           (deadline) => evaluate<boolean>(
             cdp!,
             viewer,
-            `(() => { const video = document.querySelector('video'); return Boolean(
-              video && video.videoWidth === ${width} && video.videoHeight === ${height}
-            ); })()`,
+            `window.__piikGateFitsProfile(${width}, ${height})`,
             deadline,
           ),
           Boolean,
@@ -1016,7 +988,7 @@ async function main(): Promise<void> {
         `(() => {
           const resolution = document.querySelector('button.lr-chip[aria-label="1440p"]');
           const preference = document.querySelector('button[name="degradationPreference"][value="maintain-framerate"]');
-          const sliders = [...document.querySelectorAll('.lr-slider input[type="range"]')];
+          const sliders = [...document.querySelectorAll('.lr-quality-rate input[type="range"]')];
           return Boolean(
             resolution && preference && !resolution.disabled && !preference.disabled &&
             sliders.length === 2 && sliders.every((slider) => !slider.disabled)
@@ -1038,7 +1010,7 @@ async function main(): Promise<void> {
           cdp!,
           viewer,
           `(() => { const video = document.querySelector('video'); return Boolean(
-            video && video.videoWidth === 2560 && video.videoHeight === 1440 &&
+            video && window.__piikGateFitsProfile(2560, 1440) &&
             video.getVideoPlaybackQuality().totalVideoFrames >= ${viewerState.frames + 10}
           ); })()`,
           deadline,
@@ -1049,9 +1021,77 @@ async function main(): Promise<void> {
       if (!result.liveQualityChanged) {
         throw new Error("Native quality change did not reach the Viewer");
       }
-      result.viewerWidth = 2560;
-      result.viewerHeight = 1440;
+      result.viewerWidth = viewerState.width;
+      result.viewerHeight = viewerState.height;
       await assertVideoCodec(cdp, viewer, actualCodec);
+      stage = "native-4k-preset";
+      await clickHostControl(cdp, host, `document.querySelectorAll('button.lr-tile')[2]`);
+      await waitForValue(deadline => evaluate<boolean>(cdp!, host,
+        `document.querySelector('input[name="maxFramerate"]')?.value === '60' &&
+          document.querySelector('.lr-sharing-panel')?.getAttribute('aria-busy') === 'false'`,
+        deadline), Boolean, 20_000);
+      stage = "native-4k-controls";
+      const framesBefore4K = await evaluate<number>(cdp, viewer,
+        `document.querySelector('video')?.getVideoPlaybackQuality().totalVideoFrames ?? 0`, Date.now() + 5_000);
+      await evaluate<void>(cdp, host,
+        `document.querySelector('button.lr-chip[aria-label="4K"]')?.click()`, Date.now() + 5_000);
+      await waitForValue(deadline => evaluate<boolean>(cdp!, host, `(() => {
+        const fps = document.querySelector('input[name="maxFramerate"]');
+        const width = document.querySelector('.lr-video-size input[name="width"]');
+        const height = document.querySelector('.lr-video-size input[name="height"]');
+        return fps && Number(fps.max) >= 60 && fps.validity.valid && fps.value === '60' &&
+          width?.value === '3840' && height?.value === '2160';
+      })()`, deadline), Boolean, 10_000);
+      stage = "native-4k-decode";
+      result.fourKQualityChanged = await waitForValue(deadline => evaluate<boolean>(cdp!, viewer, `(() => {
+        const video = document.querySelector('video');
+        return Boolean(video && window.__piikGateFitsProfile(3840, 2160) &&
+          video.srcObject === window.__piikGateMedia &&
+          video.getVideoPlaybackQuality().totalVideoFrames >= ${framesBefore4K + 10});
+      })()`, deadline), Boolean, 20_000);
+      await assertVideoCodec(cdp, viewer, actualCodec);
+      stage = "native-custom-quality";
+      const framesBeforeCustom = await evaluate<number>(cdp, viewer,
+        `document.querySelector('video')?.getVideoPlaybackQuality().totalVideoFrames ?? 0`, Date.now() + 5_000);
+      await evaluate<void>(cdp, host, `(() => {
+        const width = document.querySelector('.lr-video-size input[name="width"]');
+        const height = document.querySelector('.lr-video-size input[name="height"]');
+        width.focus(); width.value = '960';
+        height.focus(); height.value = '600'; height.blur();
+      })()`, Date.now() + 5_000);
+      result.customQualityChanged = await waitForValue(
+        deadline => evaluate<boolean>(cdp!, viewer, `(() => {
+          const video = document.querySelector('video');
+          return Boolean(video && window.__piikGateFitsProfile(960, 600) &&
+            video.srcObject === window.__piikGateMedia &&
+            video.getVideoPlaybackQuality().totalVideoFrames >= ${framesBeforeCustom + 10});
+        })()`, deadline), Boolean, 20_000);
+      await assertVideoCodec(cdp, viewer, actualCodec);
+      stage = "native-rate-range";
+      for (const [fps, mbps] of [[1, 0.1], [60, 50]]) {
+        for (const [name, value] of [["maxFramerate", fps], ["maxBitrate", mbps]] as const) {
+          await evaluate<void>(cdp, host, `(() => {
+            const input = document.querySelector('input[name="${name}"]');
+            if (!input || input.disabled) throw new Error('Rate control is unavailable');
+            input.focus(); input.value = '${value}';
+            if (!input.validity.valid) throw new Error('Rate control rejected the candidate range');
+            input.blur();
+          })()`, Date.now() + 5_000);
+          await waitForValue(deadline => evaluate<boolean>(cdp!, host,
+            `document.querySelector('input[name="${name}"]')?.value === '${value}' &&
+              document.querySelector('.lr-sharing-panel')?.getAttribute('aria-busy') === 'false'`,
+            deadline), Boolean, 20_000);
+        }
+        const before = await evaluate<number>(cdp, viewer,
+          `document.querySelector('video')?.getVideoPlaybackQuality().totalVideoFrames ?? 0`, Date.now() + 5_000);
+        await waitForValue(deadline => evaluate<boolean>(cdp!, viewer, `(() => {
+          const video = document.querySelector('video');
+          return Boolean(video && video.srcObject === window.__piikGateMedia &&
+            video.getVideoPlaybackQuality().totalVideoFrames >= ${before + 3});
+        })()`, deadline), Boolean, 20_000);
+        await assertVideoCodec(cdp, viewer, actualCodec);
+        result.rateQualityChanges += 1;
+      }
       const framesBeforePreference = await evaluate<number>(
         cdp,
         viewer,
@@ -1177,10 +1217,10 @@ async function main(): Promise<void> {
           deadline,
         ),
         (value) => value.frames >= framesBeforeResume + 10 &&
-          value.width === 854 && value.height === 480,
+          matchesCaptureSize(value.width, value.height, fittedCaptureSize(viewerState, 854, 480)),
         20_000,
       );
-      result.pausedQualityChanged = resumed.width === 854 && resumed.height === 480;
+      result.pausedQualityChanged = matchesCaptureSize(resumed.width, resumed.height, fittedCaptureSize(viewerState, 854, 480));
       result.mediaObjectPreserved = resumed.sameMedia;
       result.viewerWidth = resumed.width;
       result.viewerHeight = resumed.height;
@@ -1234,7 +1274,7 @@ async function main(): Promise<void> {
             `(() => {
               const video = document.querySelector('video');
               return Boolean(video && video.srcObject === window.__piikGateMedia &&
-                video.videoWidth === ${width} && video.videoHeight === ${height} &&
+                window.__piikGateFitsProfile(${width}, ${height}) &&
                 video.getVideoPlaybackQuality().totalVideoFrames >= ${before + 10});
             })()`, deadline,
           ), Boolean, 20_000);
@@ -1323,7 +1363,7 @@ async function main(): Promise<void> {
             const video = document.querySelector('video');
             return Boolean(
               video && video.srcObject === window.__piikGateMedia &&
-              video.videoWidth === 854 && video.videoHeight === 480 &&
+              video.videoWidth > 0 && video.videoWidth <= 854 && video.videoHeight > 0 && video.videoHeight <= 480 &&
               video.getVideoPlaybackQuality().totalVideoFrames >= ${framesBeforeSourceChange + 10}
             );
           })()`,
@@ -1431,7 +1471,7 @@ async function main(): Promise<void> {
             const video = document.querySelector('video');
             return Boolean(video && video.srcObject &&
               video.srcObject !== window.__piikGateMedia &&
-              video.videoWidth === 854 && video.videoHeight === 480);
+              video.videoWidth > 0 && video.videoWidth <= 854 && video.videoHeight > 0 && video.videoHeight <= 480);
           })()`,
           deadline,
         ),
@@ -1467,9 +1507,6 @@ async function main(): Promise<void> {
     result.error = error instanceof Error ? error.message : String(error);
     result.stage = stage;
   } finally {
-    if (remoteTunnel) {
-      result.reverseSignalTunnelClosed = await stopChild(remoteTunnel);
-    }
     if (sourceChrome && sourceCdp) {
       await closeSourceBrowser(sourceChrome, sourceCdp);
       sourceChrome = null;
@@ -1505,20 +1542,21 @@ async function main(): Promise<void> {
     result.hostInvite &&
     (remote
       ? result.remoteViewerConnected && result.remoteViewerPackets >= 30 &&
-        result.remoteNatPath && result.remotePeerExited === true &&
-        (mode !== "cross-nat" || result.reverseSignalTunnelClosed === true)
+        result.remoteNatPath && result.remotePeerExited === true
       : mode === "one-link"
         ? result.publicViewerPage && result.publicViewerSignal && result.viewerConnected &&
-          result.viewerFrames >= 30 && result.viewerWidth === 1920 && result.viewerHeight === 1080 && result.codecPreserved
+          result.viewerFrames >= 30 && result.viewerWidth > 0 && result.viewerWidth <= 2560 &&
+          result.viewerHeight > 0 && result.viewerHeight <= 1440 && result.codecPreserved
         : result.viewerConnected && result.viewerFrames >= 30 &&
-        result.qualityControlsEnabled && result.liveQualityChanged &&
+        result.qualityControlsEnabled && result.liveQualityChanged && result.fourKQualityChanged && result.customQualityChanged &&
+        result.rateQualityChanges === 2 &&
         result.backgroundProfileRecovery !== false &&
         result.sourceWindowRecovery !== false &&
         result.livePresetChanges === 2 &&
         result.codecPreserved &&
         result.pausedQualityChanged && result.mediaObjectPreserved &&
         result.nativeSourceChanged &&
-        result.viewerWidth === 854 && result.viewerHeight === 480 &&
+        result.viewerWidth > 0 && result.viewerWidth <= 854 && result.viewerHeight > 0 && result.viewerHeight <= 480 &&
         result.nativeQualityEvidence &&
         (crashGate
           ? result.appCrashEndedShare === true

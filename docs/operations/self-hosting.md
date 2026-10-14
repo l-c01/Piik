@@ -1,17 +1,31 @@
 # Deploy Piik Server
 
-English · [简体中文](./self-hosting.zh-CN.md) · [Documentation](../README.md)
+English · [简体中文](./self-hosting.zh-CN.md) · [Documentation](../guide/README.md)
 
 Piik Server packages the web interface, room management and optional media
 forwarding in **one server binary**. Extract and run it; room data is stored in SQLite.
 
+The default P2P configuration handles room management, signaling and STUN; shared
+video and audio travel between participants. Enabling SFU adds media-forwarding
+bandwidth and processing on the server. For a small server, start with the default
+and measure CPU, memory and network use with your intended number of rooms and
+viewers before enabling SFU. Lowering picture resolution primarily reduces
+participants' capture and encoding work.
+
 ## Try it locally
 
-These server instructions use a Linux x64 machine.
+These instructions support Linux x64 and ARM64.
 
-Download **`piik-<revision>-runtime.tar.gz`**, the Linux x64 Server archive,
+Download the Server archive matching your machine
 from [GitHub Releases](https://github.com/TNTcraftHIM/Piik/releases)
 or the [Gitee mirror](https://gitee.com/TNTcraftHIM/Piik/releases).
+Use `uname -m` to check the architecture:
+
+| Architecture | Archive |
+| --- | --- |
+| `x86_64` (x64) | `piik-<revision>-runtime.tar.gz` |
+| `aarch64` (ARM64) | `piik-<revision>-linux-arm64-runtime.tar.gz` |
+
 Extract it and run the following in its directory:
 
 ```sh
@@ -24,7 +38,7 @@ use the [Piik App guide](../guide/getting-started.md).
 
 ## Docker Compose
 
-On a Linux x64 server with Docker Compose v2, download the two deployment files
+On a Linux x64 or ARM64 server with Docker Compose v2, download the two deployment files
 into an empty directory:
 
 ```sh
@@ -40,7 +54,7 @@ docker compose up -d
 ```
 
 The `ghcr.io/tntcrafthim/piik:latest` image includes the Web UI, signaling, STUN
-and optional SFU. Complete [HTTPS](#2-enable-https) and
+and optional SFU. Docker selects the matching architecture automatically. Complete [HTTPS](#2-enable-https) and
 [firewall configuration](#3-open-the-ports-and-verify) below. The default is P2P;
 the sample `.env` also shows how to enable SFU fallback. Keep the `piik-data`
 volume, which stores room data and optional diagnostics. See
@@ -48,7 +62,7 @@ volume, which stores room data and optional diagnostics. See
 
 ## Put it online
 
-You need a Linux x64 server and a domain pointing to its public IP.
+You need a Linux x64 or ARM64 server and a domain pointing to its public IP.
 The example uses `share.example.com`; replace it with your domain.
 
 ### 1. Configure and start Piik
@@ -86,6 +100,12 @@ cause [403 when creating a room](../guide/troubleshooting.md#room-creation-retur
 resources. See [room capacity](../standards/configuration.md#room-capacity)
 for defaults and the difference from App rooms.
 
+For a public site, optionally set `ROOM_EMPTY_TIMEOUT_SECONDS=3600` and restart.
+Rooms with nobody connected are reclaimed after an hour; if all room codes are
+used, the oldest empty room can be reclaimed earlier. Occupied rooms keep working.
+Reclaimed rooms need new invitations. Unset or `0` keeps the default indefinite
+retention; see [room retention](../standards/configuration.md#room-retention).
+
 ### 2. Enable HTTPS
 
 Use your existing HTTPS reverse proxy to forward to `127.0.0.1:8787` with
@@ -112,6 +132,9 @@ permission; `self` allows this site to request access.
 Allow **TCP 80/443** for HTTPS and **UDP 3478** for STUN in the server firewall
 and cloud security group. Keep TCP 8787 private. The STUN hostname must resolve
 directly to the server; a CDN HTTP proxy does not forward its UDP traffic.
+See the [complete port table](../standards/configuration.md#public-and-private-ports)
+for optional services. Embedded SFU media shares the single UDP port set by
+`SFU_UDP_PORT`.
 
 Open `https://share.example.com/healthz`; it should return `{"status":"ok"}`.
 Then open the site, share a screen and join from another device. This initial
@@ -121,9 +144,16 @@ configuration uses P2P media, so participants need a usable UDP path.
 
 Add `SFU_UDP_PORT=7882` to `.env`, allow UDP 7882, and restart Piik to enable
 automatic SFU fallback. When the server is behind NAT, also set `SFU_PUBLIC_IP`
-to its reachable public IPv4 address. The same binary provides the fallback.
+to its reachable public IPv4 address and forward the same external and internal
+UDP port as `SFU_UDP_PORT`. The same binary provides the fallback.
+Allow server forwarding capacity and outbound bandwidth for Viewers actually
+using the SFU.
 The Host must turn off **Privacy mode** before sharing to allow this route.
 Both direct and SFU media need a usable UDP connection.
+
+To send every room through your server, also set `SFU_ONLY=true` and restart.
+The sharing settings will show **Server media**. Plan server bandwidth for every
+Viewer; this mode does not fall back to P2P if the server route fails.
 
 ## Keep it running and update
 

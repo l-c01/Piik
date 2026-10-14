@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture_error.h"
+#include "capture_color.h"
 
 #include "capture_input.h"
 
@@ -38,16 +39,14 @@ class H264Decoder final {
     }
     Microsoft::WRL::ComPtr<ICodecAPI> codec;
     Check(decoder_.As(&codec), "codec-api");
-    for (const auto& setting : {
-             std::pair<GUID, ULONG>{CODECAPI_AVLowLatencyMode, TRUE},
-             std::pair<GUID, ULONG>{CODECAPI_AVDecVideoMaxCodedWidth, 2560},
-             std::pair<GUID, ULONG>{CODECAPI_AVDecVideoMaxCodedHeight, 1440}}) {
-      VARIANT value;
-      VariantInit(&value);
-      value.vt = VT_UI4;
-      value.ulVal = setting.second;
-      Check(codec->SetValue(&setting.first, &value), "codec-setting");
-    }
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_UI4;
+    value.ulVal = TRUE;
+    Check(codec->SetValue(&CODECAPI_AVLowLatencyMode, &value), "codec-setting");
+    // Let the MFT own its supported dimensions. Setting both global axis
+    // ceilings preallocates a square and can fail even for a small input.
+    // Go validates SPS storage before this process; SelectOutput bounds its buffers.
   }
 
   ~H264Decoder() {
@@ -55,6 +54,14 @@ class H264Decoder final {
   }
   H264Decoder(const H264Decoder&) = delete;
   H264Decoder& operator=(const H264Decoder&) = delete;
+
+  DXGI_COLOR_SPACE_TYPE ColorSpace() const {
+    Microsoft::WRL::ComPtr<IMFMediaType> type;
+    Check(decoder_->GetOutputCurrentType(0, &type), "current-output-type");
+    return windows::DecodedVideoColor(type.Get());
+  }
+
+  RECT DisplayArea() const { return display_area_; }
 
   void Decode(const InputEnvelope& input, const Consumer& consume) {
     if (input.kind != 2 || input.data.empty() || input.data.size() > 4 * 1024 * 1024)
@@ -110,9 +117,31 @@ class H264Decoder final {
       if (subtype != MFVideoFormat_NV12) continue;
       UINT32 width = 0, height = 0;
       Check(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height), "output-size");
-      if (width < 2 || height < 2 || width > 2560 || height > 1440 || (width & 1) || (height & 1)) {
-        throw std::runtime_error("H264 decoder output dimensions exceed the source bound");
+      if (!ValidCodedVideoSize(width, height)) {
+        throw std::runtime_error("H264 decoder output storage exceeds its bound");
       }
+      // MF_MT_FRAME_SIZE includes codec padding. The display aperture owns
+      // visible pixels, independently of the bounded decoder allocation.
+      MFVideoArea area{};
+      UINT32 area_bytes = 0;
+      HRESULT aperture = type->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE,
+          reinterpret_cast<UINT8*>(&area), sizeof(area), &area_bytes);
+      if (aperture == MF_E_ATTRIBUTENOTFOUND)
+        aperture = type->GetBlob(MF_MT_GEOMETRIC_APERTURE,
+            reinterpret_cast<UINT8*>(&area), sizeof(area), &area_bytes);
+      if (aperture == MF_E_ATTRIBUTENOTFOUND) {
+        area = {{0, 0}, {0, 0}, {static_cast<LONG>(width), static_cast<LONG>(height)}};
+      } else {
+        Check(aperture, "display-aperture");
+        if (area_bytes != sizeof(area)) throw std::runtime_error("H264 display aperture is incomplete");
+      }
+      if (area.OffsetX.value < 0 || area.OffsetY.value < 0 ||
+          area.OffsetX.fract || area.OffsetY.fract ||
+          (area.OffsetX.value & 1) || (area.OffsetY.value & 1) ||
+          !ValidVideoSize(area.Area.cx, area.Area.cy) ||
+          area.OffsetX.value + area.Area.cx > static_cast<LONG>(width) ||
+          area.OffsetY.value + area.Area.cy > static_cast<LONG>(height))
+        throw std::runtime_error("H264 display aperture exceeds its picture bound");
       Check(decoder_->SetOutputType(0, type.Get(), 0), "set-output");
       UINT32 stride = 0;
       if (FAILED(type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride))) {
@@ -124,6 +153,8 @@ class H264Decoder final {
       width_ = width;
       height_ = height;
       stride_ = static_cast<LONG>(stride);
+      display_area_ = {area.OffsetX.value, area.OffsetY.value,
+          area.OffsetX.value + area.Area.cx, area.OffsetY.value + area.Area.cy};
       return;
     }
     throw std::runtime_error("H264 decoder has no NV12 output");
@@ -135,11 +166,11 @@ class H264Decoder final {
       Check(decoder_->GetOutputStreamInfo(0, &info), "output-info");
       Microsoft::WRL::ComPtr<IMFSample> owned;
       if (!(info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
-        const DWORD expected = static_cast<DWORD>(stride_) * height_ * 3 / 2;
-        const DWORD size = std::max(info.cbSize, expected);
-        if (size > 2560 * 1440 * 2) throw std::runtime_error("H264 decoder output allocation exceeds its bound");
+        const UINT64 expected = static_cast<UINT64>(stride_) * height_ * 3 / 2;
+        const UINT64 size = std::max<UINT64>(info.cbSize, expected);
+        if (size > kMaxCodedVideoPixels * 2) throw std::runtime_error("H264 decoder output allocation exceeds its bound");
         Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
-        Check(MFCreateAlignedMemoryBuffer(size, info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer), "output-buffer");
+        Check(MFCreateAlignedMemoryBuffer(static_cast<DWORD>(size), info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer), "output-buffer");
         Check(MFCreateSample(&owned), "output-sample");
         Check(owned->AddBuffer(buffer.Get()), "output-sample-buffer");
       }
@@ -167,6 +198,7 @@ class H264Decoder final {
   UINT32 width_ = 0;
   UINT32 height_ = 0;
   LONG stride_ = 0;
+  RECT display_area_{};
   bool configured_ = false;
 };
 

@@ -66,6 +66,7 @@ func TestEmbeddedSfuSignalsRequireExactAdmittedConnectionAndCurrentSession(t *te
 }
 
 func TestEmbeddedSfuAuthenticatedWebSocketCarriesActualRTP(t *testing.T) {
+	diagnostics := captureRouteDebug(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	check := func(err error) {
@@ -209,6 +210,20 @@ func TestEmbeddedSfuAuthenticatedWebSocketCarriesActualRTP(t *testing.T) {
 		}
 	})
 	applyRemote(viewer, subscriber, viewerConfig, false)
+	// SFU reserves its audio track for later source/microphone changes. Match
+	// the product Viewer's receive preference even while this fixture is silent.
+	for _, transceiver := range subscriber.GetTransceivers() {
+		if transceiver.Kind() != webrtc.RTPCodecTypeAudio {
+			continue
+		}
+		for _, codec := range transceiver.Receiver().GetParameters().Codecs {
+			if codec.MimeType == webrtc.MimeTypeOpus {
+				codec.SDPFmtpLine = "stereo=1;maxaveragebitrate=510000"
+				check(transceiver.SetCodecPreferences([]webrtc.RTPCodecParameters{codec}))
+				break
+			}
+		}
+	}
 	answer, err := subscriber.CreateAnswer(nil)
 	check(err)
 	sendDescription(viewer, viewerConfig, gather(subscriber, answer), nil)
@@ -216,10 +231,22 @@ func TestEmbeddedSfuAuthenticatedWebSocketCarriesActualRTP(t *testing.T) {
 	if !waitFor(t, 3*time.Second, func() bool { return received.Load() >= 3 }) {
 		t.Fatal("authenticated signaling did not produce forwarded video RTP")
 	}
+	if !waitFor(t, time.Second, func() bool {
+		return diagnostics.calledWith(h.room.RoomID, "sfu-transport-state", map[string]any{
+			"role": "host", "phase": "prepare", "revision": int64(hostConfig.Revision), "state": "connected",
+		}) && diagnostics.calledWith(h.room.RoomID, "sfu-transport-state", map[string]any{
+			"role": "viewer", "phase": "prepare", "revision": int64(viewerConfig.Revision), "state": "connected",
+		})
+	}) {
+		t.Fatal("SFU diagnostics did not distinguish connected ingress and egress before route commit")
+	}
 	h.locked(func() {
 		room, _ := h.server.router.rooms.Get(h.room.RoomID)
 		if room.controller.Operation() == nil {
 			t.Fatal("transport/RTP arrival committed without client decoded-frame proof")
+		}
+		if room.controller.Publication() != nil {
+			t.Fatal("preparing media was advertised as a committed Host publication")
 		}
 	})
 	viewer.sendJSON(map[string]any{"type": "route-ready", "revision": viewerConfig.Revision, "phase": "prepare"})

@@ -1,45 +1,105 @@
 import {
   DEFAULT_QUALITY_SETTINGS,
+  MIN_AUDIO_BITRATE,
+  MAX_AUDIO_BITRATE,
+  qualitySettingsSchema,
   type DegradationPreference,
-  type QualityProfileId,
   type QualityResolution,
   type QualitySettings,
-  type ScreenAudioQuality,
 } from "../../shared/protocol";
 import { say, type CopyKey } from "../ui/copy";
 import type { MediaFailure } from "../ui/media-failure";
 import { displayMediaOptions } from "./audio-capture";
 import { browserDebugEnabled, debugOperation } from "../lib/debug";
 import { debugTrack } from "../lib/debug-webrtc";
+import { applySenderCaptureConstraints, senderCaptureTrack } from "./sender-video-track";
+import { cameraCaptureConstraints } from "./capture-devices";
 
 export type {
   DegradationPreference,
-  QualityProfileId,
   QualityResolution,
   QualitySettings,
-  ScreenAudioQuality,
 } from "../../shared/protocol";
 
 export type QualityProfile = QualitySettings;
 export const STARTUP_VIDEO_ENCODED_FRAMES = 5;
+export const MIN_VIDEO_FRAMERATE = 1;
+export const MIN_VIDEO_BITRATE = 100_000;
+export interface VideoCaptureLimits {
+  maxVideoResolution: QualityResolution;
+  maxVideoPixels: number;
+  maxVideoMacroblocksPerSecond: number;
+  maxVideoFramerate: number;
+  maxVideoBitrate: number;
+}
+
+// Current output boundary, independent of descriptive wire bounds and UI presets.
+// H.264 Level 5.2 bounds frame area, processing rate and bitrate independently.
+// Keep a finite 240 fps scheduling budget; ultrawide/high-refresh inputs need
+// not fit a named preset. Actual output still depends on the source and encoder.
+export const VIDEO_CAPTURE_LIMITS: VideoCaptureLimits = {
+  maxVideoResolution: { width: 8192, height: 8192 },
+  maxVideoPixels: 36_864 * 16 * 16,
+  maxVideoMacroblocksPerSecond: 2_073_600,
+  maxVideoFramerate: 240,
+  maxVideoBitrate: 240_000_000,
+};
+
+export function videoCaptureLimits(advertised?: Partial<VideoCaptureLimits>): VideoCaptureLimits {
+  const local = VIDEO_CAPTURE_LIMITS;
+  return {
+    maxVideoResolution: {
+      width: Math.min(local.maxVideoResolution.width, advertised?.maxVideoResolution?.width ?? local.maxVideoResolution.width),
+      height: Math.min(local.maxVideoResolution.height, advertised?.maxVideoResolution?.height ?? local.maxVideoResolution.height),
+    },
+    maxVideoPixels: Math.min(local.maxVideoPixels, advertised?.maxVideoPixels ?? local.maxVideoPixels),
+    maxVideoMacroblocksPerSecond: Math.min(local.maxVideoMacroblocksPerSecond,
+      advertised?.maxVideoMacroblocksPerSecond ?? local.maxVideoMacroblocksPerSecond),
+    maxVideoFramerate: Math.min(local.maxVideoFramerate, advertised?.maxVideoFramerate ?? local.maxVideoFramerate),
+    maxVideoBitrate: Math.min(local.maxVideoBitrate, advertised?.maxVideoBitrate ?? local.maxVideoBitrate),
+  };
+}
+
+export function captureFramerateCeiling(size: QualityResolution, limits = VIDEO_CAPTURE_LIMITS): number {
+  if (![size.width, size.height].every(value => Number.isInteger(value) && value >= 4 && value % 2 === 0)
+    || size.width > limits.maxVideoResolution.width || size.height > limits.maxVideoResolution.height
+    || size.width * size.height > limits.maxVideoPixels
+    || Math.ceil(size.width / 16) * Math.ceil(size.height / 16) * 256 > VIDEO_CAPTURE_LIMITS.maxVideoPixels) return 0;
+  return Math.floor(Math.min(limits.maxVideoFramerate, limits.maxVideoMacroblocksPerSecond /
+    (Math.ceil(size.width / 16) * Math.ceil(size.height / 16))));
+}
+
+export function supportsCaptureProfile(profile: QualityProfile, limits = VIDEO_CAPTURE_LIMITS,
+  maxAudioBitrate = MAX_SCREEN_AUDIO_BITRATE): boolean {
+  return qualitySettingsSchema.safeParse(profile).success &&
+    Number.isInteger(profile.maxFramerate) && profile.maxFramerate >= MIN_VIDEO_FRAMERATE &&
+    profile.maxFramerate <= captureFramerateCeiling(profile.resolution, limits) &&
+    profile.maxBitrate >= MIN_VIDEO_BITRATE && profile.maxBitrate <= limits.maxVideoBitrate &&
+    screenAudioBitrate(profile.maxAudioBitrate) <= maxAudioBitrate;
+}
+
+function requireCaptureProfile(profile: QualityProfile): void {
+  if (!supportsCaptureProfile(profile)) throw new Error("Capture quality is not supported by this implementation");
+}
 
 export const QUALITY_PROFILES = {
   "720p30": {
-    resolution: "720p",
+    resolution: { width: 1280, height: 720 },
     maxFramerate: 30,
     maxBitrate: 3_000_000,
     degradationPreference: "balanced",
-    screenAudioQuality: "music",
+    maxAudioBitrate: 128000,
   },
   "1080p30": DEFAULT_QUALITY_SETTINGS,
   "1080p60": {
-    resolution: "1080p",
+    resolution: { width: 1920, height: 1080 },
     maxFramerate: 60,
     maxBitrate: 8_000_000,
     degradationPreference: "balanced",
-    screenAudioQuality: "music",
+    maxAudioBitrate: 128000,
   },
-} as const satisfies Record<QualityProfileId, QualitySettings>;
+} as const satisfies Record<string, QualitySettings>;
+export type QualityProfileId = keyof typeof QUALITY_PROFILES;
 
 export const QUALITY_PROFILE_KEYS = {
   "720p30": "host.quality.720p30",
@@ -48,14 +108,21 @@ export const QUALITY_PROFILE_KEYS = {
 } as const satisfies Record<QualityProfileId, CopyKey>;
 
 export const QUALITY_RESOLUTIONS = {
-  "480p": { width: 854, height: 480, label: "480p" },
-  "720p": { width: 1280, height: 720, label: "720p" },
-  "1080p": { width: 1920, height: 1080, label: "1080p" },
-  "1440p": { width: 2560, height: 1440, label: "1440p" },
-} as const satisfies Record<
-  QualityResolution,
-  { width: number; height: number; label: string }
->;
+  "480p": { width: 854, height: 480 },
+  "720p": { width: 1280, height: 720 },
+  "1080p": { width: 1920, height: 1080 },
+  "1440p": { width: 2560, height: 1440 },
+  "4K": { width: 3840, height: 2160 },
+} as const satisfies Record<string, QualityResolution>;
+
+export function qualityResolutionEqual(left: QualityResolution, right: QualityResolution): boolean {
+  return left.width === right.width && left.height === right.height;
+}
+
+export function qualityResolutionLabel(resolution: QualityResolution): string {
+  return Object.entries(QUALITY_RESOLUTIONS).find(([, size]) => qualityResolutionEqual(size, resolution))?.[0]
+    ?? `${resolution.width}×${resolution.height}`;
+}
 
 export const DEGRADATION_PREFERENCE_KEYS = {
   "maintain-resolution": "host.advanced.preference.resolution",
@@ -63,14 +130,15 @@ export const DEGRADATION_PREFERENCE_KEYS = {
   "maintain-framerate": "host.advanced.preference.framerate",
 } as const satisfies Record<DegradationPreference, CopyKey>;
 
-export const DEFAULT_SCREEN_AUDIO_QUALITY: ScreenAudioQuality = "music";
 export const SCREEN_AUDIO_BITRATES = {
   saver: 64_000,
   music: 128_000,
   "very-high": 192_000,
-} as const satisfies Record<ScreenAudioQuality, number>;
-export const SCREEN_AUDIO_RECEIVE_MAX_BITRATE =
-  SCREEN_AUDIO_BITRATES["very-high"];
+} as const;
+export type ScreenAudioPreset = keyof typeof SCREEN_AUDIO_BITRATES;
+// Current 20 ms output leaves room for RTP/SRTP overhead within a 1200-byte packet.
+export const MAX_SCREEN_AUDIO_BITRATE = 320_000;
+export const SCREEN_AUDIO_RECEIVE_MAX_BITRATE = MAX_AUDIO_BITRATE;
 
 export function startupVideoProfile(
   profile: QualityProfile,
@@ -104,16 +172,10 @@ export interface AudioSenderParameterReadback {
   mismatch: boolean;
 }
 
-export function resolveScreenAudioQuality(
-  quality: ScreenAudioQuality | undefined,
-): ScreenAudioQuality {
-  return quality ?? DEFAULT_SCREEN_AUDIO_QUALITY;
-}
-
 export function screenAudioBitrate(
-  quality: ScreenAudioQuality | undefined,
+  bitrate: number | undefined,
 ): number {
-  return SCREEN_AUDIO_BITRATES[resolveScreenAudioQuality(quality)];
+  return bitrate ?? DEFAULT_QUALITY_SETTINGS.maxAudioBitrate;
 }
 
 export function qualitySettingsEqual(
@@ -122,7 +184,7 @@ export function qualitySettingsEqual(
 ): boolean {
   return (
     videoQualitySettingsEqual(left, right) &&
-    screenAudioQualityEqual(left, right)
+    audioQualitySettingsEqual(left, right)
   );
 }
 
@@ -131,20 +193,20 @@ export function videoQualitySettingsEqual(
   right: QualitySettings,
 ): boolean {
   return (
-    left.resolution === right.resolution &&
+    qualityResolutionEqual(left.resolution, right.resolution) &&
     left.maxFramerate === right.maxFramerate &&
     left.maxBitrate === right.maxBitrate &&
     left.degradationPreference === right.degradationPreference
   );
 }
 
-export function screenAudioQualityEqual(
+export function audioQualitySettingsEqual(
   left: QualitySettings,
   right: QualitySettings,
 ): boolean {
   return (
-    resolveScreenAudioQuality(left.screenAudioQuality) ===
-      resolveScreenAudioQuality(right.screenAudioQuality)
+    screenAudioBitrate(left.maxAudioBitrate) ===
+      screenAudioBitrate(right.maxAudioBitrate)
   );
 }
 
@@ -154,7 +216,7 @@ export function matchingQualityProfileId(
   for (const id of Object.keys(QUALITY_PROFILES) as QualityProfileId[]) {
     const profile = QUALITY_PROFILES[id];
     if (
-      settings.resolution === profile.resolution &&
+      qualityResolutionEqual(settings.resolution, profile.resolution) &&
       settings.maxFramerate === profile.maxFramerate &&
       settings.maxBitrate === profile.maxBitrate &&
       settings.degradationPreference === profile.degradationPreference
@@ -170,14 +232,16 @@ export function qualitySettingsLabel(settings: QualitySettings): string {
   if (profileId) {
     return say(QUALITY_PROFILE_KEYS[profileId]);
   }
-  return `${QUALITY_RESOLUTIONS[settings.resolution].label} ${settings.maxFramerate} fps · ${(settings.maxBitrate / 1_000_000).toFixed(1)} Mbps · ${say(DEGRADATION_PREFERENCE_KEYS[settings.degradationPreference])}`;
+  return `${qualityResolutionLabel(settings.resolution)} ${settings.maxFramerate} fps · ${(settings.maxBitrate / 1_000_000).toFixed(1)} Mbps · ${say(DEGRADATION_PREFERENCE_KEYS[settings.degradationPreference])}`;
 }
 
 function captureConstraints(profile: QualityProfile): MediaTrackConstraints {
-  const resolution = QUALITY_RESOLUTIONS[profile.resolution];
+  requireCaptureProfile(profile);
+  const resolution = profile.resolution;
   return {
-    width: { ideal: resolution.width, max: resolution.width },
-    height: { ideal: resolution.height, max: resolution.height },
+    // A ceiling must not ask the Browser to fill both axes by cropping a source.
+    width: { max: resolution.width },
+    height: { max: resolution.height },
     frameRate: {
       ideal: profile.maxFramerate,
       max: profile.maxFramerate,
@@ -223,12 +287,9 @@ export type BrowserCaptureSource = "browser" | "camera";
 
 export async function captureBrowserSource(profile: QualityProfile, source: BrowserCaptureSource, deviceId = ""): Promise<MediaStream> {
   if (source !== "camera") return captureDisplay(profile);
-  const resolution = QUALITY_RESOLUTIONS[profile.resolution];
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: {
-    ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
-    width: { ideal: resolution.width }, height: { ideal: resolution.height },
-    frameRate: { ideal: profile.maxFramerate, max: profile.maxFramerate },
-  } });
+  requireCaptureProfile(profile);
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+    video: cameraCaptureConstraints(profile.resolution, profile.maxFramerate, deviceId) });
   const track = stream.getVideoTracks()[0];
   if (!track || track.readyState === "ended") {
     stream.getTracks().forEach((track) => track.stop());
@@ -249,15 +310,6 @@ export async function applyCaptureProfile(
   await applyVideoCaptureProfile(videoTrack, profile);
 }
 
-export function cloneSenderVideoTrack(
-  source: MediaStreamTrack,
-): MediaStreamTrack {
-  const clone = source.clone();
-  clone.contentHint = source.contentHint || "motion";
-  clone.enabled = source.enabled;
-  return clone;
-}
-
 export async function applyVideoCaptureProfile(
   track: MediaStreamTrack,
   profile: QualityProfile,
@@ -267,7 +319,7 @@ export async function applyVideoCaptureProfile(
   }
   const complete = debugOperation("quality", "capture", { requested: profile, trackId: track.id });
   try {
-    await track.applyConstraints(captureConstraints(profile));
+    await applySenderCaptureConstraints(track, captureConstraints(profile));
     complete("applied", { trackId: track.id });
     debugTrack(track, { event: "profile-applied" });
   } catch (error) {
@@ -277,6 +329,7 @@ export async function applyVideoCaptureProfile(
 }
 
 function videoTrackOwnsCaptureConstraints(track: MediaStreamTrack): boolean {
+  track = senderCaptureTrack(track);
   const capabilities = track.getCapabilities?.();
   return !capabilities ||
     "width" in capabilities ||
@@ -305,9 +358,9 @@ function requestedScaleResolutionDownBy(
   }
   const source =
     sender.track && typeof sender.track.getSettings === "function"
-      ? sender.track.getSettings()
+      ? senderCaptureTrack(sender.track).getSettings()
       : undefined;
-  const ceiling = QUALITY_RESOLUTIONS[profile.resolution];
+  const ceiling = profile.resolution;
   if (!source?.width || !source.height) {
     return 1;
   }
@@ -390,7 +443,10 @@ export async function configureVideoSender(
   if (parameters.encodings.length === 1) {
     encoding.scaleResolutionDownBy = carrierScale ?? requestedScaleResolutionDownBy(sender, profile);
   }
-  parameters.degradationPreference = profile.degradationPreference;
+  // The carrier transports already-adapted frames. Native FPS adaptation on
+  // that clock would discard them a second time and repeatedly break the queue.
+  parameters.degradationPreference = carrierScale === undefined
+    ? profile.degradationPreference : "maintain-framerate";
 
   const requested = readVideoSenderParameters(parameters, false, encodingIndex);
   await sender.setParameters(parameters);
@@ -402,9 +458,39 @@ export async function configureVideoSender(
   return senderParameterReadback(requested, applied);
 }
 
+export function screenAudioSenderCeiling(current: RTCRtpSendParameters, requestedMaxBitrate: number): number {
+  // Some Browsers accept setParameters above the negotiated Opus receive limit.
+  // Keep that limit on this sender, never on the shared capture or sibling edges.
+  let ceiling = Math.min(requestedMaxBitrate, MAX_SCREEN_AUDIO_BITRATE);
+  for (const codec of current.codecs ?? []) {
+    if (codec.mimeType.toLowerCase() !== "audio/opus") continue;
+    let receiveLimit: number | undefined;
+    let playbackRate = 48_000;
+    let channels = 1;
+    for (const parameter of (codec.sdpFmtpLine ?? "").split(";")) {
+      const [name, value] = parameter.trim().split("=");
+      const key = name?.trim().toLowerCase();
+      const number = Number(value);
+      if (key === "stereo") channels = value?.trim() === "1" ? 2 : 1;
+      if (key === "maxplaybackrate" && Number.isInteger(number) && number >= 8_000 && number <= 48_000) {
+        playbackRate = number;
+      }
+      // RFC 7587 ignores out-of-range receive preferences.
+      if (key === "maxaveragebitrate" && Number.isInteger(number) && number >= MIN_AUDIO_BITRATE && number <= MAX_AUDIO_BITRATE) {
+        receiveLimit = Math.min(receiveLimit ?? MAX_AUDIO_BITRATE, number);
+      }
+    }
+    // Match libwebrtc's default when the peer omits a valid explicit ceiling;
+    // omission must not let setParameters override the default with a higher rate.
+    const defaultBitrate = (playbackRate <= 8_000 ? 12_000 : playbackRate <= 16_000 ? 20_000 : 32_000) * channels;
+    ceiling = Math.min(ceiling, receiveLimit ?? defaultBitrate);
+  }
+  return ceiling;
+}
+
 export async function configureScreenAudioSender(
   sender: RTCRtpSender,
-  quality?: ScreenAudioQuality,
+  requestedMaxBitrate: number,
 ): Promise<AudioSenderParameterReadback> {
   const current = sender.getParameters();
   const parameters = {
@@ -414,8 +500,7 @@ export async function configureScreenAudioSender(
   if (parameters.encodings.length === 0) {
     parameters.encodings = [{}];
   }
-  const requestedMaxBitrate = screenAudioBitrate(quality);
-  parameters.encodings[0]!.maxBitrate = requestedMaxBitrate;
+  parameters.encodings[0]!.maxBitrate = screenAudioSenderCeiling(current, requestedMaxBitrate);
   await sender.setParameters(parameters);
   const appliedMaxBitrate =
     sender.getParameters().encodings[0]?.maxBitrate ?? null;

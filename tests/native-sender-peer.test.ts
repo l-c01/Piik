@@ -18,6 +18,9 @@ describe("native Host peer quality", () => {
     invalidateSenderQualityEvidence();
     let listener: (event: NativeClientEvent) => void = () => undefined;
     const control: NativeEdgeControl = {
+    preparePunch: vi.fn(async () => null),
+    runPunch: vi.fn(async () => false),
+    closePunch: vi.fn(async () => undefined),
       updateShare: vi.fn(async () => undefined),
       prepareEdge: vi.fn<NativeEdgeControl["prepareEdge"]>(async () => ({
         type: "offer",
@@ -67,7 +70,7 @@ describe("native Host peer quality", () => {
       qualityProbe: true,
     })).toBe(false);
     listener({
-      version: 9,
+      version: 10,
       type: "edge-state",
       shareId: "share_1234567",
       connectionId: "edge_12345678",
@@ -75,7 +78,7 @@ describe("native Host peer quality", () => {
     });
 
     const quality = {
-      version: 9 as const,
+      version: 10 as const,
       type: "edge-quality" as const,
       shareId: "share_1234567",
       connectionId: "edge_12345678",
@@ -117,6 +120,9 @@ describe("native Host peer quality", () => {
   it("applies the latest relay ceiling before preparing a child", async () => {
     let profile: QualitySettings = DEFAULT_QUALITY_SETTINGS;
     const control: NativeEdgeControl = {
+    preparePunch: vi.fn(async () => null),
+    runPunch: vi.fn(async () => false),
+    closePunch: vi.fn(async () => undefined),
       updateShare: vi.fn(async () => undefined),
       prepareEdge: vi.fn(async () => ({ type: "offer" as const, sdp: "v=0\r\n" })),
       acceptSignal: vi.fn(async () => undefined),

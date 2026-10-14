@@ -7,10 +7,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TNTcraftHIM/Piik/internal/app/nativecapture"
 	"github.com/TNTcraftHIM/Piik/internal/media/encoded"
 	"github.com/livekit/livekit-server/pkg/sfu"
+	"github.com/pion/ice/v4"
+	"github.com/pion/interceptor"
+	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
+	"github.com/pion/transport/v5/vnet"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -39,7 +44,11 @@ func TestRelayInputKeepsRecoveryAndEmitsACompleteQuietFrame(t *testing.T) {
 	}
 
 	input = relayVideoInput{codec: "h264"}
-	configuration, _ := hex.DecodeString("000000016742c01eda0280b7fe5c050505020000000168ce06e2")
+	var configuration []byte
+	for _, nal := range sfu.H264KeyFrame2x2[:2] {
+		configuration = append(configuration, 0, 0, 0, 1)
+		configuration = append(configuration, nal...)
+	}
 	if _, err = input.frame(configuration); err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +57,103 @@ func TestRelayInputKeepsRecoveryAndEmitsACompleteQuietFrame(t *testing.T) {
 		!bytes.Contains(frame.Data, input.pps) {
 		t.Fatal("H264 IDR lost preceding decoder configuration")
 	}
+}
+
+func TestRelayInputRejectsUnsafeH264Configuration(t *testing.T) {
+	// Generated Constrained Baseline SPS: ID 0 is 5120x2880; ID 1 is
+	// 160x90. A decoder may use either, regardless of which arrived last.
+	const oversized = "6742c034da0050005a64"
+	const small = "6742c015570a37e4c05a8303035280000003008000000301478b17c0"
+	for _, test := range []struct {
+		name string
+		nals []string
+	}{
+		{"oversize-hidden-by-small-SPS", []string{oversized, small}},
+		{"oversize-after-small-SPS", []string{small, oversized}},
+		{"truncated-SPS", []string{small, "6742c015"}},
+		{"truncated-VUI", []string{"6742c01eda0280b7fe5c0505050200"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var data []byte
+			for _, value := range test.nals {
+				nal, err := hex.DecodeString(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = append(data, 0, 0, 0, 1)
+				data = append(data, nal...)
+			}
+			input := relayVideoInput{codec: "h264"}
+			if _, err := input.frame(data); err == nil {
+				t.Fatal("unsafe configuration reached the native decoder boundary")
+			}
+		})
+	}
+	input := relayVideoInput{codec: "h264"}
+	data, err := hex.DecodeString("00000001" + small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := input.frame(data)
+	if err != nil || frame.Width != 160 || frame.Height != 90 {
+		t.Fatalf("valid cropped SPS was rejected: %dx%d, %v", frame.Width, frame.Height, err)
+	}
+}
+
+func TestRelayH264AllocationBounds(t *testing.T) {
+	// Minimal Constrained Baseline parameter sets, including valid codec padding
+	// and coded dimensions hidden behind a small crop. No decoder is allocated.
+	for _, test := range []struct {
+		name, sps     string
+		width, height uint32
+	}{
+		{"1440p", "6742c033da00a002d640", 2560, 1440},
+		{"padded-1080p", "6742c033da01e0089f95", 1920, 1080},
+		{"portrait-within-bound", "6742c033da01100b5e5d", 1080, 1440},
+		{"4k", "6742c033da00f0010f90", 3840, 2160},
+		{"portrait-4k", "6742c033da008701e190", 2160, 3840},
+		{"level-5.2-4k", "6742c034da00f0010f90", 3840, 2160},
+		{"level-5.2-portrait-4k", "6742c034da008701e190", 2160, 3840},
+		{"level-5.2-dci", "6742c034da0040004864", 4096, 2304},
+		{"level-5.2-ultrawide", "6742c034da005000b590", 5120, 1440},
+		{"level-5.2-portrait-ultrawide", "6742c034da0168028190", 1440, 5120},
+		{"padded-4k", "6742c033da00f00111f894", 3840, 2160},
+		{"4k-reference-buffer-limit", "6742c033f300780087c8", 3840, 2160},
+		{"4k-reference-buffer-overflow", "6742c033f380780087c8", 0, 0},
+		{"level-5.2-reference-buffer-overflow", "6742c034f380780087c8", 0, 0},
+		{"level-5.2-cropped-storage-overflow", "6742c034da00f001e1f8034940", 0, 0},
+		{"large-cropped-storage", "6742c033da00f001e1f8034940", 0, 0},
+		{"crop-overflow", "6742c033da0a37e000000300100000030004", 0, 0},
+		{"coded-size-overflow", "6742c033da000003000040000003000d90", 0, 0},
+		{"excessive-references", "6742c033d84828d9", 0, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := hex.DecodeString(test.sps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			width, height, err := relayH264Size(data)
+			if (err == nil) != (test.width != 0) || width != test.width || height != test.height {
+				t.Fatalf("picture = %dx%d, %v; want %dx%d", width, height, err, test.width, test.height)
+			}
+		})
+	}
+}
+
+func FuzzRelayH264Size(f *testing.F) {
+	for _, value := range []string{"6742c033da00f0010f90", "6742c033da008701e190", "6742c033da00f00111f894", "6742c015"} {
+		data, err := hex.DecodeString(value)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		width, height, err := relayH264Size(data)
+		if err == nil && !nativecapture.ValidVideoSize(width, height) {
+			t.Fatalf("unbounded picture accepted: %dx%d", width, height)
+		}
+	})
 }
 
 func TestLargeRecoveryUsesTheDefaultPacketWindow(t *testing.T) {
@@ -79,9 +185,27 @@ func TestLargeRecoveryUsesTheDefaultPacketWindow(t *testing.T) {
 	if len(packets) <= 500 || len(packets) > encoded.MaxPacketWindow {
 		t.Fatal("fixture does not exercise the packet window boundary")
 	}
+	// Isolate packet-window capacity from host UDP receive-buffer overflow.
+	// The production sender, SRTP transport and frame assembler still run here.
+	router, err := vnet.NewRouter(&vnet.RouterConfig{CIDR: "10.0.0.0/24",
+		QueueSize: encoded.MaxPacketWindow, LoggerFactory: logging.NewDefaultLoggerFactory()})
+	check(err)
+	sendNet, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.0.0.1"}})
+	check(err)
+	receiveNet, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.0.0.2"}})
+	check(err)
+	check(router.AddNet(sendNet))
+	check(router.AddNet(receiveNet))
+	check(router.Start())
+	defer router.Stop()
 	engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", IncludeLoopback: true, InitialBitrate: 12_000_000})
 	check(err)
 	defer engine.Close()
+	engine.listenPacket = sendNet.ListenPacket
+	engine.bindAddress = "10.0.0.1:0"
+	engine.settings.SetNet(sendNet)
+	engine.settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	engine.settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	source, err := engine.NewSource("h264", 1, 1, nil)
 	check(err)
 	defer source.Close()
@@ -90,7 +214,17 @@ func TestLargeRecoveryUsesTheDefaultPacketWindow(t *testing.T) {
 	edge, err := engine.NewEdge(source, EdgeOptions{ConnectionID: "large-recovery"})
 	check(err)
 	defer edge.Close()
-	receiver := newReceiver(t)
+	media := &webrtc.MediaEngine{}
+	check(media.RegisterDefaultCodecs())
+	registry := &interceptor.Registry{}
+	check(webrtc.RegisterDefaultInterceptors(media, registry))
+	settings := webrtc.SettingEngine{}
+	settings.SetNet(receiveNet)
+	settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	receiver, err := webrtc.NewAPI(webrtc.WithMediaEngine(media), webrtc.WithInterceptorRegistry(registry),
+		webrtc.WithSettingEngine(settings)).NewPeerConnection(webrtc.Configuration{})
+	check(err)
 	defer receiver.Close()
 	var complete atomic.Bool
 	receiver.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -134,9 +268,8 @@ func TestLargeRecoveryUsesTheDefaultPacketWindow(t *testing.T) {
 
 func TestRelayAssemblyRecoversAtNewIndependentFrame(t *testing.T) {
 	key, _ := hex.DecodeString("1000009d012aa0005a00")
-	sps, _ := hex.DecodeString("6742c01eda0280b7fe5c0505050200")
-	pps := []byte{0x68, 0xce, 0x06, 0xe2}
-	idr := []byte{0x65, 0x88, 0x84}
+	sps, pps := sfu.H264KeyFrame2x2[0], sfu.H264KeyFrame2x2[1]
+	idr := sfu.H264KeyFrame2x2IDR
 	stap := []byte{0x78}
 	for _, nal := range [][]byte{sps, pps, idr} {
 		stap = append(stap, byte(len(nal)>>8), byte(len(nal)))

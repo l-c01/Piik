@@ -187,6 +187,21 @@ func TestLoadSFUOptional(t *testing.T) {
 	}
 }
 
+func TestSFUOnlyRequiresAnEnabledListener(t *testing.T) {
+	configuration := mustLoad(t, map[string]string{"SFU_UDP_PORT": "7882", "SFU_ONLY": "true"})
+	if !configuration.SFU.Only {
+		t.Fatal("SFU_ONLY was ignored")
+	}
+	for _, values := range []map[string]string{
+		{"SFU_ONLY": "true"},
+		{"SFU_ONLY": "yes", "SFU_UDP_PORT": "7882"},
+	} {
+		if _, err := Load(values); err == nil {
+			t.Fatalf("accepted invalid SFU policy: %v", values)
+		}
+	}
+}
+
 func TestLoadAccepts(t *testing.T) {
 	developmentPath, err := filepath.Abs(filepath.Join("state", "rooms.sqlite"))
 	if err != nil {
@@ -481,11 +496,11 @@ func TestLoadRejects(t *testing.T) {
 		{"removed peer-assisted toggle", map[string]string{"PEER_ASSISTED_MEDIA": "true"},
 			"PEER_ASSISTED_MEDIA is no longer supported; peer-assisted media is always enabled"},
 		{"removed room TTL", map[string]string{"ROOM_TTL_SECONDS": ""},
-			"ROOM_TTL_SECONDS is no longer supported; rooms do not expire"},
+			"ROOM_TTL_SECONDS is no longer supported; use ROOM_EMPTY_TIMEOUT_SECONDS for empty-room retention"},
 		{"removed room lease", map[string]string{"ROOM_LEASE_SECONDS": "86400"},
-			"ROOM_LEASE_SECONDS is no longer supported; rooms do not expire"},
+			"ROOM_LEASE_SECONDS is no longer supported; use ROOM_EMPTY_TIMEOUT_SECONDS for empty-room retention"},
 		{"blank removed room lease", map[string]string{"ROOM_LEASE_SECONDS": ""},
-			"ROOM_LEASE_SECONDS is no longer supported; rooms do not expire"},
+			"ROOM_LEASE_SECONDS is no longer supported; use ROOM_EMPTY_TIMEOUT_SECONDS for empty-room retention"},
 		{"removed access password", map[string]string{"ACCESS_PASSWORD": "legacy-password"},
 			"ACCESS_PASSWORD is no longer supported; use SITE_ACCESS_PASSWORD"},
 		{"blank access password", map[string]string{"ACCESS_PASSWORD": ""},

@@ -46,7 +46,7 @@ topologies and makes a saved Site unavailable while another room source runs.
    public process identity, not authentication. The listener accepts the current
    Local Host origin and the one user-saved Site origin. Origin and Host
    validation plus the Browser's local-network permission own this boundary.
-4. Loopback v9 starts with a strict `hello` handshake. Up to two participant
+4. Native control starts with a strict `hello` handshake. Up to two participant
    control sessions may coexist; each retains its own share and media lifetime.
    This bounds concurrent Native work, not the shared server's room count.
    Ending one control session cannot end another; App exit waits for all
@@ -69,11 +69,15 @@ topologies and makes a saved Site unavailable while another room source runs.
    wrapper or UI.
 6. The system Browser remains the UI. Browser extensions, userscripts, Electron,
    Tauri, and resident services need new evidence before they can replace this
-   smaller boundary. An App-opened Site stores a non-secret opt-in at that
-   exact Browser origin, so later manually opened pages may discover the running
-   App. Pages without that opt-in do not probe localhost or request local-
-   network permission. Clearing Site data simply requires opening it from the
-   App again.
+   smaller boundary. An App-opened or explicitly connected Site stores a
+   non-secret opt-in at that exact Browser origin, so later pages may discover
+   the running App. Without this opt-in, only the user's App connection action
+   starts discovery. Its public loopback discovery returns process identity and
+   a local approval URL, never native capability, source or preference data.
+   The App-owned approval page displays the exact requesting origin and requires
+   confirmation before saving it. It rejects cross-origin mutations and framing;
+   the Site cannot approve itself. A popup message requests an authorized health
+   recheck, not authorization. Clearing Site data requires connecting again.
 7. A self-contained Local deployment serves reachable LAN peers without a
    central Piik service. Its explicit `--link` mode starts one accountless
    Cloudflare Quick Tunnel for the same HTTP/WebSocket surface. The App
@@ -96,9 +100,11 @@ topologies and makes a saved Site unavailable while another room source runs.
     existing Browser peer. One isolated
    platform capture feeds one encoded source and bounded independent Pion
    transports, with process-loopback audio for windows or system-loopback audio
-   for screens sharing the same PeerConnection when available. Each Site or one-link share makes one bounded, best-effort PCP,
-   UPnP, or NAT-PMP mapping for that same Pion UDP socket before its first edge
-   gathers ICE; pure LAN Local mode does not. Once ordinary STUN observes a
+   for screens sharing the same PeerConnection when available. Each physical Native
+   connection owns an independent UDP socket; discovery and media share that
+   socket, including after ICE restart. Site and one-link P2P connections request
+   a bounded, best-effort PCP, UPnP, or NAT-PMP mapping alongside gathering;
+   pure LAN Local connections do not. Once ordinary STUN observes a
    public address, Native advertises the mapped port as one lower-priority,
    srflx-shaped candidate on that address. Absence or rejection leaves ordinary
    ICE/STUN unchanged. Native P2P quality uses Pion's transport-wide
@@ -128,19 +134,20 @@ topologies and makes a saved Site unavailable while another room source runs.
    extra threshold, timer, score, route operation, or representation ladder is
    added. Only a consumed App-launch marker travels in the URL fragment.
    Exact target identity travels over loopback.
-9. The App uses the system Browser as its only UI. On every launch, the current
-   lightweight control center offers Local, public link, and Site. The Site value
-   is stored in App configuration and remains one click on later launches;
-   selecting Local or public link does not disable background RPC access for the
-   saved Site. Command-line mode
-   selectors remain automation inputs rather than the normal interface. An
+9. The App uses the system Browser as its only UI. It remains available to the
+   saved Site before a room mode is chosen. Its persistent launcher offers Local
+   and public link, shows the approved Site and allows revocation. Starting a
+   Local/public room does not disable that Site's native access or approval UI;
+   neither visiting the launcher nor approving a Site creates a room. Command-line
+   entry selectors remain automation inputs rather than the normal interface. An
    embedded shell requires a reproduced product failure and one comparative
    decision.
 10. Local mode is one explicit server composition: static current assets,
     memory-only rooms, peer-assisted media, no SQLite or SFU, and localhost plus
     current LAN IPv4 origins. It uses no public discovery by default. Public-link
-    mode adds its temporary HTTPS origin, one ordinary public STUN destination,
-    and two bounded public survey destinations. Site mode consumes that Site's
+    mode adds its temporary HTTPS origin and the bounded public STUN discovery
+    and survey configuration in [ADR-0009](0009-optional-nat-prediction.md).
+    A participant on an approved Site consumes that Site's
     configured STUN survey. Both feed the same connection-local prediction
     adapter; Native additionally owns its UDP socket and best-effort port mapping.
 11. One App configuration owns the optional Site origin and an optional,
@@ -149,12 +156,21 @@ topologies and makes a saved Site unavailable while another room source runs.
     App bootstraps a selected page through a fragment consumed before
     authentication; the page retains only the non-secret App opt-in at its
     origin. Friends use the existing room invitation grant. No App-specific
-    room authorization system is added.
+    room authorization system is added. Site replacement/revocation uses this
+    same configuration owner, immediately denies new control requests from the
+    old origin and cancels its existing sessions. Retirement is bounded and does
+    not wait for unrelated Local sessions. Cleanup failure never restores the
+    revoked permission; concurrent approval pages must review a changed Site
+    before replacing it.
 12. Local authority shutdown first ends every in-memory room through the current
     `room-closed` path, then closes signaling and HTTP. The App cancels the
     server context, calls that end-then-close sequence under one bounded
-    timeout, and only then closes the public tunnel and the loopback service. It
-    does not restart a vanished authority.
+    timeout, and only then closes the public tunnel. Interactive room failure
+    leaves the resident App, approved Site sessions and approval UI available;
+    the launcher invalidates the failed room's target and reports its error.
+    Process exit additionally retires the loopback service. Explicit CLI room
+    launches still return their failure to the caller. Neither path restarts a
+    vanished authority.
 13. App assembly consumes the immutable application release from the same full
     Git revision and an explicit supported target. The Go binary embeds that
     release's built Browser assets and the package `REVISION` records the same
@@ -228,6 +244,7 @@ architectural claim.
 - [Cloudflare Tunnel WebSocket support](https://developers.cloudflare.com/cloudflare-one/faq/cloudflare-tunnels-faq/)
 - [RFC 6455 WebSocket Origin model](https://www.rfc-editor.org/rfc/rfc6455.html)
 - [Chrome Local Network Access](https://developer.chrome.com/blog/local-network-access)
+- [Browser popup message origin/source checks](https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage#security_concerns)
 - [Discord local RPC](https://docs.discord.com/developers/topics/rpc)
 - [OBS WebSocket protocol](https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md)
 - [LocalSend protocol](https://github.com/localsend/protocol/blob/main/README.md)

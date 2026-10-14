@@ -1,4 +1,5 @@
 import { SIGNALING_PROTOCOL } from "../../shared/protocol";
+import { downloadBlob } from "./download";
 
 type DebugValue = null | boolean | number | string | DebugValue[] | { [key: string]: DebugValue };
 type DebugDetails = object;
@@ -30,7 +31,7 @@ const events: Array<{ record: BrowserDebugEvent; bytes: number }> = [];
 const startedAt = new Date().toISOString();
 const started = performance.now();
 let sequence = 0, retainedBytes = 0, evictedEvents = 0, truncatedEvents = 0;
-const secretKey = /(?:token|password|passwd|secret|credential|authorization|cookie|private.?key|ice.?pwd|ufrag|usernamefragment|sdp|grant)|^(?:candidate|title|displayName)$/i;
+const secretKey = /(?:token|password|passwd|secret|credential|authorization|cookie|private.?key|ice.?pwd|ufrag|usernamefragment|sdp|grant)|^(?:candidate|title|displayName|text)$/i;
 
 function safeText(value: string): string {
   return value
@@ -187,14 +188,8 @@ export async function exportBrowserDebug(): Promise<string> {
 }
 
 export async function downloadBrowserDebug(): Promise<void> {
-  const blob = new Blob([await exportBrowserDebug()], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  try {
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `piik-browser-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-    link.click();
-  } finally { setTimeout(() => URL.revokeObjectURL(url), 0); }
+  downloadBlob(new Blob([await exportBrowserDebug()], { type: "application/json" }),
+    `piik-browser-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
 }
 
 export function installBrowserDebug(): (() => void) | undefined {

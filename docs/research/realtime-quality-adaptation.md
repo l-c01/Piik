@@ -30,6 +30,35 @@
   cannot prove an unconnected parent is better or authorize parent-wide/SFU
   routing changes.
 
+## Go GC Attribution
+
+A stall or resolution drop alone does not identify garbage collection. The
+relevant boundary is the selected media path:
+
+| Path | Go's role |
+| --- | --- |
+| Browser capture and Browser P2P/relay | Chrome owns capture, encoding and RTP. Go owns room/signaling; its GC does not directly pause those Browser media workers. Control delays and shared-machine resource pressure remain possible indirect effects. |
+| Native App | The capture helper owns encoding; Go reads its output and runs Pion/LiveKit transport. Go scheduling or allocation pressure can delay frame ingestion, packet delivery or feedback. |
+| Embedded SFU or Native relay | Go participates in forwarding, so its runtime is on the media path. |
+
+The [Browser adaptation comparisons](./browser-local-encoding-pool.md#sustained-h264-recovery)
+include low-output recovery in an isolated Chrome/Node harness without a Go
+process. Go GC is therefore not necessary for those reproductions; this does
+not diagnose every field blur, drop or Native/SFU interruption.
+
+Go's [GC guide](https://go.dev/doc/gc-guide#Latency) distinguishes brief global
+pauses from concurrent CPU cost, allocation assists and scheduling delays. A
+small pause total alone cannot rule out runtime pressure. Before tuning GC,
+correlate the same attempt's source/encoder progress, RTP/loss/RTT, selected
+route and receiver frames with the relevant Go process. Existing diagnostic
+`memory.json` contains GC counts, recent pause durations/end times and cumulative
+GC CPU fraction; `heap.pprof` identifies sampled allocations. These are snapshots,
+not a continuous latency trace. Use a bounded local Go execution trace/CPU profile
+or `GODEBUG=gctrace=1` reproduction when the snapshots justify it, following
+[Go diagnostics](https://go.dev/doc/diagnostics); no public profiler is needed.
+Current evidence does not justify disabling GC, imposing a memory limit or
+replacing the Go transport. The unmatched field reports remain in [TODO](../todo.md).
+
 ## VP8 Cost And Hardware Boundary
 
 Chromium 151's Windows Media Foundation and D3D12 WebRTC encoder factories did
@@ -146,17 +175,28 @@ This isolates the observed AMD failure to outer bitrate-control/frame-drop
 interaction, not a fixed MFT throughput ceiling. The page cannot enable the
 process feature, override Chromium's AMD workaround, or select a different MFT.
 
-Upstream status checked on 2026-09-28: Chromium main's
+Upstream status checked on 2026-10-14: Chromium main's
 [driver bug list](https://raw.githubusercontent.com/chromium/chromium/main/gpu/config/gpu_driver_bug_list.json)
 entry 449 still disables H.264 software bitrate control on AMD Windows without
 a driver-version exception
 ([crbug 417752242](https://issues.chromium.org/issues/417752242)).
+The [AMD override](https://raw.githubusercontent.com/chromium/chromium/main/media/gpu/windows/mf_video_encoder_switches.cc)
+also remains disabled by default in main and Chrome 154.0.8037.98.
 This source establishes the Browser workaround, not the state of every AMD
 driver or native device. The earlier measured low-cadence output supports keeping
 an actual-output gate rather than inferring compatibility from a device name.
 Windows native Auto likewise measures through its live pipeline, including the
 untrusted rate controller and frame dropper. Matching native AMD physical
 evidence remains pending.
+
+Chromium's separate [2026-10-06 MFVEA repair](https://chromium.googlesource.com/chromium/src/+/b12ee1f641ce7de36d6c5c97b1b3ee5d3f6090c9)
+recreates software rate control when the encoded dimensions change; its stated
+trigger is a VP9 rate controller failing when resolution increases. It neither
+removes the AMD H264 workaround above nor establishes restored cadence on the
+affected devices. Browser GPU preference can change the chosen hardware path,
+but integrated versus discrete GPU is not a reliable encoder-quality rule.
+Native selection already tries available adapter/encoder candidates; changing
+Chrome's preference does not select the App's capture device.
 
 Later exact Browser cohorts demonstrated why runtime evidence is useful:
 
@@ -325,9 +365,9 @@ settings remained at 30 fps; the server process, kernel queues, and network
 device reported no contemporaneous resource or drop pressure. The deployed
 LiveKit Server 1.13.5 also predates the upstream simulcast RTX pairing repair:
 under the affected Pion integration, repair streams were not paired and
-retransmissions were silently dropped. LiveKit Server 1.13.6 is therefore the
-accepted patch baseline. This repairs loss recovery; it does not claim to
-prevent loss on the Host-to-SFU UDP path.
+retransmissions were silently dropped. LiveKit Server 1.13.6 established the
+RTX-repair baseline; `go.mod` owns the current dependency pin. This repairs loss
+recovery; it does not claim to prevent loss on the Host-to-SFU UDP path.
 
 The same later room also contained a separate interval in which the native
 bandwidth estimate stayed near 13 Mbps while the sender media-source cadence

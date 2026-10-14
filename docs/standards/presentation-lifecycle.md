@@ -24,10 +24,41 @@ room identity, current state, roster, and one manual media-reconnect action.
 Controls and text must remain usable without overlap or horizontal overflow on
 desktop and mobile viewports.
 
-Piik App opens this same application in the system Browser. Its small
-startup surface selects Local, temporary public invitation, or a configured
-Site before entering the Host workspace. Viewer links opened at that activated
-origin may use the same running App without changing the Viewer UI. Starting a share offers the
+A capable, opted-in authenticated room session
+outlives its current publication. Stopping capture retires media, not chat;
+restoring an existing room joins it without starting capture. Entering the page
+alone does not create a room. Room close, lost authority and page teardown still
+retire the session, including its App control connection and pending discovery.
+That retirement cannot wait for the denied page to unmount. Connected Viewers may keep interacting while the Host page
+is absent, provided the room service and their admitted sessions remain available.
+[Rooms and access](./rooms-access.md#room-interactions) owns interaction authority
+and retention; [status](../status.md#accepted-interaction-phase) owns release readiness.
+
+On capable desktop browsers, chat can move to a Document Picture-in-Picture
+window. It remains one presentation of the admitted room session, with the same
+draft and history. Read visibility and guidance follow its current document.
+Closing the window returns chat to the page; room retirement or opener teardown
+closes it, including a late asynchronous open. Browser window support does not
+promise game-overlay transparency, click-through or exclusive-fullscreen coverage.
+
+Piik App opens this same application in the system Browser. Its startup surface
+offers Local and temporary public invitation; the running App is already
+available to its approved Site before either mode starts. A Site's explicit App
+action discovers the local approval page, where the user confirms its exact
+origin. The launcher shows and revokes that approval. Activating a page supplies
+native capability without restarting its room or healthy media session.
+The source selector exposes that same connection action before sharing; a
+successful connection refreshes its current list. An already approved exact
+origin needs no repeat confirmation, but the page still verifies authorized App
+health. Closing the selector cancels its pending connection action. Existing
+Browser shares retain their capture implementation until sharing ends.
+App-created Local/public-invite Host pages open at their automatically approved
+loopback origin. The shared App button reflects verified authorized health,
+including activation through another entry and return to an activated page;
+a remembered activation alone cannot show readiness. Idle verification holds
+no media session or polling loop.
+Viewer links opened at that activated origin may use the same running App
+without changing the Viewer UI. Starting a share offers the
 Browser picker and any exact App-owned native windows. It never chooses a
 window automatically. A reproduced Browser-window, capture, or background
 failure is required before introducing an embedded Web runtime.
@@ -53,8 +84,9 @@ blocks Browser selection or overrides an explicitly chosen tab. Refresh remains
 reachable after failed App discovery; pending attempts are shared, completed failures
 do not suppress later discovery. Cancelling the selector or ending a share
 releases its unused control session; an obsolete operation cannot install or
-retire another operation's media. Camera thumbnails own only temporary preview
-inputs; leaving their tab or picker retires them. An active shared camera is
+retire another operation's media. Cancellation covers discovery and the opening
+handshake, not just a connection returned later. Camera thumbnails own only
+temporary preview inputs; leaving their tab or picker retires them. An active shared camera is
 borrowed, never reopened or stopped by preview. Optional native ingress uses an already
 available connection without another scan. If it is not ready at Browser
 startup, that share keeps Browser senders.
@@ -226,11 +258,25 @@ recovery state still requires a fresh current frame to clear. SFU media is
 retained independently of transient room-signaling loss, but Browser or OS
 suspension and page reclamation remain outside Web guarantees.
 
-Failure of the local Native media bridge disables Native reception for the
+The local Native media bridge owns bounded ICE recovery on its existing
+connection and stream. Its offer identity fences each answer; retirement cancels
+pending negotiation and cannot recreate a source or receiver. Connection recovery
+does not assert fresh media, and an intentionally paused source is not a failure.
+First-frame and playback owners retain their existing evidence requirements.
+
+Terminal failure of the local Native media bridge disables Native reception for the
 current Viewer session before route recovery runs. Future peers in that session
 use Browser reception; existing healthy peers are not torn down by this choice.
 Parent-network failure alone is not evidence that the local Native capability
 is unavailable.
+
+The Native Host's local bridge remains required by its Browser share owner:
+the stream supplies preview and Browser quality candidates and participates in
+source and quality changes. A terminal failure retires that share through the
+existing Host lifecycle; it is not merely a missing preview. An individual
+downstream network failure instead recovers that edge and does not retire the
+bridge or capture. Browser capture's optional Native fanout can fall back to
+Browser senders because the Browser still owns its source.
 
 ## Presence And Diagnostics
 

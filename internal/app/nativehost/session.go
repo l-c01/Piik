@@ -67,6 +67,7 @@ type Options struct {
 	Video            nativecapture.VideoOptions
 	Profile          QualityProfile
 	AudioEnabled     bool
+	ExcludeAudio     *nativecapture.CaptureTarget
 	MicrophoneMixing bool
 	EdgeCapacity     int
 	BindAddress      string
@@ -138,6 +139,7 @@ func Start(parent context.Context, options Options) (*Session, error) {
 			parent,
 			options.CaptureProcess,
 			options.Video.Target,
+			options.ExcludeAudio,
 		)
 		if audioErr != nil {
 			slog.DebugContext(parent, "piik-client", "event", "capture-audio-unavailable", "share", diagnostics.ID(options.ShareID), diagnostics.Error(audioErr))
@@ -232,20 +234,30 @@ func (session *Session) HasAudio() bool {
 func (session *Session) PrepareEdge(
 	connectionID string,
 	iceServers []webrtc.ICEServer,
+	punched bool,
 ) (webrtc.SessionDescription, error) {
-	return session.prepareEdge(connectionID, iceServers, false)
+	return session.prepareEdge(connectionID, iceServers, "", punched)
 }
 
 func (session *Session) PrepareLocalEdge(
-	connectionID string,
+	connectionID, offerID string,
+	restart bool,
 ) (webrtc.SessionDescription, error) {
-	return session.prepareEdge(connectionID, nil, true)
+	if restart {
+		edge := session.edge(connectionID)
+		if edge == nil {
+			return webrtc.SessionDescription{}, errors.New("native local media edge does not exist")
+		}
+		return edge.CreateLocalOffer(session.ctx, offerID, true)
+	}
+	return session.prepareEdge(connectionID, nil, offerID, false)
 }
 
 func (session *Session) prepareEdge(
 	connectionID string,
 	iceServers []webrtc.ICEServer,
-	local bool,
+	localOfferID string,
+	punched bool,
 ) (webrtc.SessionDescription, error) {
 	session.mu.Lock()
 	if session.closed || session.edges[connectionID] != nil {
@@ -257,7 +269,8 @@ func (session *Session) prepareEdge(
 		ConnectionID: connectionID,
 		ICEServers:   iceServers,
 		Audio:        session.audioSource,
-		Local:        local,
+		Local:        localOfferID != "",
+		Punched:      punched,
 		Events: mediaedge.EdgeEvents{
 			LocalCandidate: func(candidate *webrtc.ICECandidateInit) {
 				session.emit(Event{
@@ -294,7 +307,12 @@ func (session *Session) prepareEdge(
 	}
 	session.edges[connectionID] = edge
 	session.mu.Unlock()
-	offer, err := edge.CreateOffer()
+	var offer webrtc.SessionDescription
+	if localOfferID != "" {
+		offer, err = edge.CreateLocalOffer(session.ctx, localOfferID, false)
+	} else {
+		offer, err = edge.CreateOffer()
+	}
 	if err != nil {
 		session.CloseEdge(connectionID)
 		return webrtc.SessionDescription{}, err
@@ -302,12 +320,12 @@ func (session *Session) prepareEdge(
 	return offer, nil
 }
 
-func (session *Session) SetAnswer(connectionID string, answer webrtc.SessionDescription) error {
+func (session *Session) SetAnswer(connectionID string, answer webrtc.SessionDescription, offerID string) error {
 	edge := session.edge(connectionID)
 	if edge == nil {
 		return errors.New("native media edge does not exist")
 	}
-	return edge.SetAnswer(answer)
+	return edge.SetAnswer(answer, offerID)
 }
 
 func (session *Session) AddCandidate(
@@ -401,6 +419,7 @@ func (session *Session) UpdateProfile(profile QualityProfile) error {
 func (session *Session) ReplaceSource(
 	options nativecapture.VideoOptions,
 	audioEnabled bool,
+	excludeAudio *nativecapture.CaptureTarget,
 ) error {
 	session.updateMu.Lock()
 	defer session.updateMu.Unlock()
@@ -416,15 +435,40 @@ func (session *Session) ReplaceSource(
 	options.EncoderIndex = session.videoOptions.EncoderIndex
 	options.OutputGroups = session.edgeCapacity
 	hasAudio := session.audioSource != nil && session.audioStream != nil
+	currentTarget := session.videoOptions.Target
+	audioOnly := options.Target.Kind != "picker" &&
+		options.Target.Kind == currentTarget.Kind && options.Target.SourceID == currentTarget.SourceID &&
+		options.Target.PID == currentTarget.PID && options.Target.CreationTime == currentTarget.CreationTime &&
+		options.ShowCaptureBorder == session.videoOptions.ShowCaptureBorder
 	session.mu.Unlock()
 	if session.mixer == nil && audioEnabled != hasAudio {
 		return errors.New("native source audio availability cannot change while sharing")
 	}
+	if excludeAudio != nil {
+		if session.mixer == nil {
+			return errors.New("native audio exclusion requires mixed audio")
+		}
+		// A privacy change retires the old source before preparation. Failure must
+		// leave it silent rather than retaining unfiltered audio; video/mic stay live.
+		session.mu.Lock()
+		previousAudio := session.audioStream
+		session.audioStream = nil
+		session.mu.Unlock()
+		session.mixer.setSource(nil)
+		if previousAudio != nil {
+			_ = previousAudio.Close()
+		}
+	}
 	options.Profile = profile.Video
 	options.RestoreToken = ""
-	replacement, state, err := session.prepareVideo(session.ctx, options, options.Target.Kind == "picker", false)
-	if err != nil {
-		return err
+	var replacement *nativecapture.Stream
+	var state CaptureState
+	var err error
+	if !audioOnly {
+		replacement, state, err = session.prepareVideo(session.ctx, options, options.Target.Kind == "picker", false)
+		if err != nil {
+			return err
+		}
 	}
 	var replacementAudio *nativecapture.Stream
 	if audioEnabled {
@@ -432,9 +476,12 @@ func (session *Session) ReplaceSource(
 			session.ctx,
 			session.captureProcess,
 			options.Target,
+			excludeAudio,
 		)
 		if err != nil {
-			_ = replacement.Close()
+			if replacement != nil {
+				_ = replacement.Close()
+			}
 			return errors.New("native source audio could not start")
 		}
 	}
@@ -452,11 +499,15 @@ func startAudioCapture(
 	ctx context.Context,
 	captureProcess string,
 	target nativecapture.CaptureTarget,
+	excludeAudio *nativecapture.CaptureTarget,
 ) (*nativecapture.Stream, error) {
+	if excludeAudio != nil {
+		return nativecapture.StartAudio(ctx, captureProcess, *excludeAudio, true)
+	}
 	if target.Kind == "display" || target.Kind == "picker" {
 		return nativecapture.StartSystemAudio(ctx, captureProcess)
 	}
-	return nativecapture.StartAudio(ctx, captureProcess, target)
+	return nativecapture.StartAudio(ctx, captureProcess, target, false)
 }
 
 func (session *Session) prepareVideo(
@@ -501,7 +552,9 @@ func (session *Session) commitCapture(
 	session.mu.Lock()
 	if session.closed || session.ctx.Err() != nil {
 		session.mu.Unlock()
-		_ = replacement.Close()
+		if replacement != nil {
+			_ = replacement.Close()
+		}
 		if replacementAudio != nil {
 			_ = replacementAudio.Close()
 		}
@@ -509,14 +562,20 @@ func (session *Session) commitCapture(
 	}
 	previous := session.stream
 	previousAudio := session.audioStream
-	if state.RestoreToken != "" {
-		options.RestoreToken = state.RestoreToken
+	var applied chan struct{}
+	// A source-audio change retains the current capture generation and encoder.
+	if replacement != nil {
+		if state.RestoreToken != "" {
+			options.RestoreToken = state.RestoreToken
+		}
+		state.applyBackend(&options)
+		session.stream = replacement
+		applied = make(chan struct{})
+		session.captureApplied = applied
+		session.captureUnavailable = state.unavailableLayers
+		session.videoOptions = options
+		session.profile = profile
 	}
-	state.applyBackend(&options)
-	session.stream = replacement
-	applied := make(chan struct{})
-	session.captureApplied = applied
-	session.captureUnavailable = state.unavailableLayers
 	if replaceAudio {
 		session.audioStream = replacementAudio
 		select {
@@ -524,18 +583,19 @@ func (session *Session) commitCapture(
 		default:
 		}
 	}
-	session.videoOptions = options
-	session.profile = profile
 	session.mu.Unlock()
 
 	if replaceAudio && session.mixer != nil {
 		session.mixer.setSource(replacementAudio)
 	}
-	_ = replacement.RequestKeyFrame(-1)
-	_ = previous.Close()
 	if replaceAudio && previousAudio != nil {
 		_ = previousAudio.Close()
 	}
+	if replacement == nil {
+		return nil
+	}
+	_ = replacement.RequestKeyFrame(-1)
+	_ = previous.Close()
 	select {
 	case <-applied:
 	case <-session.ctx.Done():
@@ -560,7 +620,7 @@ func (session *Session) installCapture(next *nativecapture.Stream) error {
 	// Preparation has consumed these events. Apply them to the new generation
 	// before acknowledging it, just as the live reader handles unavailable layers.
 	for _, layer := range unavailable {
-		if err := session.source.DisableLayer(layer); err != nil {
+		if err := session.disableCaptureLayer(next, layer); err != nil {
 			return err
 		}
 	}
@@ -575,7 +635,24 @@ func (session *Session) installCapture(next *nativecapture.Stream) error {
 	return nil
 }
 
+func (session *Session) disableCaptureLayer(stream *nativecapture.Stream, layer int) error {
+	session.mu.Lock()
+	if session.stream != stream || session.closed || session.ctx.Err() != nil {
+		session.mu.Unlock()
+		return nil
+	}
+	// Accept failure atomically with capture selection. Closing transports may
+	// wait for callbacks, so only the source-state change belongs under this lock.
+	retire, err := session.source.MarkLayerUnavailable(layer)
+	session.mu.Unlock()
+	if retire != nil {
+		retire()
+	}
+	return err
+}
+
 func (session *Session) CloseEdge(connectionID string) {
+	session.engine.ClosePunch(connectionID)
 	session.mu.Lock()
 	edge := session.edges[connectionID]
 	delete(session.edges, connectionID)
@@ -649,7 +726,8 @@ func (session *Session) run() {
 	}()
 	if session.mixer != nil {
 		go func() { session.mixer.run(); close(audioDone) }()
-	} else if session.audioStream == nil {
+	} else if session.audioSource == nil {
+		// The session's output shape is fixed; source inputs can change concurrently.
 		close(audioDone)
 	} else {
 		go func() {
@@ -831,7 +909,7 @@ func (session *Session) runVideo() error {
 			if session.source == nil {
 				return fail(errors.New("native output ended before its source state"))
 			}
-			if err = session.source.DisableLayer(frame.Layer); err != nil {
+			if err = session.disableCaptureLayer(current, frame.Layer); err != nil {
 				return fail(err)
 			}
 		case nativecapture.FramePCM:
@@ -1152,7 +1230,7 @@ func decodeCaptureState(payload []byte) (CaptureState, error) {
 	}
 	original := state.Outputs[min(1, len(state.Outputs)-1)]
 	if state.State == "active" &&
-		((state.Codec == "h264" && !validH264ProfileLevelID(state.ProfileLevelID)) ||
+		((state.Codec == "h264" && !nativecapture.SupportedH264ProfileLevelID(state.ProfileLevelID)) ||
 			(state.Codec == "vp8" && state.ProfileLevelID != "") ||
 			state.Width != original.Width ||
 			state.Height != original.Height ||
@@ -1172,15 +1250,6 @@ func (state CaptureState) applyBackend(options *nativecapture.VideoOptions) {
 	}
 	if state.EncoderIndex != nil {
 		options.EncoderIndex = *state.EncoderIndex
-	}
-}
-
-func validH264ProfileLevelID(value string) bool {
-	switch value {
-	case "42c01e", "42c01f", "42c020", "42c028", "42c029", "42c02a", "42c032", "42c033":
-		return true
-	default:
-		return false
 	}
 }
 

@@ -24,3 +24,43 @@ pass, replace both local module directives with version pins, remove their sourc
 directories and the extra dependency test patterns in `scripts/check-go.mjs`.
 Until then, review updates against the named baselines; do not edit Go's shared
 module cache or apply build-time patches.
+
+## LiveKit Send-Side Bandwidth Estimation
+
+`livekit/sendsidebwe` retains only the eight source files from
+[LiveKit v1.13.6's package](https://github.com/livekit/livekit/tree/v1.13.6/pkg/sfu/bwe/sendsidebwe),
+with its original `LICENSE` and `NOTICE`. It uses the existing pinned LiveKit
+interfaces; the rest of LiveKit remains the normal Go dependency. There is no
+whole-module fork or build-time patch.
+
+Two measurement corrections are marked in the modified files: probe finalization
+returns the current acknowledged capacity and rejects invalid/empty feedback;
+probe timing begins with its first acknowledged packet, excluding pre-probe idle
+time. Piik's shared forwarding package uses this copy for both individual
+transports and publications. Its regression checks use real TWCC feedback and
+retain the no-feedback and idle-before-probe controls. The
+[media research owner](../../docs/research/node-local-media-design.md#send-queue-recovery)
+records the runtime evidence and remaining limits.
+
+The package notice collector still includes LiveKit's upstream license and
+notice through the other compiled LiveKit packages. When a maintained upstream
+version covers both corrections and the same regressions pass, remove this
+directory and restore the upstream imports. Review dependency bumps against the
+named baseline; do not evolve a separate congestion-control algorithm here.
+
+The retained detector also includes [upstream #4935](https://github.com/livekit/livekit/pull/4935)
+and its regression from v1.13.9, adapted to standard Go assertions. Reserved
+TWCC symbols carry no receive delta: skip their measurement rather than consuming
+the next packet's delta or indexing past the feedback array.
+
+## Pion Repaired-Packet Identity
+
+The shared [RTP receive adapter](../media/forwarding/codecs.go) uses the negotiated
+primary codec for packets Pion identifies as repaired. In Pion v4.2.23,
+[`receiveForRid`](https://github.com/pion/webrtc/blob/v4.2.23/rtpreceiver.go)
+initializes the codec before the first primary read initializes `PayloadType`;
+an earlier RTX packet can therefore be queued with payload type zero.
+Ordinary packet validation remains unchanged. A real simulcast/NACK regression
+fences that ordering without sleeps and fails when the correction is removed.
+Remove the adapter when a maintained upstream version passes that same control
+without it; no Pion source fork or second retransmission handler is retained.

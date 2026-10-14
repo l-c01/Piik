@@ -142,7 +142,8 @@ describe("release automation", () => {
         "scripts/build-website.mjs", "scripts/check-docs.mjs", "scripts/check-container.mjs", "scripts/markdown-slug.mjs", "scripts/release-notes.mjs",
         "scripts/publish-container.mjs",
         "scripts/app-gate-endpoint.ts", "scripts/client-gate-endpoint.ts",
-        "tests/room.test.ts", ".agents/skills/ponytail/SKILL.md", ".github/workflows/website.yml"]) {
+        "tests/room.test.ts", ".agents/skills/ponytail/SKILL.md", ".github/workflows/website.yml",
+        ".github/workflows/gitee-mirror.yml", "scripts/release-mirror-source.mjs"]) {
         mkdirSync(dirname(join(root, path)), { recursive: true });
         writeFileSync(join(root, path), "Peripheral content");
       }
@@ -164,7 +165,7 @@ describe("release automation", () => {
       expect(reused.status).not.toBe(0);
       expect(reused.stderr).toContain("two source revisions");
     } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  }, 15_000); // Real Git subprocesses share the runner with the rest of the suite.
 
   it("keeps shipped assets, build inputs and moves across the website boundary release-worthy", () => {
     const root = mkdtempSync(join(tmpdir(), "piik-release-paths-"));
@@ -211,19 +212,20 @@ describe("release automation", () => {
     const revision = "a".repeat(40);
     const run = () => spawnSync(process.execPath, [publisher, root, version, revision, "--dry-run"], { encoding: "utf8" });
     try {
-      for (const target of ["server", "windows-amd64", "linux-amd64", "darwin-arm64"]) {
-        const artifact = `${target}.${target === "server" ? "tar.gz" : "zip"}`;
+      for (const target of ["server", "server-linux-arm64", "windows-amd64", "linux-amd64", "linux-arm64", "darwin-arm64", "darwin-amd64"]) {
+        const server = target.startsWith("server");
+        const artifact = `${target}.${server ? "tar.gz" : "zip"}`;
         writeFileSync(join(root, artifact), target);
         const descriptor = { schema: 2, version, revision, artifact, artifactSha256: sha(target),
-          ...(target === "server" ? { manifest: "server.manifest.tsv", manifestSha256: sha("manifest") } : { target }) };
+          target, ...(server ? { manifest: `${target}.manifest.tsv`, manifestSha256: sha("manifest") } : {}) };
         writeFileSync(join(root, `${target}.release.json`), JSON.stringify(descriptor));
-        if (target === "server") writeFileSync(join(root, "server.manifest.tsv"), "manifest");
+        if (server) writeFileSync(join(root, `${target}.manifest.tsv`), "manifest");
         else writeFileSync(join(root, `${artifact}.sha256`), `${sha(target)}  ${artifact}\n`);
       }
       const complete = run();
       expect(complete.status, complete.stderr).toBe(0);
-      expect(JSON.parse(complete.stdout).targets).toHaveLength(4);
-      expect(JSON.parse(complete.stdout).files).toBe(4);
+      expect(JSON.parse(complete.stdout).targets).toHaveLength(7);
+      expect(JSON.parse(complete.stdout).files).toBe(7);
       const checksum = join(root, "windows-amd64.zip.sha256");
       const originalChecksum = readFileSync(checksum, "utf8");
       writeFileSync(checksum, "wrong checksum");

@@ -57,8 +57,8 @@ var removedEnvironmentVariables = []struct{ name, reason string }{
 	{"PEER_ASSISTED_MEDIA", "peer-assisted media is always enabled"},
 	{"HOST_ADMISSION_PASSWORD", "use SITE_ACCESS_PASSWORD"},
 	{"MAX_PEER_RELAY_DOWNSTREAM_EDGES", "use ENDPOINT_MEDIA_COPY_CAPACITY"},
-	{"ROOM_TTL_SECONDS", "rooms do not expire"},
-	{"ROOM_LEASE_SECONDS", "rooms do not expire"},
+	{"ROOM_TTL_SECONDS", "use ROOM_EMPTY_TIMEOUT_SECONDS for empty-room retention"},
+	{"ROOM_LEASE_SECONDS", "use ROOM_EMPTY_TIMEOUT_SECONDS for empty-room retention"},
 	{"ACCESS_PASSWORD", "use SITE_ACCESS_PASSWORD"},
 	{"NODE_ENV", "use PIIK_ENV"},
 }
@@ -68,6 +68,7 @@ type SFUConfig struct {
 	ListenHost string
 	Port       int
 	PublicIP   string
+	Only       bool
 }
 
 // Config describes runtime configuration. Zero values mean open site
@@ -81,6 +82,7 @@ type Config struct {
 	AllowedOrigins            map[string]struct{}
 	SiteAccessPassword        string
 	RoomDatabasePath          string
+	RoomEmptyTimeoutSeconds   int
 	MaxViewersPerRoom         int
 	EndpointMediaCopyCapacity int
 	SFU                       *SFUConfig
@@ -143,6 +145,13 @@ func Load(env map[string]string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	roomEmptyTimeout := 0
+	if value := strings.TrimSpace(env["ROOM_EMPTY_TIMEOUT_SECONDS"]); value != "" {
+		roomEmptyTimeout, err = strconv.Atoi(value)
+		if err != nil || roomEmptyTimeout < 0 || roomEmptyTimeout > 31_536_000 {
+			return Config{}, errors.New("ROOM_EMPTY_TIMEOUT_SECONDS must be an integer between 0 and 31536000")
+		}
+	}
 	stunURLs, err := parseStunURLList(env["STUN_URLS"], "STUN_URLS")
 	if err != nil {
 		return Config{}, err
@@ -200,6 +209,7 @@ func Load(env map[string]string) (Config, error) {
 		AllowedOrigins:            allowedOrigins,
 		SiteAccessPassword:        siteAccessPassword,
 		RoomDatabasePath:          roomDatabasePath,
+		RoomEmptyTimeoutSeconds:   roomEmptyTimeout,
 		MaxViewersPerRoom:         int(maxViewersPerRoom),
 		EndpointMediaCopyCapacity: int(endpointMediaCopyCapacity),
 		SFU:                       sfu,
@@ -273,8 +283,15 @@ func parseRoomDatabasePath(value string) (string, error) {
 }
 
 func parseSFU(env map[string]string) (*SFUConfig, error) {
+	only, err := parseBoolean(env["SFU_ONLY"], "SFU_ONLY")
+	if err != nil {
+		return nil, err
+	}
 	rawPort := strings.TrimSpace(env["SFU_UDP_PORT"])
 	if rawPort == "" {
+		if only {
+			return nil, errors.New("SFU_ONLY requires SFU_UDP_PORT")
+		}
 		return nil, nil
 	}
 	port, err := parseBoundedInteger(rawPort, 0, "SFU_UDP_PORT", 1, maxPort)
@@ -298,6 +315,7 @@ func parseSFU(env map[string]string) (*SFUConfig, error) {
 		ListenHost: listenHost,
 		Port:       int(port),
 		PublicIP:   publicIP,
+		Only:       only,
 	}, nil
 }
 

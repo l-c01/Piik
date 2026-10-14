@@ -35,9 +35,7 @@ var (
 
 // Enumerations mirrored from src/shared/protocol.ts.
 var (
-	qualityResolutions           = []string{"480p", "720p", "1080p", "1440p"}
 	degradationPreferences       = []string{"maintain-resolution", "balanced", "maintain-framerate"}
-	screenAudioQualities         = []string{"saver", "music", "very-high"}
 	mediaRoutePhases             = []string{"prepare", "active"}
 	routeDemandReasons           = []string{"join", "edge-unavailable", "parent-departed", "capacity-reduction", "sfu-bootstrap", "direct-convergence", "quality-convergence", "root-convergence"}
 	routeDiagnosticFinalRoutes   = []string{"direct", "sfu", "waiting", "failed"}
@@ -106,13 +104,35 @@ func (v *MediaRouteUpstream) UnmarshalJSON(data []byte) error {
 // qualitySettingsSchema / routePolicySchema / runtimeCapabilitiesSchema
 // ---------------------------------------------------------------------------
 
+// QualityResolution is a requested ceiling, not encoder availability or an allocation.
+type QualityResolution struct {
+	Width  Int `json:"width"`
+	Height Int `json:"height"`
+}
+
+func (v *QualityResolution) UnmarshalJSON(data []byte) error {
+	*v = QualityResolution{}
+	type raw QualityResolution
+	present, err := decodeObject(data, (*raw)(v))
+	if err != nil {
+		return err
+	}
+	if err := present.require("width", "height"); err != nil {
+		return err
+	}
+	if !inRangeInt(v.Width, 1, 0xffff_ffff) || !inRangeInt(v.Height, 1, 0xffff_ffff) {
+		return errors.New("resolution is out of range")
+	}
+	return nil
+}
+
 // QualitySettings mirrors qualitySettingsSchema.
 type QualitySettings struct {
-	Resolution            string `json:"resolution"`
-	MaxFramerate          Int    `json:"maxFramerate"`
-	MaxBitrate            Int    `json:"maxBitrate"`
-	DegradationPreference string `json:"degradationPreference"`
-	ScreenAudioQuality    string `json:"screenAudioQuality,omitempty"`
+	Resolution            QualityResolution `json:"resolution"`
+	MaxFramerate          Num               `json:"maxFramerate"`
+	MaxBitrate            Int               `json:"maxBitrate"`
+	DegradationPreference string            `json:"degradationPreference"`
+	MaxAudioBitrate       Int               `json:"maxAudioBitrate,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -127,23 +147,20 @@ func (v *QualitySettings) UnmarshalJSON(data []byte) error {
 		"resolution", "maxFramerate", "maxBitrate", "degradationPreference"); err != nil {
 		return err
 	}
-	if err := present.optional("screenAudioQuality"); err != nil {
+	if err := present.optional("maxAudioBitrate"); err != nil {
 		return err
 	}
-	if !enumOf(v.Resolution, qualityResolutions...) {
-		return fmt.Errorf("unknown resolution %q", v.Resolution)
-	}
-	if !inRangeInt(v.MaxFramerate, 15, 60) {
+	if v.MaxFramerate <= 0 || !inRangeNum(v.MaxFramerate, 0, MaxSafeInteger) {
 		return errors.New("maxFramerate is out of range")
 	}
-	if !inRangeInt(v.MaxBitrate, 2_000_000, 12_000_000) {
+	if !inRangeInt(v.MaxBitrate, 1, 0xffff_ffff) {
 		return errors.New("maxBitrate is out of range")
 	}
 	if !enumOf(v.DegradationPreference, degradationPreferences...) {
 		return fmt.Errorf("unknown degradationPreference %q", v.DegradationPreference)
 	}
-	if present.has("screenAudioQuality") && !enumOf(v.ScreenAudioQuality, screenAudioQualities...) {
-		return fmt.Errorf("unknown screenAudioQuality %q", v.ScreenAudioQuality)
+	if present.has("maxAudioBitrate") && !inRangeInt(v.MaxAudioBitrate, MinAudioBitrate, MaxAudioBitrate) {
+		return errors.New("maxAudioBitrate is out of range")
 	}
 	return nil
 }
@@ -168,9 +185,11 @@ func (v *RoutePolicy) UnmarshalJSON(data []byte) error {
 
 // RuntimeCapabilities mirrors runtimeCapabilitiesSchema.
 type RuntimeCapabilities struct {
-	ConnectionAttemptProgress4 bool `json:"connectionAttemptProgress4,omitempty"`
-	Sfu                        bool `json:"sfu"`
-	NatPrediction              bool `json:"natPrediction"`
+	Sfu              bool `json:"sfu"`
+	SfuOnly          bool `json:"sfuOnly,omitempty"`
+	NatPrediction    bool `json:"natPrediction"`
+	RoomInteractions bool `json:"roomInteractions,omitempty"`
+	HostRoomSession  bool `json:"hostRoomSession,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -183,12 +202,13 @@ func (v *RuntimeCapabilities) UnmarshalJSON(data []byte) error {
 	if present == nil {
 		return errors.New("runtime capabilities must be an object")
 	}
-	if err := present.optional("sfu", "natPrediction", "connectionAttemptProgress4"); err != nil {
+	if err := present.optional("sfu", "sfuOnly", "roomInteractions", "hostRoomSession", "natPrediction"); err != nil {
+
 		return err
 	}
 	for key, target := range map[string]*bool{
-		"sfu": &v.Sfu, "natPrediction": &v.NatPrediction,
-		"connectionAttemptProgress4": &v.ConnectionAttemptProgress4,
+		"sfu": &v.Sfu, "sfuOnly": &v.SfuOnly, "natPrediction": &v.NatPrediction,
+		"roomInteractions": &v.RoomInteractions, "hostRoomSession": &v.HostRoomSession,
 	} {
 		if value, ok := present[key]; ok {
 			if err := json.Unmarshal(value, target); err != nil {
@@ -394,16 +414,26 @@ type SignalPayload struct {
 	ConnectionID string
 	Description  *SessionDescription
 	Candidate    *IceCandidate
+	Punch        *PunchSignal
+	Punched      bool
 }
 
 // MarshalJSON implements json.Marshaler.
 func (v SignalPayload) MarshalJSON() ([]byte, error) {
+	if v.Kind == "punch" {
+		return marshalJSON(struct {
+			Kind         string       `json:"kind"`
+			ConnectionID string       `json:"connectionId"`
+			Punch        *PunchSignal `json:"punch"`
+		}{v.Kind, v.ConnectionID, v.Punch})
+	}
 	if v.Kind == "description" {
 		return marshalJSON(struct {
 			Kind         string              `json:"kind"`
 			ConnectionID string              `json:"connectionId"`
 			Description  *SessionDescription `json:"description"`
-		}{v.Kind, v.ConnectionID, v.Description})
+			Punched      bool                `json:"punched,omitempty"`
+		}{v.Kind, v.ConnectionID, v.Description, v.Punched})
 	}
 	return marshalJSON(struct {
 		Kind         string        `json:"kind"`
@@ -420,11 +450,30 @@ func (v *SignalPayload) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch kind {
+	case "punch":
+		var body struct {
+			Kind         string       `json:"kind"`
+			ConnectionID string       `json:"connectionId"`
+			Punch        *PunchSignal `json:"punch"`
+		}
+		present, err := decodeObject(data, &body)
+		if err != nil {
+			return err
+		}
+		if err = present.require("kind", "connectionId", "punch"); err != nil {
+			return err
+		}
+		if !ValidOpaqueID(body.ConnectionID) || body.Punch == nil {
+			return errors.New("invalid connection preparation signal")
+		}
+		*v = SignalPayload{Kind: kind, ConnectionID: body.ConnectionID, Punch: body.Punch}
+		return nil
 	case "description":
 		var body struct {
 			Kind         string              `json:"kind"`
 			ConnectionID string              `json:"connectionId"`
 			Description  *SessionDescription `json:"description"`
+			Punched      bool                `json:"punched,omitempty"`
 		}
 		present, err := decodeObject(data, &body)
 		if err != nil {
@@ -436,7 +485,10 @@ func (v *SignalPayload) UnmarshalJSON(data []byte) error {
 		if !ValidOpaqueID(body.ConnectionID) {
 			return errors.New("connectionId is not an opaque id")
 		}
-		*v = SignalPayload{Kind: kind, ConnectionID: body.ConnectionID, Description: body.Description}
+		if _, exists := present["punched"]; exists && !body.Punched {
+			return errors.New("punched must be true when present")
+		}
+		*v = SignalPayload{Kind: kind, ConnectionID: body.ConnectionID, Description: body.Description, Punched: body.Punched}
 		return nil
 	case "candidate":
 		var body struct {
@@ -487,8 +539,8 @@ func (v *ConnectionAttempt) UnmarshalJSON(data []byte) error {
 	if !inRangeInt(v.Current, 1, int64(v.Total)) {
 		return errors.New("connectionAttempt.current is out of range")
 	}
-	if v.Total != 3 && v.Total != 4 {
-		return errors.New("connectionAttempt.total must be 3 or 4")
+	if !inRangeInt(v.Total, 1, MaxSafeInteger) {
+		return errors.New("connectionAttempt.total is out of range")
 	}
 	return nil
 }
@@ -974,11 +1026,11 @@ func (v *ViewerQualityEvidenceMetrics) UnmarshalJSON(data []byte) error {
 		value            *Int
 		minimum, maximum int64
 	}{
-		{v.Width, 1, 16_384}, {v.Height, 1, 16_384},
-		{v.PacketsReceivedDelta, 0, 1_000_000}, {v.PacketsLostDelta, 0, 1_000_000},
-		{v.FramesDecodedDelta, 0, 10_000}, {v.FramesDroppedDelta, 0, 10_000},
+		{v.Width, 1, MaxSafeInteger}, {v.Height, 1, MaxSafeInteger},
+		{v.PacketsReceivedDelta, 0, MaxSafeInteger}, {v.PacketsLostDelta, 0, MaxSafeInteger},
+		{v.FramesDecodedDelta, 0, MaxSafeInteger}, {v.FramesDroppedDelta, 0, MaxSafeInteger},
 		{v.FreezeCountDelta, 0, MaxSafeInteger}, {v.PauseCountDelta, 0, MaxSafeInteger},
-		{v.AudioConcealmentEventsDelta, 0, 10_000},
+		{v.AudioConcealmentEventsDelta, 0, MaxSafeInteger},
 	} {
 		if bound.value != nil && !inRangeInt(*bound.value, bound.minimum, bound.maximum) {
 			return errors.New("viewer quality evidence integer is out of range")
@@ -988,15 +1040,15 @@ func (v *ViewerQualityEvidenceMetrics) UnmarshalJSON(data []byte) error {
 		value            *Num
 		minimum, maximum float64
 	}{
-		{v.FramesPerSecond, 0, 240}, {v.BitrateKbps, 0, 100_000},
-		{v.RttMs, 0, 60_000}, {v.JitterMs, 0, 60_000},
-		{v.DecodeMsPerFrame, 0, 60_000},
+		{v.FramesPerSecond, 0, MaxSafeInteger}, {v.BitrateKbps, 0, MaxSafeInteger},
+		{v.RttMs, 0, MaxSafeInteger}, {v.JitterMs, 0, MaxSafeInteger},
+		{v.DecodeMsPerFrame, 0, MaxSafeInteger},
 		{v.FreezeDurationMsDelta, 0, MaxSafeInteger},
 		{v.PauseDurationMsDelta, 0, MaxSafeInteger},
-		{v.AudioBitrateKbps, 0, 10_000}, {v.AudioPacketLossPercent, 0, 100},
-		{v.AudioJitterMs, 0, 60_000},
-		{v.AudioVideoPlayoutDeltaMs, -60_000, 60_000},
-		{v.VideoJitterBufferDelayMs, 0, 60_000}, {v.AudioJitterBufferDelayMs, 0, 60_000},
+		{v.AudioBitrateKbps, 0, MaxSafeInteger}, {v.AudioPacketLossPercent, 0, 100},
+		{v.AudioJitterMs, 0, MaxSafeInteger},
+		{v.AudioVideoPlayoutDeltaMs, -MaxSafeInteger, MaxSafeInteger},
+		{v.VideoJitterBufferDelayMs, 0, MaxSafeInteger}, {v.AudioJitterBufferDelayMs, 0, MaxSafeInteger},
 		{v.AudioConcealedSamplesPercent, 0, 100},
 	} {
 		if bound.value != nil && !inRangeNum(*bound.value, bound.minimum, bound.maximum) {
@@ -1080,11 +1132,11 @@ func (v *SenderQualityDiagnostics) UnmarshalJSON(data []byte) error {
 		value            *Num
 		minimum, maximum float64
 	}{
-		{v.FramesPerSecond, 0, 240}, {v.BitrateKbps, 0, 100_000},
-		{v.CaptureFramesPerSecond.Value, 0, 240},
-		{v.MediaSourceFramesPerSecond.Value, 0, 240},
-		{v.AvailableOutgoingKbps.Value, 0, 100_000},
-		{v.RttMs.Value, 0, 60_000}, {v.PacketLossPercent.Value, 0, 100},
+		{v.FramesPerSecond, 0, MaxSafeInteger}, {v.BitrateKbps, 0, MaxSafeInteger},
+		{v.CaptureFramesPerSecond.Value, 0, MaxSafeInteger},
+		{v.MediaSourceFramesPerSecond.Value, 0, MaxSafeInteger},
+		{v.AvailableOutgoingKbps.Value, 0, MaxSafeInteger},
+		{v.RttMs.Value, 0, MaxSafeInteger}, {v.PacketLossPercent.Value, 0, 100},
 	} {
 		if bound.value != nil && !inRangeNum(*bound.value, bound.minimum, bound.maximum) {
 			return errors.New("sender quality diagnostic number is out of range")
@@ -1094,7 +1146,7 @@ func (v *SenderQualityDiagnostics) UnmarshalJSON(data []byte) error {
 		value   *Int
 		maximum int64
 	}{
-		{v.Width.Value, 16_384}, {v.Height.Value, 16_384},
+		{v.Width.Value, MaxSafeInteger}, {v.Height.Value, MaxSafeInteger},
 		{v.VideoEncodingCount.Value, MaxSafeInteger},
 		{v.ActiveVideoEncodingCount.Value, MaxSafeInteger},
 	} {

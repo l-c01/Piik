@@ -45,6 +45,10 @@ function rtcCandidate(port: number): RTCIceCandidate {
 
 describe("NAT prediction ICE adapter", () => {
   it("uses only explicit Native survey candidates as prediction evidence", () => {
+    const iceConfig = {
+      iceServers: [{ urls: ["stun:share.example.test:3478", "stun:other.example.test:3478"] }],
+      natPredictionStunUrls: ["stun:share.example.test:3479", "stun:share.example.test:3480"],
+    };
     const survey = candidate(40_000);
     if (survey) {
       survey.candidate = survey.candidate.replace(
@@ -53,9 +57,36 @@ describe("NAT prediction ICE adapter", () => {
       );
     }
 
-    expect(isNativeNatSurveyCandidate(survey)).toBe(true);
-    expect(isNativeNatSurveyCandidate(candidate(40_000))).toBe(false);
-    expect(isNativeNatSurveyCandidate(hostCandidate())).toBe(false);
+    const eligible = (value: SignalCandidate) => isNativeNatSurveyCandidate(value, iceConfig.iceServers, iceConfig.natPredictionStunUrls);
+    expect(eligible(survey)).toBe(true);
+    for (const [index, expected] of [[2, false], [3, true], [4, true], [5, false], [0, false]] as const) {
+      expect(eligible({ candidate: `candidate:ns${index} 1 udp 1 203.0.113.7 40000 typ srflx` })).toBe(expected);
+    }
+    expect(eligible(candidate(40_000))).toBe(false);
+    expect(eligible(hostCandidate())).toBe(false);
+  });
+
+  it.each([
+    { surveyPorts: [40_000, 40_003, 40_006], predictions: MAX_NAT_PREDICTION_CANDIDATES },
+    { surveyPorts: [40_000, 40_000, 40_000], predictions: 0 },
+  ])("retains survey identity before mapping deduplication: $surveyPorts", ({ surveyPorts, predictions }) => {
+    const iceServers = [{ urls: ["stun:share.example.test:3478", "stun:other.example.test:3478"] }];
+    const auxiliary = ["stun:share.example.test:3479", "stun:share.example.test:3480"];
+    const send = vi.fn<(candidate: SignalCandidate) => void>();
+    const batch = new NatPredictionCandidateBatch(send);
+    // A faster ordinary destination shares the first survey mapping. All
+    // destinations reach ICE, but only the actual survey can prove a pattern.
+    const observations = [[2, 40_000], [1, surveyPorts[0]], [3, surveyPorts[1]], [4, surveyPorts[2]]];
+    for (const [index, port] of observations) {
+      const observation = candidate(port!)!;
+      observation.candidate = observation.candidate.replace("candidate:base", `candidate:ns${index}`);
+      batch.add(observation, isNativeNatSurveyCandidate(observation, iceServers, auxiliary));
+    }
+    batch.complete();
+    const emitted = send.mock.calls.map(([value]) => value);
+    expect(emitted.filter(value => /^candidate:ns/.test(value?.candidate ?? ""))).toHaveLength(4);
+    expect(emitted.filter(value => /^candidate:s[pm]/.test(value?.candidate ?? ""))).toHaveLength(predictions);
+    expect(emitted.at(-1)).toBeNull();
   });
 
   it("keeps unexpected ordinary-candidate failures visible", async () => {
@@ -147,6 +178,16 @@ describe("NAT prediction ICE adapter", () => {
 
     expect(iceServersWithNatPrediction(servers, true)).toEqual(servers);
     expect(natPredictionSurveyUrls(servers)).toEqual(new Set());
+  });
+
+  it("retains ordinary fallback discovery independently of prediction", () => {
+    const urls = ["stun:primary.test:3478", "stun:fallback-a.test:3478", "stun:fallback-b.test:3478"];
+    const servers = [{ urls }];
+    const auxiliary = urls.slice(1);
+    for (const enabled of [false, true]) {
+      expect(iceServersWithNatPrediction(servers, enabled, auxiliary)).toEqual(servers);
+    }
+    expect(natPredictionSurveyUrls(servers, auxiliary)).toEqual(new Set(urls));
   });
 
   it.each([

@@ -16,6 +16,138 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it.each(["commit", "expired", "rpc-expired"])("scopes optional connection preparation to its route: %s", async outcome => {
+  vi.useFakeTimers();
+  vi.stubGlobal("window", globalThis);
+  vi.stubGlobal("MediaStream", class { getTracks() { return []; } });
+  vi.stubGlobal("RTCPeerConnection", class { close() {} });
+  vi.spyOn(NativeMediaBridge.prototype, "start").mockResolvedValue({} as MediaStream);
+  const client = {
+    preparePunch: vi.fn(async () => ({ address: "198.51.100.1", port: 40000, step: 1 })),
+    runPunch: vi.fn(async () => true), closePunch: vi.fn(async () => undefined),
+    receiveOffer: vi.fn(async () => ({ answer: { type: "answer", sdp: "answer" }, audio: false, codec: "vp8" })),
+    onEvent: () => () => {}, onClose: () => () => {},
+    closeReceiver: vi.fn(async () => {}), closeEdge: vi.fn(async () => {}),
+  } as unknown as NativeClient;
+  const unavailable = vi.fn(), exhausted = vi.fn(() => true), sent = vi.fn(() => true);
+  const peer = new NativeCapableViewerPeer({
+    iceServers: [{ urls: ["stun:site.example:3478"] }],
+    natPredictionStunUrls: ["stun:site.example:3479", "stun:site.example:3480"],
+  }, { sendSignal: sent, sendRestartRequest: () => true, onStream: () => {}, onUpdate: () => {}, onRecoveryExhausted: exhausted },
+  { natPredictionEnabled: true, recoveryOwner: "route" }, async () => client, unavailable, "session", 2);
+  const prepare: SignalPayload = { kind: "punch", connectionId: "current", punch: { phase: "prepare", secret: "42".repeat(32) } };
+  try {
+    await peer.acceptSignal("parent", prepare);
+    await vi.advanceTimersByTimeAsync(0);
+    await peer.acceptSignal("parent", { kind: "punch", connectionId: "current", punch: {
+      phase: "start", prediction: { address: "198.51.100.2", port: 50000, step: 1 },
+    } });
+    await vi.advanceTimersByTimeAsync(0);
+    if (outcome === "expired") await vi.advanceTimersByTimeAsync(3_500);
+    if (outcome === "rpc-expired") vi.mocked(client.receiveOffer).mockRejectedValueOnce(new Error("prepared socket expired"));
+    await peer.acceptSignal("parent", {
+      kind: "description", connectionId: "current", punched: true,
+      description: { type: "offer", sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\na=rtpmap:96 VP8/90000\r\n" },
+    });
+    expect(unavailable).not.toHaveBeenCalled();
+    if (outcome === "commit") {
+      expect(exhausted).not.toHaveBeenCalled();
+      expect(client.receiveOffer).toHaveBeenCalledWith("session", "current", expect.anything(), expect.anything(), 2, true);
+      await peer.acceptSignal("parent", prepare);
+      expect(client.preparePunch).toHaveBeenCalledOnce();
+    } else {
+      expect(exhausted).toHaveBeenCalledExactlyOnceWith("parent", "current");
+      if (outcome === "expired") expect(client.receiveOffer).not.toHaveBeenCalled();
+    }
+  } finally { peer.dispose(); }
+});
+
+it("uses the offer's STUN destinations for prediction while the next ICE config changes", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("window", globalThis);
+  vi.stubGlobal("MediaStream", class { getTracks() { return []; } });
+  vi.stubGlobal("RTCPeerConnection", class { close() {} });
+  vi.spyOn(NativeMediaBridge.prototype, "start").mockResolvedValue({} as MediaStream);
+  let onEvent!: (event: NativeClientEvent) => void;
+  const client = {
+    receiveOffer: vi.fn(async () => ({ answer: { type: "answer", sdp: "v=0\r\n" }, audio: false, codec: "vp8" })),
+    onEvent: (handler: typeof onEvent) => { onEvent = handler; return () => {}; },
+    onClose: () => () => {},
+    closeReceiver: vi.fn(async () => {}), closeEdge: vi.fn(async () => {}),
+  } as unknown as NativeClient;
+  const original = {
+    iceServers: [{ urls: ["stun:site.example:3478", "stun:other.example:3478"] }],
+    natPredictionStunUrls: ["stun:site.example:3479", "stun:site.example:3480"],
+  };
+  const sent: SignalPayload[] = [];
+  const peer = new NativeCapableViewerPeer(original, {
+    sendSignal: (_parent, payload) => { sent.push(payload); return true; },
+    sendRestartRequest: () => true, onStream: () => {}, onUpdate: () => {},
+  }, { natPredictionEnabled: true }, async () => client, () => {}, "session", 2);
+  const emit = (index: number, port: number) => onEvent({
+    version: 10, type: "edge-candidate", shareId: "session", connectionId: "current",
+    candidate: { candidate: `candidate:ns${index} 1 udp 1 203.0.113.7 ${port} typ srflx` },
+  });
+  const candidates = () => sent.flatMap(payload => payload.kind === "candidate" ? [payload.candidate] : []);
+  try {
+    await peer.acceptSignal("parent", {
+      kind: "description", connectionId: "current",
+      description: { type: "offer", sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\na=rtpmap:96 VP8/90000\r\n" },
+    });
+    peer.updateIceConfig({
+      ...original, iceServers: [{ urls: ["stun:other.example:3478", "stun:site.example:3478"] }],
+    });
+    emit(3, 40006);
+    emit(2, 40003); // Ordinary extra destination must not complete a predicted sequence.
+    emit(1, 40000);
+    expect(candidates()).toHaveLength(3);
+    emit(4, 40012);
+    expect(candidates()).toHaveLength(12); // Four ordinary candidates plus the bounded eight predictions.
+  } finally {
+    peer.dispose();
+  }
+});
+
+it("retires queued candidates when disposed during their delivery", async () => {
+  vi.stubGlobal("window", globalThis);
+  vi.stubGlobal("MediaStream", class { getTracks() { return []; } });
+  let finishCandidate!: () => void;
+  const accept = vi.spyOn(ViewerPeer.prototype, "acceptSignal").mockImplementation(
+    async (_parent, payload) => {
+      if (payload.kind === "candidate") {
+        await new Promise<void>(resolve => { finishCandidate = resolve; });
+      }
+    },
+  );
+  const peer = new NativeCapableViewerPeer(
+    { iceServers: [] },
+    {
+      sendSignal: () => true, sendRestartRequest: () => true,
+      onStream: () => undefined, onUpdate: () => undefined,
+    },
+    {}, async () => null, () => undefined, "session", 2,
+  );
+  try {
+    for (const port of [5000, 5001]) {
+      await peer.acceptSignal("parent", {
+        kind: "candidate", connectionId: "current",
+        candidate: { candidate: `candidate:1 1 UDP 2122260223 192.0.2.1 ${port} typ host` },
+      });
+    }
+    const accepting = peer.acceptSignal("parent", {
+      kind: "description", connectionId: "current",
+      description: { type: "offer", sdp: "v=0\r\n" },
+    });
+    await vi.waitFor(() => expect(accept).toHaveBeenCalledTimes(2));
+    peer.dispose();
+    finishCandidate();
+    await expect(accepting).resolves.toBeUndefined();
+    expect(accept).toHaveBeenCalledTimes(2);
+  } finally {
+    peer.dispose();
+  }
+});
+
 it.each(["viewer", "route"] as const)("retires a connected Native receiver on control loss (%s)", async (recoveryOwner) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
@@ -54,7 +186,7 @@ it.each(["viewer", "route"] as const)("retires a connected Native receiver on co
       description: { type: "offer", sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\na=rtpmap:96 VP8/90000\r\n" },
     });
     const connected = {
-      version: 9, shareId: "session", connectionId: "current", type: "edge-state", state: "connected",
+      version: 10, shareId: "session", connectionId: "current", type: "edge-state", state: "connected",
     } as const;
     onEvent(connected);
     expect(peer.isConnected()).toBe(true);
@@ -175,7 +307,7 @@ it.each(["reused", "replaced", "answer-lost", "control-lost"])("keeps Native rec
   });
   try {
     await peer.acceptSignal("parent", offer("first"));
-    event({ version: 9, type: "edge-state", shareId: "session", connectionId: "current", state: "connected" });
+    event({ version: 10, type: "edge-state", shareId: "session", connectionId: "current", state: "connected" });
     const source = peer.nativeSource;
     receiveOffer.mockImplementationOnce(async () => {
       if (outcome === "replaced") {
@@ -210,17 +342,62 @@ it("admits one active sending H264 or VP8 video section, not unrelated SDP codec
     `m=video ${port} UDP/TLS/RTP/SAVPF ${payload}`,
     `a=${direction}`,
     `a=rtpmap:96 ${codec}/90000`,
+    "a=fmtp:96 profile-level-id=42e01f;packetization-mode=1",
     "",
   ].join("\r\n");
   expect(offerHasNativeVideoCodec(video("H264"))).toBe(true);
   expect(offerHasNativeVideoCodec(video("VP8"))).toBe(true);
   expect(offerHasNativeVideoCodec(video("VP8", "sendrecv"))).toBe(true);
+  expect(offerHasNativeVideoCodec("a=group:BUNDLE 0\r\n" +
+    video("VP8", "sendonly", 0) + "a=bundle-only\r\na=mid:0\r\n")).toBe(true);
+  expect(offerHasNativeVideoCodec("m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n" +
+    "a=sendonly\r\na=rtpmap:96 H264/90000\r\na=rtpmap:97 VP8/90000\r\n")).toBe(true);
   for (const offer of [
     video("VP8", "recvonly"), video("VP8", "inactive"),
     video("VP8", "sendonly", 0), video("VP8", "sendonly", 9, 97),
+    video("VP8", "sendonly", 0) + "a=bundle-only\r\na=mid:0\r\n",
     video("VP9"), video("H264") + video("VP8"),
     "m=audio 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n",
   ]) expect(offerHasNativeVideoCodec(offer)).toBe(false);
+});
+
+it.each([
+  ["42e01f", "1", true], ["42c01f", "1", true],
+  ["4de01f", "1", true], ["58c01f", "1", true],
+  ["42e00b", "1", true], ["42e033", "1", true], ["42e034", "1", true],
+  ["42e03c", "1", false],
+  ["4d001f", "1", false], ["64001f", "1", false], ["42001f", "1", false],
+  ["42e11f", "1", false], ["42e035", "1", false], ["42e03c", "1", false],
+  ["42e01f=invalid", "1", false],
+  ["", "1", false], ["42e01f", "0", false], ["42e01f", "", false],
+])("matches Native H264 forwarding admission: profile=%s, packetization=%s", (profile, mode, supported) => {
+  const offer = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\n" +
+    "a=rtpmap:96 H264/90000\r\n" +
+    `a=fmtp:96 profile-level-id=${profile};packetization-mode=${mode}\r\n`;
+  expect(offerHasNativeVideoCodec(offer)).toBe(supported);
+});
+
+it("sends an unsupported Native format straight to the Browser without failing the App", async () => {
+  vi.stubGlobal("MediaStream", class { getTracks() { return []; } });
+  const browserSignal = vi.spyOn(ViewerPeer.prototype, "acceptSignal").mockResolvedValue();
+  const acquire = vi.fn(async () => null);
+  const unavailable = vi.fn();
+  const restart = vi.fn(() => true);
+  const peer = new NativeCapableViewerPeer({ iceServers: [] }, {
+    sendSignal: () => true, sendRestartRequest: restart,
+    onStream: () => undefined, onUpdate: () => undefined,
+  }, {}, acquire, unavailable, "session", 2);
+  const offer: SignalPayload = { kind: "description", connectionId: "current", description: {
+    type: "offer", sdp: "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\n" +
+      "a=rtpmap:96 H264/90000\r\na=fmtp:96 profile-level-id=64001f;packetization-mode=1\r\n",
+  }};
+  try {
+    await peer.acceptSignal("parent", offer);
+    expect(browserSignal).toHaveBeenCalledExactlyOnceWith("parent", offer);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(unavailable).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  } finally { peer.dispose(); }
 });
 
 it("does not create a browser backend after deferred native discovery is disposed", async () => {
@@ -457,7 +634,7 @@ it.each([
   }
 });
 
-it.each([false, true])("keeps committed route recovery across backend replacement (replaced=%s)", async (replaced) => {
+it.each(["first", "replacement", "failed-offer"])("keeps committed route recovery and its budget across backend replacement (%s)", async (scenario) => {
   vi.useFakeTimers();
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("MediaStream", class { getTracks() { return []; } });
@@ -466,8 +643,9 @@ it.each([false, true])("keeps committed route recovery across backend replacemen
   vi.spyOn(NativeMediaBridge.prototype, "collectMetrics").mockResolvedValue({ ...EMPTY_METRICS });
   vi.spyOn(NativeMediaBridge.prototype, "decodedVideoFrames").mockResolvedValue(null);
   let onEvent!: (event: NativeClientEvent) => void;
+  const receiveOffer = vi.fn(async () => ({ answer: { type: "answer", sdp: "v=0\r\n" }, audio: false, codec: "vp8" }));
   const client = {
-    receiveOffer: async () => ({ answer: { type: "answer", sdp: "v=0\r\n" }, audio: false, codec: "vp8" }),
+    receiveOffer,
     onEvent: (fn: typeof onEvent) => { onEvent = fn; return () => undefined; },
     onClose: () => () => undefined,
     closeReceiver: vi.fn(async () => undefined), closeEdge: vi.fn(async () => undefined),
@@ -482,20 +660,45 @@ it.each([false, true])("keeps committed route recovery across backend replacemen
   const offer = (connectionId: string) => ({ kind: "description" as const, connectionId,
     description: { type: "offer" as const, sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\na=rtpmap:96 VP8/90000\r\n" }});
   const state = (connectionId: string, value: "connected" | "failed") => onEvent({
-    version: 9, shareId: "session", connectionId, type: "edge-state", state: value,
+    version: 10, shareId: "session", connectionId, type: "edge-state", state: value,
   });
   try {
     await peer.acceptSignal("parent", offer("first"));
     state("first", "connected");
     peer.activatePreparedRoute();
     expect(options.recoveryOwner).toBe("route"); // Caller options are not mutable route state.
-    const connectionId = replaced ? "replacement" : "first";
-    if (replaced) {
+    const connectionId = scenario === "replacement" ? "replacement" : "first";
+    if (scenario === "replacement") {
       await peer.acceptSignal("parent", offer(connectionId));
       state(connectionId, "connected");
     }
     state(connectionId, "failed");
     expect(restart).toHaveBeenCalledExactlyOnceWith("parent", connectionId, false);
     expect(exhausted).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(VIEWER_AUTOMATIC_RECOVERY_TIMEOUT_MS);
+    expect(restart).toHaveBeenNthCalledWith(2, "parent", connectionId, true);
+
+    // A new physical ID is the requested rebuild, not a recovered parent.
+    const retiredEvent = onEvent;
+    if (scenario === "failed-offer") receiveOffer.mockRejectedValueOnce(new Error("receiver unavailable"));
+    await peer.acceptSignal("parent", offer("rebuilt"));
+    retiredEvent({ version: 10, shareId: "session", connectionId, type: "edge-state", state: "connected" });
+    state("rebuilt", "failed");
+    expect(restart).toHaveBeenCalledTimes(2);
+    expect(exhausted).toHaveBeenCalledExactlyOnceWith("parent", "rebuilt");
+
+    // Explicit retry owns a new bounded request and must report its outcome.
+    expect(peer.requestRecovery(true)).toBe(true);
+    await vi.advanceTimersByTimeAsync(VIEWER_AUTOMATIC_RECOVERY_TIMEOUT_MS);
+    expect(exhausted).toHaveBeenCalledTimes(2);
+
+    // Only actual recovery or a different parent gives a fresh budget.
+    await peer.acceptSignal("parent", offer("healthy"));
+    state("healthy", "connected");
+    state("healthy", "failed");
+    expect(restart).toHaveBeenNthCalledWith(4, "parent", "healthy", false);
+    await peer.acceptSignal("other-parent", offer("other-connection"));
+    state("other-connection", "failed");
+    expect(restart).toHaveBeenNthCalledWith(5, "other-parent", "other-connection", false);
   } finally { peer.dispose(); }
 });

@@ -30,6 +30,7 @@ import { Comic, type ComicKind } from "./Comic";
 import { HintComic, isHintKind, type HintKind } from "./hints";
 import { isCopyKey, say } from "../../ui/copy";
 import { replaySvgAnimations } from "../../ui/animation";
+import { useSurfaceDocument } from "../../ui/panel-window";
 import { comicStyle, getComicPresentation, type ComicTone, type ComicMotion } from "./comic-presentation";
 
 const LONG_PRESS_MS = 500;
@@ -59,6 +60,7 @@ export function Tooltip({
   place = "above",
   align = "center",
   toggleOnClick = false,
+  disabled = false,
   overflow,
   children,
 }: TooltipContent & {
@@ -71,8 +73,11 @@ export function Tooltip({
   align?: Align;
   /** For help-only buttons; action controls keep click and touch long-press. */
   toggleOnClick?: boolean;
+  /** Suppress guidance while the control's own disclosure is open. */
+  disabled?: boolean;
   children: ReactNode;
 }) {
+  const ownerDocument = useSurfaceDocument();
   const defaults = getComicPresentation(kind);
   const resolvedTone = tone ?? defaults.tone;
   const resolvedMotion = motion ?? defaults.motion;
@@ -94,7 +99,7 @@ export function Tooltip({
   // True while the current gesture is a touch, so contextmenu can tell a
   // long-press from a mouse right-click without reading vendor event fields.
   const touchGesture = useRef(false);
-  const enabled = kind !== undefined || overflowing;
+  const enabled = !disabled && (kind !== undefined || overflowing);
   const caption = [overflowing ? overflow?.text : undefined, text].filter(Boolean).join(" · ") || undefined;
   const interactionOpen = enabled && (hoverOpen || focusOpen || pressOpen);
   const trigger = isValidElement<{
@@ -133,9 +138,16 @@ export function Tooltip({
     const observer = new ResizeObserver(measure);
     observer.observe(element);
     // Font loading can change scrollWidth without changing the clipped box.
-    void document.fonts?.ready.then(measure);
+    void element.ownerDocument.fonts?.ready.then(measure);
     return () => { disposed = true; observer.disconnect(); };
-  }, [overflow?.selector, overflow?.text, trigger?.type, trigger?.key]);
+  }, [overflow?.selector, overflow?.text, trigger?.type, trigger?.key, ownerDocument]);
+
+  useLayoutEffect(() => {
+    // A hover/hold from the old window cannot pin guidance in the new one.
+    dismissPanel();
+    setPanelMounted(false);
+    pressPoint.current = null;
+  }, [ownerDocument]);
 
   useEffect(() => {
     if (enabled) return;
@@ -162,10 +174,12 @@ export function Tooltip({
   const pickAlign = () => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const viewport = window.visualViewport;
-    const vw = viewport?.width ?? window.innerWidth;
+    const view = wrap.ownerDocument.defaultView;
+    if (!view) return;
+    const viewport = view.visualViewport;
+    const vw = viewport?.width ?? view.innerWidth;
     if (!vw) return; // no layout (SSR/test): keep the prop alignment
-    const vh = viewport?.height ?? window.innerHeight;
+    const vh = viewport?.height ?? view.innerHeight;
     const x = viewport?.offsetLeft ?? 0, y = viewport?.offsetTop ?? 0;
     const right = x + vw, bottom = y + vh;
     tipRef.current?.style.setProperty("--tooltip-max-width", `${Math.max(0, vw - EDGE_MARGIN * 2)}px`);
@@ -242,7 +256,7 @@ export function Tooltip({
       top = sideTop;
       caret = Math.max(14, Math.min(centerY - top, panelHeight - 14));
     }
-    const border = tipRef.current ? parseFloat(getComputedStyle(tipRef.current).borderLeftWidth) || 0 : 0;
+    const border = tipRef.current ? parseFloat(view.getComputedStyle(tipRef.current).borderLeftWidth) || 0 : 0;
     setPosition({
       left,
       top,
@@ -269,41 +283,44 @@ export function Tooltip({
     }
   }, [panelMounted, caption, kind]);
   useEffect(() => {
-    if (!interactionOpen || !panelMounted) return;
+    const view = ownerDocument?.defaultView;
+    if (!interactionOpen || !panelMounted || !view) return;
     let frame = 0;
     const schedulePick = () => {
-      window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => pickAlignRef.current());
+      view.cancelAnimationFrame(frame);
+      frame = view.requestAnimationFrame(() => pickAlignRef.current());
     };
     schedulePick();
-    const viewport = window.visualViewport;
+    const viewport = view.visualViewport;
     viewport?.addEventListener("resize", schedulePick);
     viewport?.addEventListener("scroll", schedulePick);
-    window.addEventListener("resize", schedulePick);
-    window.addEventListener("scroll", schedulePick, true);
+    view.addEventListener("resize", schedulePick);
+    view.addEventListener("scroll", schedulePick, true);
     return () => {
-      window.cancelAnimationFrame(frame);
+      view.cancelAnimationFrame(frame);
       viewport?.removeEventListener("resize", schedulePick);
       viewport?.removeEventListener("scroll", schedulePick);
-      window.removeEventListener("resize", schedulePick);
-      window.removeEventListener("scroll", schedulePick, true);
+      view.removeEventListener("resize", schedulePick);
+      view.removeEventListener("scroll", schedulePick, true);
     };
-  }, [panelMounted, interactionOpen, caption, kind]);
+  }, [panelMounted, interactionOpen, caption, kind, ownerDocument]);
 
   useEffect(() => {
     if (!interactionOpen) return;
     // Hover does not move keyboard focus into the trigger.
     const dismiss = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.isComposing) return;
       // Close every hint channel, including a hover panel suppressed by a
       // focused neighbour. Only visible guidance consumes the outer action.
-      const style = tipRef.current && getComputedStyle(tipRef.current);
+      const style = tipRef.current && ownerDocument?.defaultView?.getComputedStyle(tipRef.current);
       if (style?.visibility === "visible" && style.pointerEvents !== "none") event.preventDefault();
       dismissPanel();
     };
-    document.addEventListener("keydown", dismiss);
-    return () => document.removeEventListener("keydown", dismiss);
-  }, [interactionOpen]);
+    // Guidance consumes Escape before its containing window, regardless of
+    // which surface mounted first. Outer handlers respect defaultPrevented.
+    ownerDocument?.addEventListener("keydown", dismiss, true);
+    return () => ownerDocument?.removeEventListener("keydown", dismiss, true);
+  }, [interactionOpen, ownerDocument]);
 
   useEffect(() => {
     if (interactionOpen || !panelMounted) return;
@@ -339,9 +356,9 @@ export function Tooltip({
         dismissPanel();
       }
     };
-    document.addEventListener("pointerdown", dismiss);
-    return () => document.removeEventListener("pointerdown", dismiss);
-  }, [interactionOpen]);
+    ownerDocument?.addEventListener("pointerdown", dismiss);
+    return () => ownerDocument?.removeEventListener("pointerdown", dismiss);
+  }, [interactionOpen, ownerDocument]);
 
   const cancelPress = () => {
     if (pressTimer.current !== null) {
@@ -499,7 +516,7 @@ export function Tooltip({
           // This click only clears guidance; never pass it to a covered action.
           event.stopPropagation();
           // Dragging to select a caption or full nickname is still reading.
-          const selection = window.getSelection();
+          const selection = ownerDocument?.getSelection();
           if (!selection?.isCollapsed && tipRef.current.contains(selection?.anchorNode ?? null)) return;
           dismissPanel();
         } else if (!toggleOnClick && event.detail !== 0) {

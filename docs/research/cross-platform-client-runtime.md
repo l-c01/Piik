@@ -53,9 +53,10 @@ The App and Hosted Piik run the same server core, so the local package is
 one executable carrying the built Browser assets plus the optional capture and
 tunnel sidecars; [the App README](../../cmd/piik-app/README.md) owns
 that layout. In Local mode the App runs the server in its own process with
-explicit local configuration. In Site mode it starts no server, and the system
-Browser opens the saved Site while the same process remains its loopback
-native-media owner. The system Browser remains the UI.
+explicit local configuration. While waiting for an approved Site it starts no
+room server; the same process remains the Site's loopback native-media owner.
+The persistent launcher owns local approval and room startup independently.
+The system Browser remains the UI.
 
 Official Go process APIs require every started child to be waited and provide a
 bounded `WaitDelay` for cancellation and stuck I/O. That guidance now covers the
@@ -167,9 +168,11 @@ the existing 30-second startup budget. This affects HTTP/WebSocket control only;
 media routes, tunnel identity and ordered shutdown keep their existing owners.
 DNS failures, API rejection and networks blocking both transports can still fail.
 The preceding Quick Tunnel allocation is a single HTTPS request with a 15-second
-dependency timeout; failure exits before transport fallback applies. The App's
-pre-readiness exit message and exit code do not identify that cause. Match the
-same run's `public-tunnel` dependency diagnostics before classifying a report.
+dependency timeout; failure exits before transport fallback applies. The exit
+code alone does not identify that cause. An abnormal exit now retains the latest
+sanitized dependency error or plain stderr detail in the existing failure result.
+This is the last reported observation, not a classification or a complete log;
+match the same run's `public-tunnel` diagnostics when the detail is insufficient.
 Piik retries a child that exits before readiness, up to four starts with a
 one-second pause between starts, all within the same 30-second acquisition
 deadline. The previous child, output readers and temporary config retire before
@@ -190,12 +193,68 @@ own the dependency behavior. An early-exit fixture confirms fourth-start recover
 and bounded exhaustion; these checks do not identify a reporter's API or network
 failure or guarantee four starts when earlier attempts consume the deadline.
 
+A 2026-10-08 Windows check against a deliberately refused local allocation API
+confirmed that cloudflared 2026.8.3 emits its final allocation error as plain
+stderr even with `--output json`. A JSON-only error reader therefore misses it.
+The process boundary retains that detail without changing retries or shutdown;
+normal cancellation still stays clean, and late cleanup cannot erase an already
+observed failure. The launcher applies its existing redaction and display limit.
+
+The public App log in [#452](https://github.com/TNTcraftHIM/Piik/issues/452),
+reviewed on 2026-10-07, records a QUIC timeout followed by a TCP port-7844
+connect timeout within that deadline. Thus fallback ran; the report does not
+establish a local port-80/443 collision. Its accelerator dependency remains a
+network-path hypothesis requiring the same endpoint with/without the accelerator.
+The attachment contains no capture start, so it cannot diagnose the separately
+reported H.264 failure.
+
 [HTTP 1033](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1033/)
 means Cloudflare cannot find a healthy tunnel connector. App readiness requires
 both the assigned origin and a registered connection; later reconnection belongs
 to cloudflared, while process exit ends that App's public-link runtime. This
 HTTP failure precedes WebRTC candidate exchange and is distinct from media-route
 exhaustion on an already reachable site.
+The pinned [supervisor](https://github.com/cloudflare/cloudflared/blob/2026.8.3/supervisor/supervisor.go)
+uses [indefinite retries with bounded exponential backoff](https://github.com/cloudflare/cloudflared/blob/2026.8.3/retry/backoffhandler.go)
+for recoverable edge disconnects. Piik's four-start acquisition limit is not a
+four-reconnect limit after readiness. Restarting the Quick Tunnel process would
+allocate a new public address rather than repair the old invitation.
+
+## Major-Upgrade Delivery Assessment
+
+Reviewed 2026-10-06 against released update checkers and simulated v2.0.0
+metadata. The v1.0.0 checker opens a provider's release page; v1.1.0 and v1.9.1
+choose a matching ZIP on both GitHub and the Gitee fallback. Detection does not
+download or install anything: the user must click. These clients have no
+major-upgrade warning. The bounded replay used the released source, not the
+current candidate's checker.
+
+The legacy checkers accept exact provider release/asset URLs; release metadata
+cannot redirect them to `piik.tv`. A valid GitHub API response wins without
+checking whether its page or attachment is reachable. Gitee fallback selects
+the highest stable version itself, so keeping GitHub's Latest on a transition
+release does not constrain both discovery paths. Publishing a transition
+release first cannot guarantee that every installed client receives it.
+
+[Sparkle](https://sparkle-project.org/documentation/publishing/#major-upgrades)
+separates major-upgrade presentation from installation and supports
+[website downloads](https://sparkle-project.org/documentation/publishing/#downloading-from-a-web-site).
+Its [feature-upgrade guidance](https://sparkle-project.org/documentation/publishing/#upgrading-to-newer-features)
+also requires capable readers or a separate feed; metadata alone cannot teach
+older readers a new rule.
+
+[CC Switch's About panel](https://github.com/farion1231/cc-switch/blob/243cd9a93b67f56efac173f32505b4085fb40cae/src/components/settings/AboutSection.tsx)
+separates its update action from opening the target version's release notes.
+The installed edition downloads, installs and restarts. Reading release notes
+is optional. This supports Piik's action hierarchy, not adoption of CC Switch's
+installer or update infrastructure; no implementation code was copied.
+
+The evidence supports direct manual downloads with an optional release-note
+link and inline major-upgrade guidance. The accepted behavior belongs to
+[versioning](../standards/versioning.md#major-upgrade-guidance). Historical
+clients still follow their released behavior; a notice cannot substitute for
+actual App/Site compatibility checks. The scope of a future 2.0 break remains
+undecided.
 
 ## Remaining Gates
 

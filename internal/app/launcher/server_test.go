@@ -2,10 +2,14 @@ package launcher
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"testing"
@@ -40,7 +44,7 @@ func TestLauncherServesStateAndCompletesOneSelection(t *testing.T) {
 		Debug               *bool  `json:"debug"`
 	}
 	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&state) != nil ||
-		state.Site != "https://share.example" || state.DefaultMode != ModeSite ||
+		state.Site != "https://share.example" || state.DefaultMode != ModeLink ||
 		state.Version != "development" || state.Revision != "" || state.LocalAccessPassword != "" || state.Debug == nil || *state.Debug {
 		t.Fatalf("launcher state = %d, %+v", response.StatusCode, state)
 	}
@@ -48,7 +52,7 @@ func TestLauncherServesStateAndCompletesOneSelection(t *testing.T) {
 	result := make(chan *http.Response, 1)
 	requestErr := make(chan error, 1)
 	go func() {
-		response, err := http.Post(
+		response, err := localPost(
 			origin+"/api/client-launcher/launch",
 			"application/json",
 			bytes.NewBufferString(`{"mode":"link","language":"vis","debug":true}`),
@@ -83,6 +87,64 @@ func TestLauncherServesStateAndCompletesOneSelection(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("launcher did not return its result")
+	}
+}
+
+func TestRoomFailureInvalidatesReadyTargetButKeepsSiteApprovalAvailable(t *testing.T) {
+	server := startFixture(t, "https://share.example")
+	server.changeSite = func(site string) (string, error) { return site, nil }
+	origin := strings.TrimSuffix(server.URL(), "/client")
+	server.Begin()
+	server.SetResult("http://localhost:8787/#piik-client=1", nil)
+	server.SetResult("", errors.New("public invitation link stopped"))
+	response, err := http.Get(origin + "/api/client-launcher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var state struct {
+		Target, Detail, Site string
+		Starting             bool
+	}
+	if json.NewDecoder(response.Body).Decode(&state) != nil || state.Target != "" || state.Starting ||
+		state.Detail != "public invitation link stopped" || state.Site != "https://share.example" {
+		t.Fatalf("failed room state = %+v", state)
+	}
+	response, err = localPost(origin+"/api/client-launcher/site", "application/json",
+		strings.NewReader(`{"site":"","expectedSite":"https://share.example"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("failed room blocked approval revocation: %d", response.StatusCode)
+	}
+}
+
+func TestLauncherRetainsAcceptedSelectionAfterRequestCancellation(t *testing.T) {
+	// Cancellation may race the handoff, but cannot discard an accepted launch.
+	for range 32 {
+		server := &Server{
+			ctx:         t.Context(),
+			selection:   make(chan Selection, 1),
+			resultReady: make(chan struct{}),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/client-launcher/launch",
+			strings.NewReader(`{"mode":"link","language":"en"}`))
+		cancel()
+		server.handleLaunch(httptest.NewRecorder(), request)
+		select {
+		case selection := <-server.Selection():
+			if selection != (Selection{Mode: ModeLink, Language: "en"}) {
+				t.Fatalf("selection = %+v", selection)
+			}
+		default:
+			t.Fatal("cancelled Browser request left the App starting without a selection")
+		}
+		if server.Begin() {
+			t.Fatal("cancelled Browser request allowed a second launch")
+		}
 	}
 }
 
@@ -148,7 +210,7 @@ func TestLauncherLANChoicesUseCurrentAddressesAndTheExplicitPreference(t *testin
 				}
 			}
 			if err := json.NewDecoder(response.Body).Decode(&state); err != nil || response.StatusCode != http.StatusOK ||
-				state.DefaultMode != ModeSite || state.LAN == nil || state.LAN.Addresses == nil ||
+				state.DefaultMode != ModeLink || state.LAN == nil || state.LAN.Addresses == nil ||
 				state.LAN.Selected != test.selected || len(state.LAN.Addresses) != len(test.addresses) {
 				t.Fatalf("LAN choices = %+v, status %d, %v", state, response.StatusCode, err)
 			}
@@ -164,7 +226,7 @@ func TestLauncherLANChoicesUseCurrentAddressesAndTheExplicitPreference(t *testin
 func TestLauncherPassesTheChosenLANAddressToTheApp(t *testing.T) {
 	server := startFixture(t, "")
 	server.SetResult("http://localhost:8787/#piik-client=1", nil)
-	response, err := http.Post(strings.TrimSuffix(server.URL(), "/client")+"/api/client-launcher/launch",
+	response, err := localPost(strings.TrimSuffix(server.URL(), "/client")+"/api/client-launcher/launch",
 		"application/json", strings.NewReader(`{"mode":"local","language":"en","lanAddress":"192.168.1.4"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +268,7 @@ func TestLauncherPreservesAnOptionalLocalPassword(t *testing.T) {
 				t.Fatal(err)
 			}
 			go func() {
-				response, err := http.Post(
+				response, err := localPost(
 					origin+"/api/client-launcher/launch",
 					"application/json",
 					bytes.NewReader(payload),
@@ -257,6 +319,8 @@ func TestLauncherRejectsInvalidSelections(t *testing.T) {
 		"local-site":       `{"mode":"local","language":"en","site":"https://share.example"}`,
 		"missing-site":     `{"mode":"site","language":"en"}`,
 		"site-path":        `{"mode":"site","language":"en","site":"https://share.example/path"}`,
+		"bare-site-path":   `{"mode":"site","language":"en","site":"share.example/path"}`,
+		"site-credentials": `{"mode":"site","language":"en","site":"user:pass@share.example"}`,
 		"site-password":    `{"mode":"site","language":"en","site":"https://share.example","localAccessPassword":"valid-pass"}`,
 		"unknown-field":    `{"mode":"local","language":"en","extra":true}`,
 		"password-type":    `{"mode":"local","language":"en","localAccessPassword":123}`,
@@ -273,7 +337,7 @@ func TestLauncherRejectsInvalidSelections(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			server := startFixture(t, "")
 			origin := strings.TrimSuffix(server.URL(), "/client")
-			response, err := http.Post(
+			response, err := localPost(
 				origin+"/api/client-launcher/launch",
 				"application/json",
 				bytes.NewBufferString(payload),
@@ -310,7 +374,7 @@ func TestLauncherReportsSafeBoundedFailureDetails(t *testing.T) {
 	}
 	_ = response.Body.Close()
 	server.SetResult("", errors.New("public tunnel failed: token=private-secret "+strings.Repeat("network unavailable ", 200)))
-	response, err = http.Post(origin+"/api/client-launcher/launch", "application/json",
+	response, err = localPost(origin+"/api/client-launcher/launch", "application/json",
 		strings.NewReader(`{"mode":"link","language":"en"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -389,4 +453,15 @@ func startFixtureWithBuildAndPassword(
 	}
 	t.Cleanup(func() { _ = server.Close() })
 	return server
+}
+
+func localPost(target, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, target, body)
+	if err != nil {
+		return nil, err
+	}
+	address, _ := url.Parse(target)
+	req.Header.Set("Origin", address.Scheme+"://"+address.Host)
+	req.Header.Set("Content-Type", contentType)
+	return (&http.Client{Timeout: 3 * time.Second}).Do(req)
 }

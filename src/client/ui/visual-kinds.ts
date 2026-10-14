@@ -55,6 +55,7 @@ export type Set1Kind =
   | "hint-microphone-on"
   | "hint-microphone-off"
   | "hint-microphone-volume"
+  | "hint-microphone-processing"
   | "hint-capture-window"
   | "hint-capture-display";
 
@@ -71,6 +72,7 @@ export type Set2Kind =
 export type Set3Kind =
   | "hint-quality"
   | "hint-audio-quality"
+  | "hint-exclude-audio"
   | "hint-degrade-pref"
   | "hint-prefer-resolution"
   | "hint-prefer-framerate"
@@ -101,6 +103,7 @@ export type Set4Kind =
   | "hint-nat-prediction"
   | "hint-nat-unavailable"
   | "hint-client-local"
+  | "hint-app-ready"
   | "hint-client-site";
 
 export type PlaybackHintKind =
@@ -142,6 +145,15 @@ export type MetricHintKind = `hint-metric-${
   | "video-buffer" | "audio-buffer" | "concealment-rate" | "concealments"
 }`;
 
+export type InteractionHintKind =
+  | "hint-chat-open"
+  | "hint-chat-send"
+  | "hint-chat-settings"
+  | "hint-chat-export"
+  | "hint-chat-detach"
+  | "hint-chat-overlay-show"
+  | "hint-chat-overlay-hide";
+
 export type HintKind =
   | Set1Kind
   | Set2Kind
@@ -150,6 +162,7 @@ export type HintKind =
   | AdmissionHintKind
   | PlaybackHintKind
   | MetricHintKind
+  | InteractionHintKind
   | ControlHintKind;
 
 export type ComicTheme = "stage" | "paper";

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QUALITY_PROFILES } from "../src/client/media/quality.ts";
 import { SfuPublisher } from "../src/client/sfu/publisher.ts";
 import { SfuSubscriber } from "../src/client/sfu/subscriber.ts";
+import * as senderTracks from "../src/client/media/sender-video-track";
 import {
   clientMessageSchema,
   type SfuSignalMessage,
@@ -24,6 +25,7 @@ class FakeTrack extends EventTarget {
   readonly applyConstraints = vi.fn(
     async (_constraints: MediaTrackConstraints) => undefined,
   );
+  getConstraints() { return {}; }
   readonly clone = vi.fn(() => {
     const next = new FakeTrack(this.kind);
     this.clones.push(next);
@@ -190,6 +192,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -241,6 +244,74 @@ function feedVideoStats(
 }
 
 describe("embedded SFU browser transport", () => {
+  it.each([100_000, 200_000, 50_000_000])("keeps every simulcast output within the %i bps source ceiling", async (maxBitrate) => {
+    const send = vi.fn(() => true);
+    const host = new SfuPublisher({ send, onDisconnected: vi.fn() });
+    cleanups.push(() => host.disconnect());
+    await host.connect(config);
+    expect(await host.activate(stream(new FakeTrack("video")),
+      { ...QUALITY_PROFILES["1080p30"], maxBitrate, maxFramerate: 5 }, "h264")).toBe(true);
+    const encodings = FakePc.instances[0]!.transceivers[0]!.sender.getParameters().encodings;
+    expect(encodings).toHaveLength(2);
+    expect(encodings[1]!.maxBitrate).toBe(maxBitrate);
+    for (const encoding of encodings) {
+      expect(encoding.maxBitrate).toBeGreaterThan(0);
+      expect(encoding.maxBitrate).toBeLessThanOrEqual(maxBitrate);
+      expect(encoding.maxFramerate).toBe(5);
+    }
+  });
+
+  it("uses capture dimensions for simulcast before a generated sender has its first frame", async () => {
+    class Generator extends FakeTrack {
+      writable = new WritableStream<VideoFrame>();
+      constructor() { super("video"); this.getSettings.mockReturnValue({} as never); }
+    }
+    let frames!: ReadableStreamDefaultController<VideoFrame>;
+    vi.stubGlobal("MediaStreamTrackGenerator", Generator);
+    vi.stubGlobal("MediaStreamTrackProcessor", class {
+      readable = new ReadableStream<VideoFrame>({ start(controller) { frames = controller; } });
+    });
+    const video = new FakeTrack("video"), send = vi.fn(() => true), onDisconnected = vi.fn();
+    video.getSettings.mockReturnValue({ ...video.getSettings(), displaySurface: "browser" } as never);
+    const host = new SfuPublisher({ send, onDisconnected });
+    cleanups.push(() => host.disconnect());
+    await host.connect(config);
+    expect(await host.activate(stream(video), QUALITY_PROFILES["1080p30"], "h264")).toBe(true);
+    const sender = FakePc.instances[0]!.transceivers[0]!.sender;
+    expect(sender.track!.getSettings()).toEqual({});
+    expect(sender.parameters.encodings.map(e => e.scaleResolutionDownBy)).toEqual([2, 1]);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ media: expect.objectContaining({ layers: [
+      expect.objectContaining({ width: 960, height: 540 }), expect.objectContaining({ width: 1920, height: 1080 }),
+    ] }) }));
+    frames.error(new Error("display frame input failed"));
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    expect(onDisconnected).toHaveBeenCalledOnce();
+    expect(video.stop).not.toHaveBeenCalled();
+    expect(video.clones[0]!.readyState).toBe("ended");
+  });
+
+  it.each(["current", "replaced", "pending", "configuring"])("handles a %s frame input ending without affecting the source", async (phase) => {
+    const endings: Array<{ track: FakeTrack; end: () => void }> = [];
+    vi.spyOn(senderTracks, "cloneSenderVideoTrack").mockImplementation((source, onEnded) => {
+      const track = source.clone() as unknown as FakeTrack;
+      endings.push({ track, end() { track.stop(); onEnded(track as unknown as MediaStreamTrack); } });
+      return track as unknown as MediaStreamTrack;
+    });
+    const { publisher: host, pc, onDisconnected, video } = await publisher();
+    if (phase === "current") endings[0]!.end();
+    else {
+      const next = new FakeTrack("video");
+      if (phase === "pending") pc.transceivers[1]!.sender.replaceTrack.mockImplementationOnce(async () => endings[1]!.end());
+      if (phase === "configuring") pc.transceivers[0]!.sender.setParameters.mockImplementationOnce(async () => endings[1]!.end());
+      expect(await host.replaceStream(stream(next))).toBe(phase === "replaced");
+      if (phase === "replaced") endings[0]!.end();
+      expect(pc.transceivers[0]!.sender.track).toBe(endings[phase === "replaced" ? 1 : 0]!.track);
+      expect(next.stop).not.toHaveBeenCalled();
+    }
+    expect(onDisconnected).toHaveBeenCalledTimes(phase === "current" ? 1 : 0);
+    expect(video.stop).not.toHaveBeenCalled();
+  });
+
   it.each(["queued", "active"])("preserves publication after a %s candidate rejection", async (phase) => {
     const { publisher: host, pc, onDisconnected, video } = await publisher();
     const rejected = signal({ kind: "candidate", candidate: { candidate: "candidate:1 1 UDP 1 127.0.0.1 4100 typ host" } });
@@ -319,7 +390,7 @@ describe("embedded SFU browser transport", () => {
     const { publisher: host, pc, send } = await publisher();
     const profile = {
       ...QUALITY_PROFILES["720p30"],
-      screenAudioQuality: "very-high" as const,
+      maxAudioBitrate: 192000 as const,
     };
     expect(await host.updateProfile(profile)).toBe(true);
     expect(pc.transceivers[0]!.sender.parameters.encodings).toEqual([
@@ -577,6 +648,20 @@ describe("embedded SFU browser transport", () => {
     expect(onStream).toHaveBeenLastCalledWith(null);
   });
 
+  it("reports Browser video rejection through the existing SFU failure owner", async () => {
+    const send = vi.fn(() => true), onDisconnected = vi.fn();
+    const subscriber = new SfuSubscriber({ send, onStream: vi.fn(), onDisconnected });
+    cleanups.push(() => subscriber.disconnect());
+    await subscriber.connect(config);
+    const pc = FakePc.instances[0]!;
+    pc.createAnswer.mockResolvedValueOnce({ type: "answer", sdp: "m=video 0 UDP/TLS/RTP/SAVPF 120\r\n" });
+    await subscriber.acceptSignal(signal({ description: { type: "offer",
+      sdp: "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\n" } }));
+    expect(onDisconnected).toHaveBeenCalledExactlyOnceWith("VIDEO_REJECTED");
+    expect(pc.close).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it.each([
     [false, false], [true, false], [false, true], [true, true],
   ])("retires an unfinished ICE restart on reauthentication (send=%s, answer=%s)", async (sent, answered) => {
@@ -626,7 +711,7 @@ describe("embedded SFU browser transport", () => {
     expect(
       await host.updateProfile({
         ...QUALITY_PROFILES["1080p30"],
-        screenAudioQuality: "saver",
+        maxAudioBitrate: 64000,
       }),
     ).toBe(true);
     expect(video.clones[0]!.applyConstraints).toHaveBeenCalledTimes(

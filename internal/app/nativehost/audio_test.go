@@ -56,6 +56,17 @@ func runAudioRecoveryCapture() {
 		}
 	}
 	audio := microphone || (len(os.Args) > 1 && os.Args[1] == "--capture-audio")
+	if !audio && os.Getenv("PIIK_VIDEO_FAIL") == "1" {
+		os.Exit(2)
+	}
+	if !microphone && audio && os.Args[2] == "exclude" {
+		if os.Getenv("PIIK_EXCLUSION_FAIL") == "1" {
+			os.Exit(2)
+		}
+		if marker := os.Getenv("PIIK_EXCLUSION_STARTED"); marker != "" {
+			_ = os.WriteFile(marker, []byte(os.Args[3]+":"+os.Args[4]), 0600)
+		}
+	}
 	period := time.Second / 30
 	status := []byte(`{"state":"active","audio":true}`)
 	if audio {
@@ -136,9 +147,22 @@ func TestAudioEOFWaitsForExplicitSourceReplacement(t *testing.T) {
 			}
 		}
 	})
-	offer, err := session.PrepareLocalEdge("audio-edge")
+	offer, err := session.PrepareLocalEdge("audio-edge", "local_offer_1", false)
 	check(err)
 	check(receiver.SetRemoteDescription(offer))
+	// A receive preference belongs to this answer, not the upstream offer.
+	for _, transceiver := range receiver.GetTransceivers() {
+		if transceiver.Kind() != webrtc.RTPCodecTypeAudio {
+			continue
+		}
+		for _, codec := range transceiver.Receiver().GetParameters().Codecs {
+			if codec.MimeType == webrtc.MimeTypeOpus {
+				codec.SDPFmtpLine = "stereo=1;maxaveragebitrate=510000"
+				check(transceiver.SetCodecPreferences([]webrtc.RTPCodecParameters{codec}))
+				break
+			}
+		}
+	}
 	go func() {
 		for {
 			select {
@@ -160,7 +184,7 @@ func TestAudioEOFWaitsForExplicitSourceReplacement(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("receiver gathering timed out")
 	}
-	check(session.SetAnswer("audio-edge", *receiver.LocalDescription()))
+	check(session.SetAnswer("audio-edge", *receiver.LocalDescription(), "local_offer_1"))
 	waitPackets := func(counter *atomic.Uint64, minimum uint64, label string) {
 		t.Helper()
 		deadline := time.Now().Add(3 * time.Second)
@@ -179,7 +203,7 @@ func TestAudioEOFWaitsForExplicitSourceReplacement(t *testing.T) {
 	waitPackets(&videoPackets, videoPackets.Load()+10, "video after audio EOF")
 	before := audioPackets.Load()
 	options.Target.SourceID = "2"
-	check(session.ReplaceSource(options, true))
+	check(session.ReplaceSource(options, true, nil))
 	if session.currentStream() == previousVideo || session.currentAudioStream() == previousAudio ||
 		session.edge("audio-edge") != edge || session.audioSource != audioSource {
 		t.Fatal("explicit replacement did not preserve the media owners")

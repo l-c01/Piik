@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { discoverNativeHealth, NativeClient, NativeCompatibilityError, notifyNativePresentation } from "../src/client/native/client";
+import { discoverNativeConnect, discoverNativeHealth, NativeClient, NativeCompatibilityError, notifyNativePresentation } from "../src/client/native/client";
 import { DEFAULT_QUALITY_SETTINGS } from "../src/shared/protocol";
 
 import {
@@ -30,6 +30,142 @@ describe("native App private wire", () => {
     instanceToken: "a".repeat(43),
     nativeMedia: { video: true, hardwareH264: true },
   };
+
+  it("discovers only a local approval page without opening native control", async () => {
+    vi.stubGlobal("window", { setTimeout, clearTimeout, location: new URL("https://piik.example/r/9527") });
+    const socket = vi.fn();
+    vi.stubGlobal("WebSocket", socket);
+    const fetcher = vi.fn(async (url: string) => url === `http://127.0.0.1:${health.port}/connect-discovery`
+      ? new Response(JSON.stringify({ ...health, connectURL: "http://127.0.0.1:54321/client" }))
+      : new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(discoverNativeConnect()).resolves.toBe("http://127.0.0.1:54321/client?site=https%3A%2F%2Fpiik.example");
+    expect(fetcher.mock.calls.every(([url]) => url.endsWith("/connect-discovery"))).toBe(true);
+    expect(socket).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://untrusted.example/client", "http://localhost:54321/client", "http://127.0.0.1:54321/other",
+    "http://user@127.0.0.1:54321/client", "http://127.0.0.1:54321/client?site=https://other.example",
+  ])("rejects an unsafe App approval address: %s", async (connectURL) => {
+    vi.stubGlobal("window", { setTimeout, clearTimeout, location: new URL("https://piik.example/") });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => url === `http://127.0.0.1:${health.port}/connect-discovery`
+      ? new Response(JSON.stringify({ ...health, connectURL })) : new Response(null, { status: 404 })));
+    await expect(discoverNativeConnect()).resolves.toBeNull();
+  });
+
+  it("cancels the whole approval scan with its caller", async () => {
+    vi.stubGlobal("window", { setTimeout, clearTimeout, location: new URL("https://piik.example/") });
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      const signal = init.signal!;
+      signals.push(signal);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    })));
+    const controller = new AbortController();
+    const result = discoverNativeConnect(controller.signal);
+    controller.abort();
+    await expect(result).resolves.toBeNull();
+    expect(signals).toHaveLength(NATIVE_CLIENT_PORT_END - NATIVE_CLIENT_PORT_START + 1);
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+  });
+
+  it("reads numeric video capability descriptions and rejects malformed limits", () => {
+    const nativeMedia = { ...health.nativeMedia, maxVideoResolution: { width: 3840, height: 3840 },
+      maxVideoPixels: 3840 * 2160, maxVideoMacroblocksPerSecond: 983_040 };
+    expect(nativeHealthSchema.parse({ ...health, nativeMedia }).nativeMedia).toMatchObject(nativeMedia);
+    const stronger = { ...nativeMedia, maxVideoResolution: { width: 32768, height: 32768 },
+      maxVideoPixels: 32768 ** 2, maxVideoFramerate: 120, maxVideoBitrate: 100_000_000,
+      maxAudioBitrate: 960_000 };
+    expect(nativeHealthSchema.parse({ ...health, nativeMedia: stronger }).nativeMedia).toMatchObject(stronger);
+    expect(nativeHealthSchema.safeParse({ ...health, nativeMedia: { ...nativeMedia, maxVideoPixels: 0 } }).success).toBe(false);
+    expect(nativeHealthSchema.safeParse({ ...health, nativeMedia: { ...nativeMedia, maxVideoMacroblocksPerSecond: -1 } }).success).toBe(false);
+  });
+
+  it.each(["opening", "hello", "close"])("retires App acquisition during %s without waiting for its timeout", async stage => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(health))));
+    const sockets: Socket[] = [];
+    class Socket extends EventTarget {
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      readyState = 0;
+      protocol = `piik-client-v10.${health.instanceToken}`;
+      close = vi.fn(() => { this.readyState = Socket.CLOSING; });
+      send = vi.fn();
+      constructor() { super(); sockets.push(this); }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    const controller = new AbortController();
+    const settled = vi.fn();
+    const connecting = NativeClient.connect({ signal: controller.signal }).then(settled);
+    await vi.advanceTimersByTimeAsync(0);
+    const socket = sockets[0]!;
+    expect(socket).toBeDefined();
+    if (stage === "hello") {
+      socket.readyState = Socket.OPEN;
+      socket.dispatchEvent(new Event("open"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.send).toHaveBeenCalledOnce();
+    }
+    if (stage === "close") {
+      socket.readyState = 3;
+      socket.dispatchEvent(new Event("close"));
+    } else controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toHaveBeenCalledExactlyOnceWith(null);
+    expect(vi.getTimerCount()).toBe(0);
+    if (stage !== "close") expect(socket.close).toHaveBeenCalledOnce();
+    // An obsolete opening event cannot start a hello or revive acquisition.
+    socket.dispatchEvent(new Event("open"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.send).toHaveBeenCalledTimes(stage === "hello" ? 1 : 0);
+    await connecting;
+  });
+
+  it("binds a local answer to its prepare request across an ICE restart", async () => {
+    const requests: Record<string, unknown>[] = [];
+    class Socket extends EventTarget {
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      readyState = Socket.OPEN;
+      protocol = `piik-client-v10.${health.instanceToken}`;
+      constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
+      close() { this.readyState = Socket.CLOSING; }
+      send(payload: string) {
+        const request = JSON.parse(payload) as Record<string, unknown>;
+        requests.push(request);
+        const fields = request.type === "hello" ? { type: "ready" }
+          : request.type === "prepare-local-edge" ? {
+            type: "edge-offer", shareId: request.shareId, connectionId: request.connectionId, sdp: "v=0\r\n",
+          } : { type: "edge-answer-accepted" };
+        queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", {
+          data: JSON.stringify({ version: 10, id: request.id, ...fields }),
+        })));
+      }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(health))));
+    const controller = new AbortController();
+    const client = (await NativeClient.connect({ signal: controller.signal }))!;
+    controller.abort(); // Acquisition cancellation no longer owns this accepted client.
+    try {
+      let lastOffer = "";
+      for (const restart of [false, true]) {
+        const offer = await client.prepareLocalEdge("share_123456", "local_123456", "source_123456", restart);
+        expect(offer.offerId).toBe(requests.at(-1)?.id);
+        expect(offer.offerId).not.toBe(lastOffer);
+        expect(requests.at(-1)).toMatchObject({ type: "prepare-local-edge", restart, sourceConnectionId: "source_123456" });
+        await client.acceptSignal("share_123456", "local_123456", {
+          kind: "description", connectionId: "local_123456", description: { type: "answer", sdp: "v=0\r\n" },
+        }, offer.offerId);
+        expect(requests.at(-1)).toMatchObject({ type: "edge-answer", offerId: offer.offerId });
+        lastOffer = offer.offerId;
+      }
+    } finally { client.close(); }
+  });
 
   it.each(["prompt", "denied"] as const)("does not hold Viewer reception for %s permission and observes a later grant", async (state) => {
     vi.stubGlobal("window", { setTimeout, clearTimeout, location: { hostname: "piik.example" } });
@@ -216,7 +352,7 @@ describe("native App private wire", () => {
     });
     const fetcher = vi.fn(async (url: string) => url.endsWith("/health")
       ? new Response(JSON.stringify({
-          protocol: 9, service: "piik-client", port: 39_721,
+          protocol: 10, service: "piik-client", port: 39_721,
           instanceToken: "a".repeat(43),
           nativeMedia: {video: true, processAudio: false, systemAudio: true, hardwareH264: true, softwareVP8: true},
         }), {status: 200})
@@ -243,7 +379,7 @@ describe("native App private wire", () => {
       static readonly CLOSING = 2;
       static readonly CLOSED = 3;
       readyState = FakeWebSocket.OPEN;
-      protocol = `piik-client-v9.${token}`;
+      protocol = `piik-client-v10.${token}`;
       readonly close = vi.fn(() => {
         this.readyState = FakeWebSocket.CLOSING;
       });
@@ -261,7 +397,7 @@ describe("native App private wire", () => {
           const event = new Event("message");
           Object.defineProperty(event, "data", {
             value: JSON.stringify({
-              version: 9,
+              version: 10,
               id: request.id,
               type: request.type === "hello" ? "ready" : request.type === "ping" ? "pong" : "request-failed",
               ...(request.type === "update-share" ? { code: "operation-failed" } : {}),
@@ -283,7 +419,7 @@ describe("native App private wire", () => {
     });
     vi.stubGlobal("fetch", vi.fn(async () =>
       new Response(JSON.stringify({
-        protocol: 9,
+        protocol: 10,
         service: "piik-client",
         port: 39_721,
         instanceToken: token,
@@ -302,13 +438,27 @@ describe("native App private wire", () => {
     const unexpected = vi.fn();
     client!.onClose(unexpected);
     await expect(client!.updateShare("share_123456", DEFAULT_QUALITY_SETTINGS))
-      .rejects.toThrow("Piik App request failed");
+      .rejects.toMatchObject({ name: "NativeRequestError", reason: "rejected", operation: "update-share" });
     await client!.ping();
     expect(sockets[0]!.close).not.toHaveBeenCalled();
     expect(unexpected).not.toHaveBeenCalled();
+    vi.useFakeTimers();
+    window.setTimeout = globalThis.setTimeout;
+    window.clearTimeout = globalThis.clearTimeout;
+    const timedOut = expect(client!.sources()).rejects.toMatchObject({ reason: "timeout", operation: "list-sources" });
+    await vi.advanceTimersByTimeAsync(8_000);
+    await timedOut;
+    expect(sockets[0]!.close).not.toHaveBeenCalled();
+    vi.useRealTimers();
+    window.setTimeout = globalThis.setTimeout;
+    window.clearTimeout = globalThis.clearTimeout;
+    const pending = client!.sources();
+    const closedRequest = expect(pending).rejects.toMatchObject({ name: "NativeRequestError", reason: "disconnected", operation: "list-sources" });
     sockets[0]!.emitUnexpectedClose();
     sockets[0]!.emitUnexpectedClose();
     expect(unexpected).toHaveBeenCalledOnce();
+    await closedRequest;
+    await expect(client!.sources()).rejects.toMatchObject({ reason: "unavailable", operation: "list-sources" });
 
     const cleanClient = await NativeClient.connect();
     expect(cleanClient).not.toBeNull();
@@ -322,7 +472,7 @@ describe("native App private wire", () => {
   it("accepts descriptive health extensions and treats absent media features as unavailable", () => {
     expect(
       nativeHealthSchema.parse({
-        protocol: 9,
+        protocol: 10,
         service: "piik-client",
         port: 39_721,
         instanceToken: "a".repeat(43),
@@ -356,11 +506,11 @@ describe("native App private wire", () => {
     })).toEqual({
       ...health, nativeMedia: {
         receiverReuse: false,
-        video: true, processAudio: false, systemAudio: false, microphone: false, captureBorderControl: false, hardwareH264: false, softwareVP8: false,
+        video: true, processAudio: false, processAudioExclusion: false, systemAudio: false, microphone: false, captureBorderControl: false, hardwareH264: false, softwareVP8: false,
       },
     });
     expect(nativeHealthSchema.parse({ ...health, nativeMedia: undefined }).nativeMedia)
-      .toEqual({ receiverReuse: false, video: false, processAudio: false, systemAudio: false, microphone: false, captureBorderControl: false, hardwareH264: false, softwareVP8: false });
+      .toEqual({ receiverReuse: false, video: false, processAudio: false, processAudioExclusion: false, systemAudio: false, microphone: false, captureBorderControl: false, hardwareH264: false, softwareVP8: false });
     for (const invalid of [
       { protocol: 0 }, { protocol: 9.5 }, { protocol: Number.MAX_SAFE_INTEGER + 1 },
       { service: "other" }, { port: NATIVE_CLIENT_PORT_END + 1 }, { instanceToken: "short" },
@@ -374,7 +524,7 @@ describe("native App private wire", () => {
       static readonly OPEN = 1;
       static readonly CLOSING = 2;
       readyState = CaptureSocket.OPEN;
-      protocol = `piik-client-v9.${health.instanceToken}`;
+      protocol = `piik-client-v10.${health.instanceToken}`;
       constructor() {
         super();
         queueMicrotask(() => this.dispatchEvent(new Event("open")));
@@ -424,6 +574,54 @@ describe("native App private wire", () => {
     } finally { client!.close(); }
   });
 
+  it.each([false, true])("never silently drops requested audio exclusion (%s)", async (supported) => {
+    const requests: Record<string, unknown>[] = [];
+    class Socket extends EventTarget {
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      readyState = Socket.OPEN;
+      protocol = `piik-client-v10.${health.instanceToken}`;
+      constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
+      close() { this.readyState = Socket.CLOSING; }
+      send(payload: string) {
+        const request = JSON.parse(payload) as Record<string, unknown>;
+        requests.push(request);
+        queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+          version: NATIVE_CLIENT_PROTOCOL, id: request.id,
+          ...(request.type === "hello" ? { type: "ready" } : {
+            type: request.type === "start-share" ? "share-started" : "share-source-replaced", shareId: request.shareId,
+            ...(request.type === "start-share" ? { audio: true, codec: "vp8", sourceAudio: true } : {}),
+          }),
+        }) })));
+      }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...health,
+      nativeMedia: { ...health.nativeMedia, microphone: true, ...(supported ? { processAudioExclusion: true } : {}) },
+    }))));
+    const client = (await NativeClient.connect())!;
+    const input = { shareId: "share_123456", source: { kind: "display" as const, sourceId: "1", title: "Display" },
+      audio: true, adapterIndex: 0, encoderIndex: 0, edgeCapacity: 1, profile: DEFAULT_QUALITY_SETTINGS, codec: "vp8" as const };
+    const excludeAudio = { kind: "window" as const, sourceId: "2", pid: 123, creationTime: "456", title: "Voice fixture" };
+    try {
+      expect(client.health.nativeMedia.processAudioExclusion).toBe(supported);
+      await client.startShare(input);
+      expect(requests.at(-1)).not.toHaveProperty("excludeAudio");
+      if (supported) {
+        await client.startShare({ ...input, excludeAudio });
+        await client.replaceShareSource(input.shareId, input.source, true, input, false, excludeAudio);
+        expect(requests.at(-2)?.excludeAudio).toEqual(excludeAudio);
+        expect(requests.at(-1)?.excludeAudio).toEqual(excludeAudio);
+      } else {
+        const count = requests.length;
+        await expect(client.startShare({ ...input, excludeAudio })).rejects.toThrow("audio exclusion");
+        await expect(client.replaceShareSource(input.shareId, input.source, true, input, false, excludeAudio)).rejects.toThrow("audio exclusion");
+        expect(requests).toHaveLength(count);
+      }
+    } finally { client.close(); }
+  });
+
   it.each([false, true])("gates microphone mixing and coalesces volume without delaying Stop (%s)", async (supported) => {
     const requests: Record<string, unknown>[] = [];
     let socket!: Socket;
@@ -431,11 +629,11 @@ describe("native App private wire", () => {
       static readonly OPEN = 1;
       static readonly CLOSING = 2;
       readyState = Socket.OPEN;
-      protocol = `piik-client-v9.${health.instanceToken}`;
+      protocol = `piik-client-v10.${health.instanceToken}`;
       constructor() { super(); socket = this; queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
       close() { this.readyState = Socket.CLOSING; }
       ack(request: Record<string, unknown>, type: string, fields = {}) {
-        this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ version: 9, id: request.id, type, ...fields }) }));
+        this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ version: 10, id: request.id, type, ...fields }) }));
       }
       send(payload: string) {
         const request = JSON.parse(payload) as Record<string, unknown>;
@@ -494,14 +692,14 @@ describe("native App private wire", () => {
       static readonly OPEN = 1;
       static readonly CLOSING = 2;
       readyState = Socket.OPEN;
-      protocol = `piik-client-v9.${health.instanceToken}`;
+      protocol = `piik-client-v10.${health.instanceToken}`;
       constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
       close() { this.readyState = Socket.CLOSING; }
       send(payload: string) {
         const request = JSON.parse(payload) as Record<string, unknown>;
         requests.push(request);
         queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
-          version: 9, id: request.id, ...(request.type === "hello" ? { type: "ready" } : {
+          version: 10, id: request.id, ...(request.type === "hello" ? { type: "ready" } : {
             type: "receive-answer", shareId: request.shareId, connectionId: request.connectionId,
             sdp: "answer", audio: false, codec: "vp8", ...(supported ? { reused: true } : {}),
           }),
@@ -516,7 +714,7 @@ describe("native App private wire", () => {
     const client = (await NativeClient.connect())!;
     try {
       const result = await client.receiveOffer("share_123456", "connection_1234", { type: "offer", sdp: "offer" }, { iceServers: [] }, 2);
-      expect(requests.at(-1)).toEqual({ version: 9, id: expect.any(String), type: "receive-offer",
+      expect(requests.at(-1)).toEqual({ version: 10, id: expect.any(String), type: "receive-offer",
         shareId: "share_123456", connectionId: "connection_1234", sdp: "offer", iceServers: [], edgeCapacity: 2,
         ...(supported ? { reuseReceiver: true } : {}),
       });
@@ -561,7 +759,7 @@ describe("native App private wire", () => {
 
   it("fences native events by share and connection identity", () => {
     const event = {
-      version: 9,
+      version: 10,
       type: "edge-state",
       shareId: "share_123456",
       connectionId: "edge_1234567",
@@ -575,7 +773,7 @@ describe("native App private wire", () => {
       nativeEventSchema.safeParse({ ...event, routeRevision: 1 }).success,
     ).toBe(false);
     const path = {
-      version: 9,
+      version: 10,
       type: "edge-path",
       shareId: "share_123456",
       connectionId: "edge_1234567",
@@ -590,7 +788,7 @@ describe("native App private wire", () => {
 
   it("keeps an unavailable preview advisory instead of treating it as media failure", () => {
     const preview = {
-      version: 9,
+      version: 10,
       id: "request_preview",
       type: "source-preview",
       sourceKey: "display:65537",
@@ -610,14 +808,14 @@ describe("native App private wire", () => {
 
   it("keeps native share lifecycle responses as strict acknowledgements", () => {
     const profile = {
-      resolution: "1440p",
+      resolution: { width: 2560, height: 1440 },
       maxFramerate: 60,
       maxBitrate: 12_000_000,
       degradationPreference: "maintain-framerate",
-      screenAudioQuality: "very-high",
+      maxAudioBitrate: 192000,
     };
     expect(shareStartedResponseSchema.safeParse({
-      version: 9,
+      version: 10,
       id: "request_start",
       type: "share-started",
       shareId: "share_123456",
@@ -625,19 +823,19 @@ describe("native App private wire", () => {
       codec: "h264",
     }).success).toBe(true);
     expect(shareUpdatedResponseSchema.safeParse({
-      version: 9,
+      version: 10,
       id: "request_update",
       type: "share-updated",
       shareId: "share_123456",
     }).success).toBe(true);
     expect(shareSourceReplacedResponseSchema.safeParse({
-      version: 9,
+      version: 10,
       id: "request_source",
       type: "share-source-replaced",
       shareId: "share_123456",
     }).success).toBe(true);
     expect(shareUpdatedResponseSchema.safeParse({
-      version: 9,
+      version: 10,
       id: "request_update",
       type: "share-updated",
       shareId: "share_123456",
@@ -647,7 +845,7 @@ describe("native App private wire", () => {
 
   it("requires the actual Native codec instead of reporting Auto as media", () => {
     const response = {
-      version: 9,
+      version: 10,
       id: "request_receive",
       type: "receive-answer",
       shareId: "share_123456",
@@ -658,7 +856,7 @@ describe("native App private wire", () => {
     for (const codec of ["h264", "vp8"]) {
       expect(receiveAnswerResponseSchema.safeParse({ ...response, codec }).success).toBe(true);
       expect(shareStartedResponseSchema.safeParse({
-        version: 9, id: "request_start", type: "share-started",
+        version: 10, id: "request_start", type: "share-started",
         shareId: response.shareId, audio: false, codec,
       }).success).toBe(true);
     }
@@ -668,7 +866,7 @@ describe("native App private wire", () => {
 
   it("accepts only internally consistent native quality evidence", () => {
     const event = {
-      version: 9,
+      version: 10,
       type: "edge-quality",
       shareId: "share_123456",
       connectionId: "edge_1234567",
@@ -696,5 +894,48 @@ describe("native App private wire", () => {
         reason: null,
       }).success,
     ).toBe(true);
+  });
+
+  it.each(["edge-quality", "publication-quality"] as const)("isolates %s observations from control lifetime", async (type) => {
+    class Socket extends EventTarget {
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static latest: Socket;
+      readyState = Socket.OPEN;
+      protocol = `piik-client-v10.${health.instanceToken}`;
+      close = vi.fn(() => { this.readyState = Socket.CLOSING; this.dispatchEvent(new Event("close")); });
+      constructor() { super(); Socket.latest = this; queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
+      emit(value: unknown) { this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(value) })); }
+      send(payload: string) {
+        const request = JSON.parse(payload);
+        this.emit({ version: 10, id: request.id, type: request.type === "hello" ? "ready" : "pong" });
+      }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(health)));
+    const client = (await NativeClient.connect())!;
+    const received = vi.fn();
+    client.onEvent(received);
+    const event = { version: 10, type, shareId: "share_123456", connectionId: "connection_123456",
+      sampleTimestampMs: 10_000, sampleWindowMs: 2_000, rtpStatsId: "rtp-1", trackIdentifier: "screen",
+      state: "healthy", reason: "none", framesPerSecond: 480, bitrateKbps: 120_000,
+      availableOutgoingKbps: 1_000_000, width: 1920, height: 1080,
+      ...(type === "edge-quality" ? { intervalFramesEncoded: 60 } : {
+        publicationGeneration: "publication_123456", codec: "vp8", videoEncodingCount: 2,
+        activeVideoEncodingCount: 2, rid: "h", intervalFramesSent: 60, audioBitrateKbps: 192,
+      }),
+    };
+    Socket.latest.emit(event);
+    expect(received).toHaveBeenLastCalledWith(event);
+    Socket.latest.emit({ ...event, framesPerSecond: -1, availableOutgoingKbps: "invalid" });
+    expect(received).toHaveBeenLastCalledWith({ ...event, framesPerSecond: null, availableOutgoingKbps: null });
+    // Invalid identity/state never becomes evidence, but cannot retire media.
+    Socket.latest.emit({ ...event, shareId: "bad", state: "degraded", reason: "none" });
+    expect(received).toHaveBeenCalledTimes(2);
+    await expect(client.ping()).resolves.toBeUndefined();
+    expect(Socket.latest.close).not.toHaveBeenCalled();
+    Socket.latest.emit({ version: 10, type: "edge-state", shareId: "bad" });
+    expect(Socket.latest.close).toHaveBeenCalledWith(1008, "invalid Client message");
   });
 });

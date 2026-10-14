@@ -15,8 +15,15 @@ private let height = 720
 private let frameRate: Int32 = 30
 private let bitrate = 3_000_000
 private let maxPayloadBytes = 4_194_304
+private let maxVideoDimension = 8192
+private let maxVideoPixels = 36_864 * 16 * 16
+private let maxVideoFramerate: Int32 = 240
+private let maxVideoBitrate = 240_000_000
+private let maxCodedVideoDimension = 8192
+private let maxCodedVideoPixels = 36_864 * 16 * 16
 private let supportedH264Levels: Set<UInt8> = [
-    0x1e, 0x1f, 0x20, 0x28, 0x29, 0x2a, 0x32, 0x33,
+    0x0a, 0x0b, 0x0c, 0x0d, 0x14, 0x15, 0x16,
+    0x1e, 0x1f, 0x20, 0x28, 0x29, 0x2a, 0x32, 0x33, 0x34,
 ]
 
 private enum DegradationPreference: String {
@@ -43,6 +50,61 @@ private struct OutputProfile: Codable {
     let bitrate: Int
 
     var frameInterval: CMTime { CMTime(value: 1, timescale: fps) }
+}
+
+// Keep the captured pixels, their clean aperture and their unscaled size together.
+// ScreenCaptureKit may place scaled window content inside a larger fixed surface.
+private struct VideoImage {
+    let buffer: CVPixelBuffer
+    let size: CGSize
+
+    init(_ buffer: CVPixelBuffer) {
+        self.buffer = buffer
+        self.size = CVImageBufferGetCleanRect(buffer).size
+    }
+
+    init?(_ buffer: CVPixelBuffer, attachments: [SCStreamFrameInfo: Any]) {
+        guard let dictionary = attachments[.contentRect] as? [String: Any],
+              let rect = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
+              let scale = attachments[.scaleFactor] as? CGFloat,
+              let contentScale = attachments[.contentScale] as? CGFloat,
+              scale.isFinite, scale > 0, contentScale.isFinite, contentScale > 0 else {
+            return nil
+        }
+        let crop = CGRect(x: rect.minX * scale, y: rect.minY * scale,
+                          width: rect.width * scale, height: rect.height * scale)
+        let bounds = CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(buffer),
+                            height: CVPixelBufferGetHeight(buffer))
+        guard crop.minX.isFinite, crop.minY.isFinite,
+              crop.width.isFinite, crop.height.isFinite,
+              crop.width > 0, crop.height > 0, bounds.contains(crop) else { return nil }
+        let size = CGSize(width: crop.width / contentScale, height: crop.height / contentScale)
+        guard size.width.isFinite, size.height.isFinite else { return nil }
+        // Set once before sharing the retained buffer with the output workers.
+        let aperture: [String: Any] = [
+            kCVImageBufferCleanApertureWidthKey as String: crop.width,
+            kCVImageBufferCleanApertureHeightKey as String: crop.height,
+            kCVImageBufferCleanApertureHorizontalOffsetKey as String: crop.midX - bounds.midX,
+            kCVImageBufferCleanApertureVerticalOffsetKey as String: crop.midY - bounds.midY,
+        ]
+        CVBufferSetAttachment(buffer, kCVImageBufferCleanApertureKey,
+                              aperture as CFDictionary, .shouldPropagate)
+        self.buffer = buffer
+        self.size = size
+    }
+
+    func fitted(to profile: OutputProfile) throws -> OutputProfile {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            throw CaptureFailure(description: "invalid video content size")
+        }
+        let scale = min(1, CGFloat(profile.width) / size.width,
+                        CGFloat(profile.height) / size.height)
+        return OutputProfile(
+            width: max(2, Int((size.width * scale / 2).rounded(.down)) * 2),
+            height: max(2, Int((size.height * scale / 2).rounded(.down)) * 2),
+            fps: profile.fps, bitrate: profile.bitrate
+        )
+    }
 }
 
 private enum CaptureControl {
@@ -218,21 +280,8 @@ private func shareableWindows(_ content: SCShareableContent) -> [(SCWindow, Capt
     }
 }
 
-private func hardwareH264Available() -> Bool {
-    do {
-        let encoder = try HardwareEncoder(
-            writer: ProtocolWriter(),
-            done: StopSignal()
-        )
-        encoder.close()
-        return true
-    } catch {
-        return false
-    }
-}
-
 private func probe() throws {
-    let encoders = hardwareH264Available()
+    let encoders = HardwareEncoder.isAvailable()
         ? [EncoderProbe(
             index: 0,
             name: "VideoToolbox H.264",
@@ -444,11 +493,19 @@ private func h264ParameterSets(_ format: CMFormatDescription) throws -> [Data] {
         result.append(Data(bytes: pointer, count: size))
     }
     let sps = result[0]
-    guard sps.count >= 4, sps[1] == 0x42, sps[2] == 0xc0,
-          supportedH264Levels.contains(sps[3]) else {
+    guard sps.count >= 4, supportedH264Profile(sps[1], sps[2], sps[3]) else {
         throw CaptureFailure(description: "H.264 profile is outside the product envelope")
     }
     return result
+}
+
+private func supportedH264Profile(_ profile: UInt8, _ constraints: UInt8, _ level: UInt8) -> Bool {
+    // RFC 6184 Table 5: equivalent Constrained Baseline tools, as in the Go reader.
+    supportedH264Levels.contains(level) && (
+        (profile == 0x42 && constraints & 0x4f == 0x40) ||
+        (profile == 0x4d && constraints & 0x8f == 0x80) ||
+        (profile == 0x58 && constraints & 0xcf == 0xc0)
+    )
 }
 
 private func annexB(_ sample: CMSampleBuffer, keyFrame: Bool) throws -> (payload: Data, recovery: Bool) {
@@ -520,7 +577,7 @@ private func h264ProfileLevelID(_ payload: Data) -> String? {
 
 private final class HardwareEncoder {
     private struct Input {
-        let image: CVImageBuffer
+        let image: VideoImage
         let timestamp: CMTime
     }
 
@@ -540,9 +597,11 @@ private final class HardwareEncoder {
     private var currentBitrate: Int
     private var lastFrameBucket: Int64?
     private let sourceFrameRate: Int32
+    private let preference: DegradationPreference
     private let profile: OutputProfile
+    private var output: OutputProfile?
     private let layer: UInt8
-    private let onActive: (String) throws -> Void
+    private let onActive: (String, OutputProfile) throws -> Void
     private let onFailure: (Error) -> Void
 
     init(
@@ -551,9 +610,9 @@ private final class HardwareEncoder {
         profile sourceProfile: VideoProfile = defaultVideoProfile,
         output: OutputProfile? = nil,
         layer: UInt8 = 0,
-        onActive: @escaping (String) throws -> Void = { _ in },
+        onActive: @escaping (String, OutputProfile) throws -> Void = { _, _ in },
         onFailure: ((Error) -> Void)? = nil
-    ) throws {
+    ) {
         self.writer = writer
         let profile = output ?? OutputProfile(
             width: sourceProfile.width, height: sourceProfile.height,
@@ -561,12 +620,40 @@ private final class HardwareEncoder {
         )
         self.profile = profile
         self.sourceFrameRate = sourceProfile.frameRate
+        self.preference = sourceProfile.preference
         self.layer = layer
         self.onActive = onActive
         self.onFailure = onFailure ?? { done.signal($0) }
         self.queue = DispatchQueue(label: "piik.capture.encoder.\(layer)")
         desiredBitrate = profile.bitrate
         currentBitrate = profile.bitrate
+    }
+
+    static func isAvailable() -> Bool {
+        let encoder = HardwareEncoder(writer: ProtocolWriter(), done: StopSignal())
+        defer { encoder.close() }
+        do {
+            _ = try encoder.queue.sync {
+                try encoder.prepare(encoder.profile, bitrate: encoder.profile.bitrate)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    // Called only by the encoder queue after the previous frame has completed.
+    // A size change replaces this output's codec, not its capture or media route.
+    private func prepare(_ requested: OutputProfile, bitrate: Int) throws -> Bool {
+        if let output, output.width == requested.width, output.height == requested.height {
+            return false
+        }
+        if let session { VTCompressionSessionInvalidate(session) }
+        if let transfer { VTPixelTransferSessionInvalidate(transfer) }
+        session = nil
+        transfer = nil
+        output = nil
+        let profile = requested
         let specification = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true,
         ] as CFDictionary
@@ -601,20 +688,32 @@ private final class HardwareEncoder {
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
             try set(kVTCompressionPropertyKey_ProfileLevel,
                     kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel)
-            try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: profile.bitrate))
+            try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: profile.fps))
             try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: profile.fps * 2))
-            if sourceProfile.preference != .balanced {
+            if preference != .balanced {
                 try? set(
                     kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
-                    sourceProfile.preference == .framerate ? kCFBooleanTrue : kCFBooleanFalse
+                    preference == .framerate ? kCFBooleanTrue : kCFBooleanFalse
                 )
             }
             try require(VTPixelTransferSessionCreate(
                 allocator: nil, pixelTransferSessionOut: &transfer
             ), "videotoolbox-scaler-create")
+            guard let transfer else {
+                throw CaptureFailure(description: "VideoToolbox returned no scaler")
+            }
+            try require(VTSessionSetProperty(transfer,
+                key: kVTPixelTransferPropertyKey_ScalingMode,
+                value: kVTScalingMode_CropSourceToCleanAperture), "videotoolbox-scale-mode")
             try require(VTCompressionSessionPrepareToEncodeFrames(created),
                         "videotoolbox-prepare")
+            output = profile
+            currentBitrate = bitrate
+            lock.lock()
+            decodable = false
+            lock.unlock()
+            return true
         } catch {
             VTCompressionSessionInvalidate(created)
             if let transfer { VTPixelTransferSessionInvalidate(transfer) }
@@ -644,7 +743,7 @@ private final class HardwareEncoder {
         lock.unlock()
     }
 
-    func encode(_ image: CVImageBuffer, timestamp: CMTime) {
+    func encode(_ image: VideoImage, timestamp: CMTime) {
         lock.lock()
         guard !closed, !failed else {
             lock.unlock()
@@ -676,18 +775,22 @@ private final class HardwareEncoder {
             return
         }
         pending = nil
-        let force = forceKeyFrame
+        var force = forceKeyFrame
         forceKeyFrame = false
         let bitrate = desiredBitrate
         encodingTimestamp = input.timestamp
         lock.unlock()
-        guard let session else { return }
         do {
+            let output = try input.image.fitted(to: profile)
+            if try prepare(output, bitrate: bitrate) { force = true }
+            guard let session else {
+                throw CaptureFailure(description: "VideoToolbox encoder is unavailable")
+            }
             if currentBitrate != bitrate {
                 try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
                 currentBitrate = bitrate
             }
-            let image = try scaled(input.image)
+            let image = try scaled(input.image.buffer, output: output)
             let properties = force
                 ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary
                 : nil
@@ -729,7 +832,7 @@ private final class HardwareEncoder {
                         throw CaptureFailure(description: "invalid H.264 timestamp")
                     }
                     try writer.writeH264(
-                        payload, keyFrame: keyFrame, layer: layer, profile: profile,
+                        payload, keyFrame: keyFrame, layer: layer, profile: output,
                         timestamp: UInt64(CMTimeConvertScale(
                             pts, timescale: 10_000_000, method: .roundTowardZero
                         ).value),
@@ -739,7 +842,7 @@ private final class HardwareEncoder {
                         guard let profileLevelId = h264ProfileLevelID(payload) else {
                             throw CaptureFailure(description: "H.264 key frame has no SPS profile")
                         }
-                        try onActive(profileLevelId)
+                        try onActive(profileLevelId, output)
                     }
                 } catch {
                     if force { requestKeyFrame() }
@@ -767,9 +870,11 @@ private final class HardwareEncoder {
         if current { queue.async { self.encodePending() } }
     }
 
-    private func scaled(_ image: CVImageBuffer) throws -> CVPixelBuffer {
-        if CVPixelBufferGetWidth(image) == profile.width &&
-            CVPixelBufferGetHeight(image) == profile.height {
+    private func scaled(_ image: CVImageBuffer, output: OutputProfile) throws -> CVPixelBuffer {
+        let bounds = CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(image),
+                            height: CVPixelBufferGetHeight(image))
+        if Int(bounds.width) == output.width && Int(bounds.height) == output.height &&
+            CVImageBufferGetCleanRect(image) == bounds {
             return image
         }
         guard let session, let transfer,
@@ -855,22 +960,18 @@ private final class EncoderGroup {
         try writer.writeStatus(StartingStatus(outputs: outputs))
         if !encoded {
             for index in 0...originalOutput { setActive(index, true) }
-            if encoders[originalOutput] == nil {
-                close()
-                throw CaptureFailure(description: "original hardware video output is unavailable")
-            }
         }
     }
 
-    private func reportActive(_ profileLevelId: String) throws {
+    private func reportActive(_ profileLevelId: String, output: OutputProfile) throws {
         lock.lock()
         let publish = !active
         active = true
         lock.unlock()
         if publish {
             try writer.writeStatus(ActiveStatus(
-                profileLevelId: profileLevelId, width: profile.width,
-                height: profile.height, fps: profile.frameRate, outputs: outputs
+                profileLevelId: profileLevelId, width: output.width,
+                height: output.height, fps: profile.frameRate, outputs: outputs
             ))
         }
     }
@@ -888,7 +989,7 @@ private final class EncoderGroup {
         if allFailed || startupFailed { done.signal(error) }
     }
 
-    func encode(_ image: CVImageBuffer, timestamp: CMTime) throws {
+    func encode(_ image: VideoImage, timestamp: CMTime) throws {
         lifecycle.lock()
         defer { lifecycle.unlock() }
         if closed { return }
@@ -926,21 +1027,17 @@ private final class EncoderGroup {
         lock.lock()
         failedLayers.remove(layer)
         lock.unlock()
-        do {
-            let encoder = try HardwareEncoder(
-                writer: writer, done: done, profile: profile,
-                output: outputs[index], layer: layer,
-                onActive: { [weak self] profileLevelId in
-                    guard let self, index == self.originalOutput else { return }
-                    try self.reportActive(profileLevelId)
-                },
-                onFailure: { [weak self] in self?.unavailable(layer, $0) }
-            )
-            encoder.setBitrate(bitrates[index])
-            encoders[index] = encoder
-        } catch {
-            unavailable(layer, error)
-        }
+        let encoder = HardwareEncoder(
+            writer: writer, done: done, profile: profile,
+            output: outputs[index], layer: layer,
+            onActive: { [weak self] profileLevelId, output in
+                guard let self, index == self.originalOutput else { return }
+                try self.reportActive(profileLevelId, output: output)
+            },
+            onFailure: { [weak self] in self?.unavailable(layer, $0) }
+        )
+        encoder.setBitrate(bitrates[index])
+        encoders[index] = encoder
     }
 
     func setBitrate(_ layer: Int, _ bitrate: Int) {
@@ -976,7 +1073,9 @@ private final class EnvelopeCollector {
     }
 }
 
-private func syntheticPixelBuffer() throws -> CVPixelBuffer {
+private func syntheticPixelBuffer(
+    width imageWidth: Int = width, height imageHeight: Int = height
+) throws -> CVPixelBuffer {
     let attributes = [
         kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary,
     ] as CFDictionary
@@ -984,8 +1083,8 @@ private func syntheticPixelBuffer() throws -> CVPixelBuffer {
     try require(
         CVPixelBufferCreate(
             kCFAllocatorDefault,
-            width,
-            height,
+            imageWidth,
+            imageHeight,
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             attributes,
             &value
@@ -1030,15 +1129,88 @@ private func containsRequiredH264Units(_ envelope: Data) -> Bool {
 private func selfTest() throws {
     let collector = EnvelopeCollector()
     let writer = ProtocolWriter(output: { collector.append($0) })
-    let encoder = try HardwareEncoder(writer: writer, done: StopSignal())
-    encoder.encode(
-        try syntheticPixelBuffer(),
-        timestamp: CMTime(value: 1, timescale: frameRate)
-    )
-    encoder.flush()
-    encoder.close()
-    guard collector.snapshot().contains(where: containsRequiredH264Units) else {
-        throw CaptureFailure(description: "hardware H.264 self-test produced no IDR")
+    let encoder = HardwareEncoder(writer: writer, done: StopSignal())
+    defer { encoder.close() }
+    let cases = [(1280, 720, 1280, 720), (720, 1280, 404, 720),
+                 (1720, 720, 1280, 534), (640, 480, 640, 480), (1280, 720, 1280, 720)]
+    for (index, item) in cases.enumerated() {
+        let previous = collector.snapshot().count
+        encoder.encode(
+            VideoImage(try syntheticPixelBuffer(width: item.0, height: item.1)),
+            timestamp: CMTime(value: Int64(index + 1), timescale: frameRate)
+        )
+        encoder.flush()
+        guard let envelope = collector.snapshot().dropFirst(previous).first(where: containsRequiredH264Units),
+              Int(envelope[24]) * 256 + Int(envelope[25]) == item.2,
+              Int(envelope[26]) * 256 + Int(envelope[27]) == item.3 else {
+            throw CaptureFailure(description: "hardware H.264 resize self-test failed at \(index)")
+        }
+    }
+}
+
+private func geometrySelfTest() throws {
+    let profiles: [(UInt32, Bool)] = [
+        (0x42c034, true), (0x42e034, true), (0x42c00a, true),
+        (0x4d8034, true), (0x58c034, true),
+        (0x4d0034, false), (0x640034, false), (0x42c035, false), (0x42c134, false),
+    ]
+    for (profile, expected) in profiles {
+        guard supportedH264Profile(UInt8(profile >> 16), UInt8((profile >> 8) & 0xff),
+                                   UInt8(profile & 0xff)) == expected else {
+            throw CaptureFailure(description: "H.264 profile admission self-test failed")
+        }
+    }
+    let buffer = try syntheticPixelBuffer()
+    let ceiling = OutputProfile(width: 1280, height: 720, fps: frameRate, bitrate: bitrate)
+    let rect = CGRect(x: 50, y: 40, width: 200, height: 300)
+    let attachments: [SCStreamFrameInfo: Any] = [
+        .contentRect: rect.dictionaryRepresentation,
+        .scaleFactor: CGFloat(2), .contentScale: CGFloat(1),
+    ]
+    // Core Video returns a lower-left origin; the surface crop starts 80 px
+    // from the top, so its lower edge is 720 - 80 - 600 = 40 px from the bottom.
+    guard let image = VideoImage(buffer, attachments: attachments),
+          try image.fitted(to: ceiling).width == 400,
+          try image.fitted(to: ceiling).height == 600,
+          CVImageBufferGetCleanRect(buffer) == CGRect(x: 100, y: 40, width: 400, height: 600) else {
+        throw CaptureFailure(description: "capture content geometry self-test failed")
+    }
+    var upscaled = attachments
+    upscaled[.contentScale] = CGFloat(2)
+    guard let smaller = VideoImage(buffer, attachments: upscaled),
+          try smaller.fitted(to: ceiling).width == 200,
+          try smaller.fitted(to: ceiling).height == 300 else {
+        throw CaptureFailure(description: "small capture was enlarged")
+    }
+    for value in [CGFloat(0), -.infinity, .nan] {
+        var invalid = attachments
+        invalid[.contentScale] = value
+        guard VideoImage(buffer, attachments: invalid) == nil else {
+            throw CaptureFailure(description: "invalid capture scale was accepted")
+        }
+    }
+    var outside = attachments
+    outside[.contentRect] = CGRect(x: 700, y: 0, width: 200, height: 300).dictionaryRepresentation
+    guard VideoImage(buffer, attachments: outside) == nil else {
+        throw CaptureFailure(description: "out-of-bounds capture content was accepted")
+    }
+    // Generated Constrained Baseline: 3856x2176 storage, 3840x2160 visible.
+    // Exercise CoreMedia's SPS interpretation without allocating a decoder.
+    let sps = Data([0x67, 0x42, 0xc0, 0x33, 0xd9, 0x00, 0x3c, 0x40, 0x44,
+                    0x78, 0x98, 0x9c, 0x04, 0x40, 0x00, 0x00, 0x03, 0x00,
+                    0x40, 0x00, 0x00, 0x0c, 0x23, 0xc6, 0x0c, 0x92])
+    let pps = Data([0x68, 0xcb, 0x83, 0xcb, 0x20])
+    let format = try h264InputFormat(sps: sps, pps: pps)
+    guard CMVideoFormatDescriptionGetCleanAperture(format, originIsAtTopLeft: true) ==
+        CGRect(x: 0, y: 0, width: 3840, height: 2160) else {
+        throw CaptureFailure(description: "H.264 visible aperture self-test failed")
+    }
+    // Uncropped 5120x2880 exceeds the visible-picture budget. Raw SPS storage
+    // and reference counts are validated by Go before reaching this process;
+    // CoreMedia can fold SPS cropping into its reported format dimensions.
+    let oversized = Data([0x67, 0x42, 0xc0, 0x34, 0xda, 0x00, 0x50, 0x00, 0x5a, 0x64])
+    guard (try? h264InputFormat(sps: oversized, pps: pps)) == nil else {
+        throw CaptureFailure(description: "H.264 oversized visible picture was accepted")
     }
 }
 
@@ -1237,7 +1409,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
     private let done: StopSignal
     private let queue: DispatchQueue
     private let profile: VideoProfile
-    private var lastImage: CVImageBuffer?
+    private var lastImage: VideoImage?
     private var lastTimestamp = CMTime.invalid
 
     init(
@@ -1285,9 +1457,11 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
                 sampleBuffer,
                 createIfNecessary: false
               ) as? [[SCStreamFrameInfo: Any]],
-              let rawStatus = attachments.first?[.status] as? Int,
+              let attachments = attachments.first,
+              let rawStatus = attachments[.status] as? Int,
               SCFrameStatus(rawValue: rawStatus) == .complete,
-              let image = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+              let buffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let image = VideoImage(buffer, attachments: attachments) else {
             return
         }
         let capturedTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -1340,6 +1514,18 @@ private func captureFilter(
     throw CaptureFailure(description: "capture target kind is unsupported")
 }
 
+private func validVideoSize(_ width: Int, _ height: Int) -> Bool {
+    width >= 2 && width <= maxVideoDimension && width % 2 == 0 &&
+        height >= 2 && height <= maxVideoDimension && height % 2 == 0 &&
+        ((width + 15) / 16) * ((height + 15) / 16) * 256 <= maxVideoPixels
+}
+
+private func validVideoFormat(_ width: Int, _ height: Int, _ fps: Int32) -> Bool {
+    // Match the shared H.264 Level 5.2 receive ceiling, including numeric sizes.
+    validVideoSize(width, height) && fps >= 1 && fps <= maxVideoFramerate &&
+        ((width + 15) / 16) * ((height + 15) / 16) * Int(fps) <= 2_073_600
+}
+
 private func videoProfile(_ arguments: [String]) throws -> VideoProfile {
     guard arguments.count >= 28,
           arguments[10] == "--width", let width = Int(arguments[11]),
@@ -1353,13 +1539,8 @@ private func videoProfile(_ arguments: [String]) throws -> VideoProfile {
           arguments[22] == "--protocol-v7" else {
         throw CaptureFailure(description: "invalid video profile arguments")
     }
-    let validResolution =
-        (width == 854 && height == 480) ||
-        (width == 1280 && height == 720) ||
-        (width == 1920 && height == 1080) ||
-        (width == 2560 && height == 1440)
-    guard validResolution, frameRate >= 15, frameRate <= 60,
-          bitrate >= 2_000_000, bitrate <= 12_000_000 else {
+    guard validVideoFormat(width, height, frameRate), width >= 4, height >= 4,
+          bitrate >= 100_000, bitrate <= maxVideoBitrate else {
         throw CaptureFailure(description: "video profile is outside the product bounds")
     }
     return VideoProfile(
@@ -1384,10 +1565,10 @@ private func outputProfiles(_ arguments: [String], start: Int = 23,
               let height = Int(arguments[index + 2]),
               let fps = Int32(arguments[index + 3]),
               let bitrate = Int(arguments[index + 4]),
-              width >= 2, width <= (source?.width ?? 2560), width % 2 == 0,
-              height >= 2, height <= (source?.height ?? 1440), height % 2 == 0,
-              fps >= 1, fps <= (source?.frameRate ?? 60),
-              bitrate >= 1000, bitrate <= (source?.bitrate ?? 12_000_000) else {
+              validVideoFormat(width, height, fps),
+              width <= (source?.width ?? maxVideoDimension), height <= (source?.height ?? maxVideoDimension),
+              fps <= (source?.frameRate ?? maxVideoFramerate),
+              bitrate >= 1000, bitrate <= (source?.bitrate ?? maxVideoBitrate) else {
             throw CaptureFailure(description: "output profile is outside source bounds")
         }
         result.append(OutputProfile(width: width, height: height, fps: fps, bitrate: bitrate))
@@ -1438,8 +1619,7 @@ private func readInput(done: StopSignal, outputs: [OutputProfile] = [],
                     let timestamp = number(8..<16), duration = number(16..<24)
                     let width = number(24..<26), height = number(26..<28)
                     guard size <= maxPayloadBytes, header[6] <= 1, header[7] == 0,
-                          width >= 2, width <= 2560, width % 2 == 0,
-                          height >= 2, height <= 1440, height % 2 == 0,
+                          validVideoSize(Int(width), Int(height)),
                           timestamp <= UInt64(Int64.max) / 100,
                           duration > 0, duration <= UInt64(Int64.max) / 100,
                           let payload = try readExactly(size) else {
@@ -1486,6 +1666,41 @@ private func readInput(done: StopSignal, outputs: [OutputProfile] = [],
             done.signal(error)
         }
     }
+}
+
+private func h264InputFormat(sps: Data, pps: Data) throws -> CMVideoFormatDescription {
+    var format: CMFormatDescription?
+    let status = sps.withUnsafeBytes { first in
+        pps.withUnsafeBytes { second in
+            let pointers = [first.bindMemory(to: UInt8.self).baseAddress!,
+                            second.bindMemory(to: UInt8.self).baseAddress!]
+            let sizes = [sps.count, pps.count]
+            return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                allocator: kCFAllocatorDefault, parameterSetCount: 2,
+                parameterSetPointers: pointers, parameterSetSizes: sizes,
+                nalUnitHeaderLength: 4, formatDescriptionOut: &format)
+        }
+    }
+    try require(status, "decode-h264-format")
+    guard let format else { throw CaptureFailure(description: "missing input format") }
+    // Go owns raw SPS storage/reference admission. CoreMedia may report a
+    // crop-normalized format; check that description and its aperture here.
+    let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+    let width = Int(dimensions.width), height = Int(dimensions.height)
+    guard width >= 2, width <= maxCodedVideoDimension, width % 2 == 0,
+          height >= 2, height <= maxCodedVideoDimension, height % 2 == 0,
+          width * height <= maxCodedVideoPixels else {
+        throw CaptureFailure(description: "decoded input format dimensions exceed their bound")
+    }
+    // The clean aperture owns visible size when the format retains padding.
+    let area = CMVideoFormatDescriptionGetCleanAperture(format, originIsAtTopLeft: true)
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+    guard area.minX.isFinite, area.minY.isFinite, area.width.isFinite, area.height.isFinite,
+          area == area.integral, bounds.contains(area),
+          validVideoSize(Int(area.width), Int(area.height)) else {
+        throw CaptureFailure(description: "decoded input aperture exceeds its picture bound")
+    }
+    return format
 }
 
 private final class H264InputDecoder {
@@ -1555,24 +1770,7 @@ private final class H264InputDecoder {
             guard recovery, !nextSPS.isEmpty, !nextPPS.isEmpty else {
                 throw CaptureFailure(description: "new H.264 input needs SPS, PPS and IDR")
             }
-            var nextFormat: CMFormatDescription?
-            let status = nextSPS.withUnsafeBytes { first in
-                nextPPS.withUnsafeBytes { second in
-                    let pointers = [first.bindMemory(to: UInt8.self).baseAddress!, second.bindMemory(to: UInt8.self).baseAddress!]
-                    let sizes = [nextSPS.count, nextPPS.count]
-                    return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                        allocator: kCFAllocatorDefault, parameterSetCount: 2,
-                        parameterSetPointers: pointers, parameterSetSizes: sizes,
-                        nalUnitHeaderLength: 4, formatDescriptionOut: &nextFormat)
-                }
-            }
-            try require(status, "decode-h264-format")
-            guard let nextFormat else { throw CaptureFailure(description: "missing input format") }
-            let dimensions = CMVideoFormatDescriptionGetDimensions(nextFormat)
-            guard dimensions.width >= 2, dimensions.width <= 2560,
-                  dimensions.height >= 2, dimensions.height <= 1440 else {
-                throw CaptureFailure(description: "decoded input exceeds its dimension bound")
-            }
+            let nextFormat = try h264InputFormat(sps: nextSPS, pps: nextPPS)
             if let session, !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: nextFormat) {
                 VTDecompressionSessionInvalidate(session)
                 self.session = nil
@@ -1622,7 +1820,7 @@ private final class H264InputDecoder {
         try require(decodeStatus, "decode-output")
         guard let image else { throw CaptureFailure(description: "decoder did not produce an image") }
         lastTimestamp = input.timestamp
-        try encoders.encode(image, timestamp: input.timestamp)
+        try encoders.encode(VideoImage(image), timestamp: input.timestamp)
     }
 }
 
@@ -1688,6 +1886,8 @@ private func capture(_ arguments: [String]) async throws {
     let configuration = SCStreamConfiguration()
     configuration.width = profile.width
     configuration.height = profile.height
+    configuration.scalesToFit = true
+    if #available(macOS 14.0, *) { configuration.preservesAspectRatio = true }
     configuration.minimumFrameInterval = profile.frameInterval
     configuration.queueDepth = 5
     configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -1912,6 +2112,8 @@ private struct PiikCapture {
                 try probe()
             } else if arguments.count == 2, arguments[1] == "--self-test" {
                 try selfTest()
+            } else if arguments.count == 2, arguments[1] == "--geometry-self-test" {
+                try geometrySelfTest()
             } else if arguments.count == 2, arguments[1] == "--list" {
                 try await listSources()
             } else if arguments.count == 2, arguments[1] == "--list-microphones" {

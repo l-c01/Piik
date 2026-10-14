@@ -5,7 +5,8 @@ enumerates local displays and visible top-level windows, binds each window to
 its PID and process creation time, and has independent modes for:
 
 - capability discovery (`--probe`);
-- process-tree or default-device loopback PCM (`--capture-audio`); or
+- process-tree inclusion/exclusion or default-device loopback PCM
+  (`--capture-audio`); or
 - WGC/D3D11 screen/window video with adapter-bound Media Foundation H.264 or
   libvpx VP8 output (`--capture-video --codec auto|h264|vp8`).
 - bounded 320x180 BMP source previews (`--preview`), delivered once per target
@@ -30,11 +31,19 @@ Video and audio run as separate bounded child processes. A source whose audio
 loopback cannot be initialized keeps video available and reports audio
 unavailable instead of failing the whole source. Process loopback is probed by
 activation rather than inferred from a Windows build number; display sources
-use the standard render-device loopback available on Windows 10 and later.
+normally use the standard render-device loopback available on Windows 10 and
+later. The optional `--capture-audio exclude <pid> <creation-time>` mode requires
+a successful exclusion-mode probe, without an additional OS-version gate. Windows 10 isolation still
+needs physical verification; see the [audio evidence](../../../docs/research/native-client-media.md#windows-audio-exclusion).
+It captures all output devices
+except the selected process tree, and retires when that process exits. The
+[screen-audio contract](../../../docs/standards/media-quality.md#screen-audio)
+owns selection and failure behavior.
 
-Auto compares target-profile encoding work within a four-second selection
-budget; H.264 that meets the target needs no software comparison. The selected
-codec remains fixed across profile and source changes. VP8 reads the existing
+Auto measures delivered frame cadence through the target-profile encoding
+pipeline within a four-second selection budget; H.264 that sustains the target
+needs no software comparison. The selected codec remains fixed across profile
+and source changes. VP8 reads the existing
 NV12 surface through one staging texture and uses the same encoded-frame
 boundary. The process has no network fallback. The App
 consumes the selected process or system-audio stream through its native media
@@ -49,6 +58,19 @@ The checks include synthetic output-worker replacement and failure cases using
 WARP and a test codec, plus preview cleanup when WGC rejects a hidden test window.
 They do not capture a user screen or validate a physical encoder.
 
+On a Windows machine with a physical D3D11 adapter, check SDR and HDR-to-SDR conversion:
+
+```powershell
+powershell -NoProfile -File native/capture/windows/build.ps1 -OutputDirectory build/color-check -CheckColor
+```
+
+This sends synthetic RGB, full/limited-range BT.601/BT.709 NV12 and FP16 HDR bars
+through the production converters. It checks range/matrix, highlight detail,
+SDR/HDR replacement, white-level changes and retained-frame ownership without
+capturing the desktop. Decoded H.264/VP8, Browser reception and real HDR displays
+remain separate media acceptance; [fidelity research](../../../docs/research/media-fidelity.md)
+records current evidence and limits.
+
 The implementation follows Microsoft's MIT-licensed reference samples and
 official API contracts without copying their WIL framework. The retained MF
 fixture compiles the same encoder source with `PIIK_H264_FIXTURE`; there is
@@ -61,7 +83,10 @@ the old fixed one-frame VBV override is removed so later bitrate increases are
 not trapped by the original buffer limit.
 
 The build caches the pinned WebRTC SDK and matching official MSVC linker/runtime
-libraries under `build/encoder-pool`. The SDK supplies libvpx, replacing the
+libraries under `build/encoder-pool`. A newer installed MSVC keeps its own linker
+and runtime; older installations use that pinned minimum, following
+[Microsoft's binary compatibility rule](https://learn.microsoft.com/en-us/cpp/porting/binary-compat-2015-2017).
+The SDK supplies libvpx, replacing the
 separate source build. Only statically linked code and required notices enter
 the package, not the SDK/toolchain or another runtime service.
 

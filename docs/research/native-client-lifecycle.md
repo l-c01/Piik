@@ -37,6 +37,19 @@ waiting; later grants can be used by later connections without replacing healthy
 Browser media. These checks do not identify the original missing-window
 reporter's cause or establish other browsers' permission behavior.
 
+### Viewer Control Retirement
+
+A denied Viewer page can stay mounted or enter the Browser's
+[back/forward cache](https://web.dev/articles/bfcache). Chromium 152 retained its
+App control socket after invitation revocation; repeated entry eventually
+exhausted the App's two control slots and used Browser reception instead.
+The Viewer room owner now releases control on access loss and rejects discovery
+that completes after retirement. A rendered optional-transport fixture retained
+the denied pages across four invitation generations: each new generation used
+Native reception with changing decoded pixels, old grants remained rejected,
+and revocation cleared media resources. This is local synthetic-media evidence;
+it does not establish physical network or all Browser navigation behavior.
+
 ## Scope Decisions
 
 - Keep one strict loopback wire and one-share/one-session fence.
@@ -309,6 +322,17 @@ starts at build 20348, beyond consumer Windows 10 build 19045. The current
 capture helper therefore retains the system border there. Browser capture
 indicators remain Browser-owned.
 
+The helper submits `IsBorderRequired(false)` after the access request completes,
+including a denied result, as in the
+[Windows capture sample](https://github.com/robmikh/Win32CaptureSample/blob/master/Win32CaptureSample/App.cpp).
+Windows enforces permission and can honor the preference if consent changes
+during capture. The earlier `Allowed` guard incorrectly made the first
+permission result decide the session's lasting preference. The 2026-10-07 review
+removed that guard; native checks and local capture/stop cycles with the border
+preference off/on/off passed. A visible denied-to-allowed transition and the new
+reporter's setup remain unverified; this correction does not establish the
+reported cause or guarantee border visibility.
+
 On Windows 11 build 26200, a 2026-09-21 controlled native-window check confirmed
 borderless permission was allowed and the default capture had no border. A
 second session explicitly requiring a border made it visible; gracefully ending
@@ -331,6 +355,20 @@ The earlier real WGC cancellation check exited normally and cleared the border.
 This establishes a retirement defect and its local repair, not the cause of
 every reported Windows 11 border: denied consent and other active captures
 remain distinct Windows-owned limits.
+
+The source-preview call chain has a separate, finite lifetime. Closing the
+picker invalidates queued thumbnails and their results; it does not kill the
+in-flight helper. That helper closes its WGC session before writing the bitmap.
+Control-session loss or the three-second preview deadline can still terminate
+it through `CommandContext`. The 2026-10-08 review did not reproduce a retained
+border from this path. Its desktop-pixel control could not see the controlled
+source, so capture/permission logs alone were not accepted as visual evidence.
+
+The upstream [display-resolution change report](https://github.com/robmikh/Win32CaptureSample/issues/59)
+is still open as of 2026-10-07: it reports borderless display capture losing that
+preference after a mode change. It gives neither a current Windows build nor a
+verified repair. Include display-mode changes in physical reproduction; this
+report alone does not justify toggling the property or restarting capture.
 
 An unofficial WGC-preserving option exists:
 [Windhawk's DWM Custom Projection Border](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/dwm-custom-projection-border.wh.cpp)

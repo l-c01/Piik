@@ -1,16 +1,46 @@
 package mediaedge
 
 import (
+	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
+	"github.com/pion/stun/v4"
 	"github.com/pion/webrtc/v4"
 )
+
+func TestOfferSendsCodecDistinguishesBundledAndRejectedMedia(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		port       int
+		attributes string
+		want       bool
+	}{
+		{"ordinary", 9, "a=sendonly\r\n", true},
+		{"bundled", 0, "a=bundle-only\r\na=sendonly\r\n", true},
+		{"rejected", 0, "a=sendonly\r\n", false},
+		{"bundled-inactive", 0, "a=bundle-only\r\na=inactive\r\n", false},
+		{"bundled-receive-only", 0, "a=bundle-only\r\na=recvonly\r\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			offer := "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n" +
+				"m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=rtpmap:96 VP8/90000\r\n" +
+				fmt.Sprintf("m=audio %d UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\na=rtpmap:111 opus/48000/2\r\n%s", test.port, test.attributes)
+			got, err := offerSendsCodec(offer, "audio", "opus")
+			if err != nil || got != test.want {
+				t.Fatalf("audio=%v, wanted %v: %v", got, test.want, err)
+			}
+		})
+	}
+}
 
 func TestReceiverAdvertisesLocalStereoPreference(t *testing.T) {
 	for _, remotePreference := range []string{"", ";stereo=0", ";stereo=1"} {
@@ -79,7 +109,7 @@ func TestReceiverAdvertisesLocalStereoPreference(t *testing.T) {
 						continue
 					}
 					for _, attribute := range media.Attributes {
-						if attribute.Key == "fmtp" && strings.Contains(attribute.Value, "stereo=1") && strings.Contains(attribute.Value, "maxaveragebitrate=192000") {
+						if attribute.Key == "fmtp" && strings.Contains(attribute.Value, "stereo=1") && strings.Contains(attribute.Value, "maxaveragebitrate=510000") {
 							found = true
 						}
 					}
@@ -95,6 +125,114 @@ func TestReceiverAdvertisesLocalStereoPreference(t *testing.T) {
 	}
 }
 
+func TestReceiverRetainsRepairForOnlyTheSelectedCodec(t *testing.T) {
+	for _, name := range []string{"vp8", "h264"} {
+		t.Run(name, func(t *testing.T) {
+			engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", IncludeLoopback: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = engine.Close() })
+			// An independent stock peer offers its normal primary/RTX pairs.
+			upstream, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = upstream.Close() })
+			transceiver, err := upstream.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
+				webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var preferences []webrtc.RTPCodecParameters
+			for _, codec := range transceiver.Sender().GetParameters().Codecs {
+				if strings.EqualFold(codec.MimeType, "video/"+name) &&
+					(name == "vp8" || strings.Contains(codec.SDPFmtpLine, "profile-level-id=42e01f") &&
+						strings.Contains(codec.SDPFmtpLine, "packetization-mode=1")) || codec.MimeType == webrtc.MimeTypeRTX {
+					preferences = append(preferences, codec)
+				}
+			}
+			if err = transceiver.SetCodecPreferences(preferences); err != nil {
+				t.Fatal(err)
+			}
+			for _, codec := range preferences {
+				if !strings.EqualFold(codec.MimeType, "video/"+name) {
+					continue
+				}
+				track, createErr := webrtc.NewTrackLocalStaticRTP(codec.RTPCodecCapability, "video", "upstream")
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				if err = transceiver.Sender().ReplaceTrack(track); err != nil {
+					t.Fatal(err)
+				}
+				break
+			}
+			offer, err := upstream.CreateOffer(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = upstream.SetLocalDescription(offer); err != nil {
+				t.Fatal(err)
+			}
+			receiver, answer, err := engine.NewReceiver(ReceiverOptions{Offer: offer, EdgeCapacity: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = receiver.Close() })
+			for attempt := 0; attempt < 2; attempt++ {
+				var description sdp.SessionDescription
+				if err = description.UnmarshalString(answer.SDP); err != nil {
+					t.Fatal(err)
+				}
+				var codecs []sdp.Codec
+				all := description.GetCodecMap()
+				for _, media := range description.MediaDescriptions {
+					for _, payload := range media.MediaName.Formats {
+						id, _ := strconv.Atoi(payload)
+						codecs = append(codecs, all[uint8(id)])
+					}
+				}
+				if len(codecs) != 2 || receiver.Codec() != name {
+					t.Fatalf("answer must retain one %s primary and its repair codec: %v", name, codecs)
+				}
+				for _, codec := range codecs {
+					if strings.EqualFold(codec.Name, "rtx") {
+						continue
+					}
+					if !strings.EqualFold(codec.Name, receiver.Codec()) {
+						t.Fatalf("unexpected primary codec: %v", codec)
+					}
+					found := false
+					for _, repair := range codecs {
+						found = found || (strings.EqualFold(repair.Name, "rtx") && repair.Fmtp == fmt.Sprintf("apt=%d", codec.PayloadType))
+					}
+					if !found {
+						t.Fatal("answer retained repair for a different primary")
+					}
+				}
+				if err = upstream.SetRemoteDescription(answer); err != nil {
+					t.Fatal(err)
+				}
+				if attempt == 0 {
+					offer, err = upstream.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err = upstream.SetLocalDescription(offer); err != nil {
+						t.Fatal(err)
+					}
+					var reused bool
+					answer, reused, err = receiver.Renegotiate(offer, nil)
+					if err != nil || !reused {
+						t.Fatalf("restart replaced or failed the receiver: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestReceiverCodecMatchesTheSingleNegotiatedAnswer(t *testing.T) {
 	for _, preferVP8 := range []bool{false, true} {
 		engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", IncludeLoopback: true})
@@ -102,7 +240,7 @@ func TestReceiverCodecMatchesTheSingleNegotiatedAnswer(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = engine.Close() })
-		upstream, err := engine.api.NewPeerConnection(webrtc.Configuration{})
+		upstream, err := testICESocket(t, engine).newPeerConnection()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -137,6 +275,97 @@ func TestReceiverCodecMatchesTheSingleNegotiatedAnswer(t *testing.T) {
 	}
 }
 
+func TestReceiverNegotiatesForwardableH264(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		formats []string
+		want    string
+	}{
+		{"browser-auto", []string{"42e01f", "vp8"}, "42e01f"},
+		{"safari-order", []string{"640c1f", "42e01f"}, "42e01f"},
+		{"main", []string{"4d001f"}, ""},
+		{"high", []string{"64001f"}, ""},
+		{"baseline", []string{"42001f"}, ""},
+		{"missing-profile", []string{""}, ""},
+		{"equivalent-baseline", []string{"42c01f"}, "42c01f"},
+		{"small-browser-output", []string{"42e00b"}, "42e00b"},
+		{"level-5.1", []string{"42e033"}, "42e033"},
+		{"level-ceiling", []string{"42e034"}, "42e034"},
+		{"over-ceiling", []string{"42e03c"}, ""},
+		{"invalid-level", []string{"42e035"}, ""},
+		{"invalid-constraints", []string{"42e11f"}, ""},
+		{"mode-zero", []string{"42e01f;packetization-mode=0"}, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine, err := NewEngine(EngineOptions{BindAddress: "127.0.0.1:0", IncludeLoopback: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = engine.Close() })
+			upstream, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = upstream.Close() })
+			transceiver, err := upstream.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
+				webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var preferences []webrtc.RTPCodecParameters
+			for index, format := range test.formats {
+				codec := videoCodecs["h264"]
+				codec.SDPFmtpLine = "level-asymmetry-allowed=1;packetization-mode=1"
+				if format != "" {
+					codec.SDPFmtpLine += ";profile-level-id=" + format
+				}
+				if format == "vp8" {
+					codec = videoCodecs["vp8"]
+				}
+				codec.PayloadType = webrtc.PayloadType(96 + index)
+				preferences = append(preferences, codec)
+			}
+			if err = transceiver.SetCodecPreferences(preferences); err != nil {
+				t.Fatal(err)
+			}
+			offer, err := upstream.CreateOffer(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiver, answer, err := engine.NewReceiver(ReceiverOptions{Offer: offer, EdgeCapacity: 1})
+			if receiver != nil {
+				t.Cleanup(func() { _ = receiver.Close() })
+			}
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("unsupported format was admitted: %s", answer.SDP)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receiver.Codec() != "h264" || !strings.Contains(answer.SDP, "profile-level-id="+test.want) {
+				t.Fatalf("wanted %s, got %s: %s", test.want, receiver.Codec(), answer.SDP)
+			}
+			// A profile-only change is still a changed media shape. Reject it before
+			// mutating the current peer/source, so the owner can prepare a replacement.
+			previous := receiver.connection.RemoteDescription().SDP
+			changed := offer
+			changed.SDP = strings.ReplaceAll(changed.SDP, "profile-level-id="+test.want, "profile-level-id=4d001f")
+			_, reused, renegotiateErr := receiver.Renegotiate(changed, nil)
+			if renegotiateErr != nil || reused || receiver.connection.RemoteDescription().SDP != previous {
+				t.Fatalf("unsupported profile altered the current source: reused=%v, error=%v", reused, renegotiateErr)
+			}
+			source := receiver.Source()
+			_, reused, renegotiateErr = receiver.Renegotiate(offer, nil)
+			if renegotiateErr != nil || !reused || receiver.Source() != source {
+				t.Fatalf("compatible renegotiation replaced the source: reused=%v, error=%v", reused, renegotiateErr)
+			}
+		})
+	}
+}
+
 func TestReceiverForwardsEncodedVideoToANativeEdge(t *testing.T) {
 	for _, codec := range []string{"h264", "vp8"} {
 		t.Run(codec, func(t *testing.T) { testReceiverForwarding(t, codec) })
@@ -161,7 +390,7 @@ func testReceiverForwarding(t *testing.T, codec string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = upstreamEngine.Close() })
-	upstream, err := upstreamEngine.api.NewPeerConnection(webrtc.Configuration{})
+	upstream, err := testICESocket(t, upstreamEngine).newPeerConnection()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +428,12 @@ func testReceiverForwarding(t *testing.T, codec string) {
 	completed := make(chan struct{}, 4)
 	gatheringCurrent := make(chan func() bool, 4)
 	surveyCandidates := 0
-	servers := []webrtc.ICEServer{{URLs: []string{localSurveyServer(t)}}}
+	var bindingRequests atomic.Int32
+	server := bindingServer(t, func(request *stun.Message, sender *net.UDPAddr, listener *net.UDPConn) {
+		bindingRequests.Add(1)
+		answerBinding(request, sender, listener, sender.Port)
+	})
+	servers := []webrtc.ICEServer{{URLs: []string{"stun:" + server.String()}}}
 	upstream.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			return
@@ -373,6 +607,7 @@ func testReceiverForwarding(t *testing.T, codec string) {
 		}
 	}()
 	source, audio := nativeReceiver.Source(), nativeReceiver.AudioSource()
+	socket := nativeReceiver.socket
 	for _, restart := range []bool{false, true} {
 		previousGathering := nativeReceiver.localCandidates
 		candidateMu.Lock()
@@ -424,8 +659,13 @@ func testReceiverForwarding(t *testing.T, codec string) {
 			if count != 2 {
 				t.Fatalf("STUN survey candidates=%d, want one per gathering", count)
 			}
+			if bindingRequests.Load() < 2 {
+				t.Fatal("receiver ICE restart reused a completed STUN observation")
+			}
+		} else if bindingRequests.Load() != 1 {
+			t.Fatal("ordinary SDP renegotiation restarted STUN discovery")
 		}
-		if nativeReceiver.Source() != source || nativeReceiver.AudioSource() != audio ||
+		if nativeReceiver.socket != socket || nativeReceiver.Source() != source || nativeReceiver.AudioSource() != audio ||
 			downstream.connection.ConnectionState() != webrtc.PeerConnectionStateConnected {
 			t.Fatal("renegotiation retired the source or its healthy downstream")
 		}

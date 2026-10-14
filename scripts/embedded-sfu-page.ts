@@ -16,12 +16,12 @@ import { NativeSfuPublisher } from "../src/client/native/native-sfu-publisher";
 import { defaultNativeCapturePath } from "../src/client/native/capture-selection";
 import { HostSfuRoute, type HostPublisherTransport } from "../src/client/media/host-sfu-route";
 import { ViewerSfuRoute } from "../src/client/media/viewer-sfu-route";
+import { fittedCaptureSize } from "./media-gate-geometry";
 
 const high: QualitySettings = {
-  resolution: "720p", maxFramerate: 15, maxBitrate: 2_000_000,
-  degradationPreference: "maintain-resolution", screenAudioQuality: "saver",
+  resolution: { width: 1280, height: 720 }, maxFramerate: 15, maxBitrate: 2_000_000,
+  degradationPreference: "maintain-resolution", maxAudioBitrate: 64000,
 };
-const low: QualitySettings = { ...high, resolution: "480p" };
 const shareGeneration = crypto.randomUUID();
 const clientId = crypto.randomUUID();
 let socket: WebSocket | null = null;
@@ -157,7 +157,9 @@ async function accept(message: ServerMessage, host: boolean): Promise<void> {
     }
   }
   if (message.type === "sfu-config") {
-    configuration = message;
+    // A late refresh can describe the old edge after a newer prepare. The route
+    // owner rejects it; the fixture's reported identity must not move backward.
+    if (!configuration || message.revision >= configuration.revision) configuration = message;
     if (host) {
       await hostRoute?.acceptConfig(message);
       published = publisher !== null;
@@ -173,6 +175,7 @@ async function connect(room: CreateRoomResponse, host: boolean): Promise<void> {
   socket = new WebSocket(new URL("/signal", location.href).href.replace(/^http/, "ws"));
   const connection = socket;
   socket.addEventListener("message", ({ data }) => {
+    if (socket !== connection) return;
     messageTail = messageTail.then(() => accept(decodeServerMessage(String(data)), host)).catch(failed);
   });
   socket.addEventListener("error", () => failed("Room WebSocket failed"));
@@ -190,12 +193,13 @@ async function connect(room: CreateRoomResponse, host: boolean): Promise<void> {
     roomId: room.roomId, clientId } as const;
   send(host
     ? { ...common, role: "host", token: room.hostToken, shareGeneration,
-        qualitySettings: high, routePolicy: { peerOnly: false, topologyOptimization: false, natPrediction: false } }
+        qualitySettings: profile, routePolicy: { peerOnly: false, topologyOptimization: false, natPrediction: false } }
     : { ...common, role: "viewer", viewerGrant: new URLSearchParams(new URL(room.inviteUrl).hash.slice(1)).get("v")! });
 }
 
-export async function startHost(nativeSource?: { title: string; port: number }, selectedCodec: "vp8" | "h264" = "vp8"): Promise<CreateRoomResponse> {
+export async function startHost(nativeSource?: { title: string; port: number }, selectedCodec: "vp8" | "h264" = "vp8", display = false, size?: QualitySettings["resolution"]): Promise<CreateRoomResponse> {
   codec = selectedCodec;
+  profile = size ? { ...high, resolution: size, maxFramerate: 60, maxBitrate: 50_000_000 } : high;
   const response = await fetch("/api/rooms", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ codeEntryPolicy: "private" }),
@@ -212,7 +216,7 @@ export async function startHost(nativeSource?: { title: string; port: number }, 
       if (!stopping && event.type === "share-ended" && event.shareId === shareGeneration) failed("Native capture ended");
     });
     const started = await native.startShare({ shareId: shareGeneration, source: target,
-      codec, audio: true, profile: high, edgeCapacity: 2, ...path });
+      codec, audio: true, profile, edgeCapacity: 2, ...path });
     nativeShareStarted = true;
     source = new MediaStream();
     if (started.codec !== codec || !started.audio) throw new Error("Requested Native codec and Opus capture did not start");
@@ -220,8 +224,8 @@ export async function startHost(nativeSource?: { title: string; port: number }, 
     return room;
   }
   canvas = document.createElement("canvas");
-  canvas.width = 1280;
-  canvas.height = 720;
+  canvas.width = profile.resolution.width;
+  canvas.height = profile.resolution.height;
   canvas.style.cssText = "max-width:100%;width:640px";
   document.body.append(canvas);
   const context = canvas.getContext("2d")!;
@@ -234,35 +238,87 @@ export async function startHost(nativeSource?: { title: string; port: number }, 
     context.fillStyle = "#ffffff";
     context.font = "48px sans-serif";
     context.fillText(String(frame), 40, 240);
-  }, 1000 / 15);
-  source = canvas.captureStream(15);
+  }, 1000 / profile.maxFramerate);
+  source = display ? await navigator.mediaDevices.getDisplayMedia({
+    video: { ...profile.resolution, frameRate: profile.maxFramerate }, audio: false,
+  }) : canvas.captureStream(profile.maxFramerate);
   audio = new AudioContext();
-  const tone = audio.createOscillator();
   const gain = audio.createGain();
   gain.gain.value = 0.05;
   const destination = audio.createMediaStreamDestination();
-  tone.connect(gain).connect(destination);
-  tone.start();
+  const channels = audio.createChannelMerger(2);
+  [500, 1500].forEach((frequency, channel) => {
+    const tone = audio!.createOscillator();
+    tone.frequency.value = frequency;
+    tone.connect(channels, 0, channel);
+    tone.start();
+  });
+  channels.connect(gain).connect(destination);
   await audio.resume();
   source.addTrack(destination.stream.getAudioTracks()[0]!);
   await connect(room, true);
   return room;
 }
 
+// Check decoded channels, not just /2 in SDP (Opus also uses that for mono).
+export async function audioSeparation(stream = video?.srcObject): Promise<number[]> {
+  if (!(stream instanceof MediaStream) || !stream.getAudioTracks().length) throw new Error("No received audio");
+  const context = new AudioContext();
+  try {
+    const input = context.createMediaStreamSource(stream);
+    const splitter = context.createChannelSplitter(2);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    sink.connect(context.destination);
+    input.connect(splitter);
+    const analyzers = [0, 1].map(channel => {
+      const analyzer = context.createAnalyser();
+      analyzer.fftSize = 8192;
+      analyzer.smoothingTimeConstant = 0;
+      splitter.connect(analyzer, channel);
+      analyzer.connect(sink);
+      return analyzer;
+    });
+    await context.resume();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    return analyzers.map((analyzer, channel) => {
+      const bins = new Float32Array(analyzer.frequencyBinCount);
+      analyzer.getFloatFrequencyData(bins);
+      const level = (frequency: number) => {
+        const bin = Math.round(frequency * analyzer.fftSize / context.sampleRate);
+        return Math.max(-120, ...bins.slice(bin - 1, bin + 2));
+      };
+      return level(channel === 0 ? 500 : 1500) - level(channel === 0 ? 1500 : 500);
+    });
+  } finally {
+    await context.close();
+  }
+}
+
 export async function startViewer(room: CreateRoomResponse): Promise<void> {
   await connect(room, false);
 }
 
-export async function reconnectViewer(room: CreateRoomResponse): Promise<void> {
+export async function reconnectViewer(room: CreateRoomResponse, discardMedia = false): Promise<void> {
   const previous = socket;
   socket = null;
   previous?.close();
+  if (discardMedia) {
+    await messageTail;
+    await viewerRoute?.disconnect();
+    viewerRoute = null;
+    video?.remove();
+    video = null;
+    decoded = committed = false;
+  }
   authenticated = false;
   await connect(room, false);
 }
 
 export function snapshot() {
   return { authenticated, published, simulcast, decoded, committed, peerFailures,
+    maxAudioBitrate: profile.maxAudioBitrate,
+    visibility: document.visibilityState, capture: source?.getVideoTracks()[0]?.getSettings(),
     routeEvents, routeStatus,
     connectionId: configuration?.connectionId,
     audioKbps, audioCodec, publicationRetired, sharingStopped, nativeShareStarted, nativeShareStopped,
@@ -286,7 +342,23 @@ export async function audioEnergy(): Promise<number> {
   return await probe();
 }
 
-export async function waitForFrames(width: number, height: number, minimumFrames = 15) {
+async function applyProfile(next: QualitySettings): Promise<boolean> {
+  if (native) await native.updateShare(shareGeneration, next);
+  if (!await hostRoute!.updateProfile(next)) return false;
+  profile = next;
+  send({ type: "set-quality-settings", qualitySettings: next });
+  return true;
+}
+
+export async function setAudioBitrate(maxAudioBitrate: number): Promise<boolean> {
+  return await applyProfile({ ...profile, maxAudioBitrate });
+}
+
+export async function setVideoRates(maxFramerate: number, maxBitrate: number): Promise<boolean> {
+  return await applyProfile({ ...profile, maxFramerate, maxBitrate });
+}
+
+export async function waitForFrames(width: number, height: number, minimumFrames = 15, withinCeiling = false, tolerance = 0) {
   if (!video) throw new Error("Viewer video is unavailable");
   const target = video;
   return await new Promise<{ frames: number; width: number; height: number }>((resolve, reject) => {
@@ -294,11 +366,14 @@ export async function waitForFrames(width: number, height: number, minimumFrames
     let callback = 0;
     const timer = setTimeout(() => {
       target.cancelVideoFrameCallback(callback);
-      reject(new Error(`Viewer did not decode ${width}x${height}; current ${target.videoWidth}x${target.videoHeight}; ${frames} frame callbacks; ${document.visibilityState}; ${error ?? "no signaling error"}`));
+      reject(new Error(`Viewer did not reach ${minimumFrames} decoded frame callbacks at ${width}x${height}; current ${target.videoWidth}x${target.videoHeight}; ${frames} matching callbacks; ${document.visibilityState}; ${error ?? "no signaling error"}`));
     }, minimumFrames > 15 ? 30_000 : 20_000);
     const next = () => {
       callback = target.requestVideoFrameCallback(() => {
-        frames = target.videoWidth === width && target.videoHeight === height ? frames + 1 : 0;
+        const matches = withinCeiling
+          ? target.videoWidth >= 320 && target.videoHeight >= 240 && target.videoWidth <= width && target.videoHeight <= height
+          : Math.abs(target.videoWidth - width) <= tolerance && Math.abs(target.videoHeight - height) <= tolerance;
+        frames = matches ? frames + 1 : 0;
         if (frames < minimumFrames) return next();
         clearTimeout(timer);
         resolve({ frames, width: target.videoWidth, height: target.videoHeight });
@@ -310,15 +385,44 @@ export async function waitForFrames(width: number, height: number, minimumFrames
 
 export async function lowerProfile(): Promise<boolean> {
   if (!publisher) throw new Error("Publisher is unavailable");
+  const low = { ...profile, resolution: { width: 854, height: 480 } };
   if (native) await native.updateShare(shareGeneration, low);
   else {
     if (!canvas) throw new Error("Browser source is unavailable");
-    canvas.width = 854;
-    canvas.height = 480;
+    const size = fittedCaptureSize(canvas, low.resolution.width, low.resolution.height);
+    canvas.width = size.width;
+    canvas.height = size.height;
   }
   profile = low;
   send({ type: "set-quality-settings", qualitySettings: low });
   return await hostRoute!.updateProfile(low);
+}
+
+export function pause(paused: boolean): void {
+  source?.getTracks().forEach(track => { track.enabled = !paused; });
+  hostRoute?.setPaused(paused);
+}
+
+// Exercise the existing server-to-publisher demand contract independently of
+// the local machine's unconstrained subscriber bandwidth.
+export async function demandLayers(activeCount: number): Promise<void> {
+  if (!publisher || !configuration || native) throw new Error("Browser publisher is unavailable");
+  const { revision, publicationGeneration, connectionId } = configuration;
+  await publisher.acceptSignal({ type: "sfu-signal", kind: "layers", activeCount,
+    revision, publicationGeneration, connectionId });
+}
+
+export async function replaceSource(): Promise<boolean> {
+  if (!source || !hostRoute || native) throw new Error("Browser source is unavailable");
+  const previous = source;
+  source = previous.clone();
+  if (!await hostRoute.replaceStream(source)) {
+    source.getTracks().forEach(track => track.stop());
+    source = previous;
+    return false;
+  }
+  previous.getTracks().forEach(track => track.stop());
+  return true;
 }
 
 export function stopSharing(): void {

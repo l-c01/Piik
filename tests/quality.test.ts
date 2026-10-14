@@ -5,6 +5,9 @@ import {
   applyCaptureProfile,
   applyVideoCaptureProfile,
   captureDisplay,
+  captureFramerateCeiling,
+  videoCaptureLimits,
+  supportsCaptureProfile,
   configureScreenAudioSender,
   configureVideoSender,
   matchingQualityProfileId,
@@ -12,7 +15,10 @@ import {
   QUALITY_PROFILES,
   QUALITY_RESOLUTIONS,
   qualitySettingsEqual,
-  SCREEN_AUDIO_BITRATES,
+  qualityResolutionLabel,
+  videoQualitySettingsEqual,
+  screenAudioBitrate,
+  screenAudioSenderCeiling,
   senderParameterWarning,
   setMediaPaused,
   startupVideoProfile,
@@ -47,6 +53,84 @@ afterEach(() => {
 });
 
 describe("realtime quality controls", () => {
+  it("bounds custom size, orientation and frame rate together before capture", () => {
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["4K"])).toBe(64);
+    expect(captureFramerateCeiling({ width: 2160, height: 3840 })).toBe(64);
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["1440p"])).toBe(144);
+    expect(captureFramerateCeiling({ width: 1440, height: 2560 })).toBe(144);
+    expect(captureFramerateCeiling({ width: 3840, height: 2100 })).toBe(65);
+    expect(captureFramerateCeiling({ width: 5120, height: 1440 })).toBe(72);
+    expect(captureFramerateCeiling({ width: 1920, height: 1080 })).toBe(240);
+    const level51 = videoCaptureLimits({ maxVideoMacroblocksPerSecond: 983_040 });
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["4K"], level51)).toBe(30);
+    expect(captureFramerateCeiling({ width: 2160, height: 3840 }, level51)).toBe(30);
+    for (const size of [{ width: 3840, height: 3840 }, { width: 1921, height: 1080 },
+      { width: 8194, height: 100 }, { width: 6562, height: 1438 },
+      { width: 4.5, height: 4 }, { width: Infinity, height: 4 }, { width: 2, height: 4 }]) {
+      expect(captureFramerateCeiling(size)).toBe(0);
+    }
+    const limited = videoCaptureLimits({ maxVideoResolution: { width: 1920, height: 1080 },
+      maxVideoPixels: 1920 * 1080, maxVideoMacroblocksPerSecond: 245_760 });
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["4K"], limited)).toBe(0);
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["1080p"], limited)).toBe(30);
+    expect(captureFramerateCeiling(QUALITY_RESOLUTIONS["720p"], limited)).toBe(68);
+    expect(videoCaptureLimits({ maxVideoResolution: { width: 8192, height: 8192 },
+      maxVideoPixels: 8192 * 8192, maxVideoMacroblocksPerSecond: 9_000_000,
+      maxVideoFramerate: 480, maxVideoBitrate: 1_000_000_000 })).toEqual(videoCaptureLimits());
+    const slower = videoCaptureLimits({ maxVideoFramerate: 30, maxVideoBitrate: 5_000_000 });
+    expect(supportsCaptureProfile(QUALITY_PROFILES["1080p30"], slower)).toBe(true);
+    expect(supportsCaptureProfile(QUALITY_PROFILES["1080p60"], slower)).toBe(false);
+  });
+
+  it("rejects unsupported requests before changing capture or asking for permission", async () => {
+    const { stream, videoTrack } = createVideoStream();
+    const getDisplayMedia = vi.fn(async () => stream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+    for (const change of [{ maxFramerate: 241 }, { maxFramerate: 30.5 }, { maxFramerate: 0 },
+      { maxBitrate: 99_999 }, { maxBitrate: 240_000_001 },
+      { resolution: { width: 32768, height: 32768 } }, { maxAudioBitrate: 510_000 }]) {
+      const requested = { ...QUALITY_PROFILES["1080p30"], ...change };
+      expect(supportsCaptureProfile(requested)).toBe(false);
+      await expect(captureDisplay(requested)).rejects.toThrow("not supported");
+      await expect(applyCaptureProfile(stream, requested)).rejects.toThrow("not supported");
+    }
+    expect(getDisplayMedia).not.toHaveBeenCalled();
+    expect(videoTrack.applyConstraints).not.toHaveBeenCalled();
+  });
+
+  it("admits useful low-rate and high-rate requests without changing presets", async () => {
+    const { stream, videoTrack } = createVideoStream();
+    for (const [maxFramerate, maxBitrate] of [[1, 100_000], [5, 800_000], [60, 50_000_000],
+      [120, 80_000_000], [144, 100_000_000], [240, 240_000_000]]) {
+      const profile = { ...QUALITY_PROFILES["1080p30"], maxFramerate, maxBitrate };
+      expect(supportsCaptureProfile(profile)).toBe(true);
+      await applyCaptureProfile(stream, profile);
+      expect(videoTrack.applyConstraints).toHaveBeenLastCalledWith(expect.objectContaining({
+        frameRate: { ideal: maxFramerate, max: maxFramerate },
+      }));
+    }
+  });
+
+  it("requests 4K60 in either orientation through the existing capture controls", async () => {
+    const { stream, videoTrack } = createVideoStream();
+    const getDisplayMedia = vi.fn(async () => stream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+    for (const resolution of [QUALITY_RESOLUTIONS["4K"], { width: 2160, height: 3840 }]) {
+      const profile = { ...QUALITY_PROFILES["1080p60"], resolution, maxBitrate: 50_000_000 };
+      expect(supportsCaptureProfile(profile)).toBe(true);
+      await captureDisplay(profile);
+      expect(getDisplayMedia).toHaveBeenLastCalledWith(expect.objectContaining({
+        video: expect.objectContaining({
+          width: expect.objectContaining({ max: resolution.width }),
+          height: expect.objectContaining({ max: resolution.height }),
+          frameRate: expect.objectContaining({ max: 60 }),
+        }),
+      }));
+      await applyCaptureProfile(stream, profile);
+      expect(videoTrack.applyConstraints).toHaveBeenCalled();
+    }
+  });
+
   it("keeps exactly three recommended profiles with 1080p30 as the default", () => {
     expect(Object.keys(QUALITY_PROFILES)).toEqual([
       "720p30",
@@ -54,7 +138,7 @@ describe("realtime quality controls", () => {
       "1080p60",
     ]);
     expect(QUALITY_PROFILES["1080p30"]).toMatchObject({
-      resolution: "1080p",
+      resolution: { width: 1920, height: 1080 },
       maxFramerate: 30,
       maxBitrate: 5_000_000,
     });
@@ -64,11 +148,10 @@ describe("realtime quality controls", () => {
     expect(QUALITY_RESOLUTIONS["480p"]).toEqual({
       width: 854,
       height: 480,
-      label: "480p",
     });
     expect(
       Object.values(QUALITY_PROFILES).map((profile) => profile.resolution),
-    ).not.toContain("480p");
+    ).not.toContainEqual(QUALITY_RESOLUTIONS["480p"]);
   });
 
   it("bounds initial capture to the selected profile", async () => {
@@ -82,8 +165,8 @@ describe("realtime quality controls", () => {
 
     expect(getDisplayMedia).toHaveBeenCalledWith({
       video: {
-        width: { ideal: 1920, max: 1920 },
-        height: { ideal: 1080, max: 1080 },
+        width: { max: 1920 },
+        height: { max: 1080 },
         frameRate: { ideal: 30, max: 30 },
       },
       audio: {
@@ -100,21 +183,32 @@ describe("realtime quality controls", () => {
     expect(audioTrack.contentHint).toBe("music");
   });
 
-  it("changes custom capture ceilings without selecting the source again", async () => {
+  it("changes capture ceilings without requesting a crop or locking source orientation", async () => {
     const { stream, videoTrack } = createVideoStream();
+    videoTrack.getSettings = () => ({ width: 540, height: 960, aspectRatio: 9 / 16 });
 
     await applyCaptureProfile(stream, {
-      resolution: "1440p",
+      resolution: { width: 1280, height: 720 },
       maxFramerate: 45,
       maxBitrate: 9_500_000,
       degradationPreference: "balanced",
     });
 
     expect(videoTrack.applyConstraints).toHaveBeenCalledWith({
-      width: { ideal: 2560, max: 2560 },
-      height: { ideal: 1440, max: 1440 },
+      width: { max: 1280 },
+      height: { max: 720 },
       frameRate: { ideal: 45, max: 45 },
     });
+  });
+
+  it("compares deserialized size values without treating audio edits as new video", () => {
+    const profile = QUALITY_PROFILES["1080p30"];
+    const restored = JSON.parse(JSON.stringify(profile));
+    expect(qualitySettingsEqual(profile, restored)).toBe(true);
+    expect(videoQualitySettingsEqual(profile, { ...restored, maxAudioBitrate: 256_000 })).toBe(true);
+    expect(videoQualitySettingsEqual(profile, { ...restored, resolution: { width: 1920, height: 1200 } })).toBe(false);
+    expect(qualityResolutionLabel(restored.resolution)).toBe("1080p");
+    expect(qualityResolutionLabel({ width: 1920, height: 1200 })).toBe("1920×1200");
   });
 
   it("leaves capture constraints with the owner of a remote track", async () => {
@@ -150,10 +244,10 @@ describe("realtime quality controls", () => {
   it("keeps audio selection orthogonal while defaulting missing settings to music", () => {
     const saver = {
       ...QUALITY_PROFILES["1080p60"],
-      screenAudioQuality: "saver",
+      maxAudioBitrate: 64000,
     } as const;
     const {
-      screenAudioQuality: _screenAudioQuality,
+      maxAudioBitrate: _maxAudioBitrate,
       ...legacySettings
     } = QUALITY_PROFILES["1080p60"];
 
@@ -253,7 +347,7 @@ describe("realtime quality controls", () => {
     ]);
   });
 
-  it("removes only the carrier's duplicate FPS ceiling and restores ordinary sender limits", async () => {
+  it("leaves picture cadence with the producer and restores ordinary sender adaptation", async () => {
     let applied = { encodings: [{ maxFramerate: 30 }] } as RTCRtpSendParameters;
     const sender = {
       getParameters: () => applied,
@@ -261,10 +355,12 @@ describe("realtime quality controls", () => {
     } as unknown as RTCRtpSender;
     const carrier = await configureVideoSender(sender, QUALITY_PROFILES["1080p60"], 1);
     expect(applied.encodings[0]).not.toHaveProperty("maxFramerate");
-    expect(carrier).toMatchObject({ requested: { maxFramerate: null, maxBitrate: 8_000_000 }, mismatches: [] });
+    expect(carrier).toMatchObject({ requested: { maxFramerate: null, maxBitrate: 8_000_000,
+      degradationPreference: "maintain-framerate" }, mismatches: [] });
     for (const id of ["720p30", "1080p60"] as const) {
       const readback = await configureVideoSender(sender, QUALITY_PROFILES[id]);
       expect(applied.encodings[0]!.maxFramerate).toBe(QUALITY_PROFILES[id].maxFramerate);
+      expect(applied.degradationPreference).toBe(QUALITY_PROFILES[id].degradationPreference);
       expect(readback.mismatches).toEqual([]);
     }
   });
@@ -292,9 +388,10 @@ describe("realtime quality controls", () => {
   });
 
   it.each([
-    ["saver", 64_000],
-    ["music", 128_000],
-    ["very-high", 192_000],
+    [undefined, 128_000],
+    [64_000, 64_000],
+    [128_000, 128_000],
+    [192_000, 192_000],
   ] as const)("applies and reads back the %s audio ceiling", async (quality, bitrate) => {
     let applied = { encodings: [] } as unknown as RTCRtpSendParameters;
     const sender = {
@@ -304,16 +401,15 @@ describe("realtime quality controls", () => {
       }),
     } as unknown as RTCRtpSender;
 
-    await expect(configureScreenAudioSender(sender, quality)).resolves.toEqual({
+    await expect(configureScreenAudioSender(sender, screenAudioBitrate(quality))).resolves.toEqual({
       requestedMaxBitrate: bitrate,
       appliedMaxBitrate: bitrate,
       mismatch: false,
     });
     expect(applied.encodings).toEqual([{ maxBitrate: bitrate }]);
-    expect(SCREEN_AUDIO_BITRATES[quality]).toBe(bitrate);
   });
 
-  it("uses the music ceiling for a setting without an audio preset", async () => {
+  it.each([96_000, 256_000, 320_000])("applies a numeric %i audio ceiling without a preset", async (bitrate) => {
     let applied = { encodings: [] } as unknown as RTCRtpSendParameters;
     const sender = {
       getParameters: () => applied,
@@ -322,11 +418,43 @@ describe("realtime quality controls", () => {
       }),
     } as unknown as RTCRtpSender;
 
-    await expect(configureScreenAudioSender(sender)).resolves.toEqual({
-      requestedMaxBitrate: 128_000,
-      appliedMaxBitrate: 128_000,
+    await expect(configureScreenAudioSender(sender, bitrate)).resolves.toEqual({
+      requestedMaxBitrate: bitrate,
+      appliedMaxBitrate: bitrate,
       mismatch: false,
     });
+  });
+
+  it.each([192_000, 510_000])("honors the receiver's %i Opus limit on every live update", async (limit) => {
+    let applied = {
+      codecs: [{ mimeType: "audio/opus", sdpFmtpLine: `stereo=1;maxaveragebitrate=${limit}` }],
+      encodings: [{}],
+    } as RTCRtpSendParameters;
+    const sender = {
+      getParameters: () => applied,
+      setParameters: async (value: RTCRtpSendParameters) => { applied = value; },
+    } as RTCRtpSender;
+    for (const bitrate of [128_000, 320_000, 96_000, 510_000]) {
+      const ceiling = Math.min(bitrate, limit, 320_000);
+      await expect(configureScreenAudioSender(sender, bitrate)).resolves.toEqual({
+        requestedMaxBitrate: bitrate, appliedMaxBitrate: ceiling, mismatch: ceiling !== bitrate,
+      });
+      expect(applied.encodings[0]?.maxBitrate).toBe(ceiling);
+    }
+  });
+
+  it.each([
+    ["", 32_000],
+    ["stereo=1", 64_000],
+    ["stereo=1;maxaveragebitrate=invalid", 64_000],
+    ["stereo=1;maxaveragebitrate=510001", 64_000],
+    ["maxplaybackrate=8000", 12_000],
+    ["stereo=1;maxplaybackrate=16000", 40_000],
+    ["maxaveragebitrate=510000;maxaveragebitrate=96000", 96_000],
+  ] as const)("keeps omitted/invalid Opus limits bounded: %s", (sdpFmtpLine, expected) => {
+    const parameters = { codecs: [{ mimeType: "audio/opus", sdpFmtpLine }] } as RTCRtpSendParameters;
+    expect(screenAudioSenderCeiling(parameters, 320_000)).toBe(expected);
+    expect(screenAudioSenderCeiling(parameters, 6_000)).toBe(6_000);
   });
 
   it("reports an audio ceiling the browser rewrites", async () => {
@@ -340,7 +468,7 @@ describe("realtime quality controls", () => {
       setParameters: vi.fn(async () => undefined),
     } as unknown as RTCRtpSender;
 
-    const readback = await configureScreenAudioSender(sender, "music");
+    const readback = await configureScreenAudioSender(sender, 128_000);
 
     expect(readback).toEqual({
       requestedMaxBitrate: 128_000,
@@ -365,7 +493,7 @@ describe("realtime quality controls", () => {
     } as unknown as RTCRtpSender;
 
     await expect(
-      configureScreenAudioSender(sender, "very-high"),
+      configureScreenAudioSender(sender, 192_000),
     ).rejects.toThrow("rejected");
     expect(applied.encodings[0]?.maxBitrate).toBe(128_000);
   });

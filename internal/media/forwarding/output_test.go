@@ -68,12 +68,18 @@ func TestOutputUsesLibraryAllocationAndExactLifetime(t *testing.T) {
 	defer output.Close()
 	output.SetMaxSpatialLayer(2)
 	output.SetMaxTemporalLayer(0)
-	output.UpTrackMaxPublishedLayerChange(2)
-	output.UpTrackMaxTemporalLayerSeenChange(0)
 	if state := output.State(); state.Target != -1 || state.Current != -1 {
 		t.Fatalf("unmeasured source pretended to have a target: %+v", state)
 	}
+	// LiveKit publishes layer discovery asynchronously. Availability can arrive
+	// first; allocation must use that observation without waiting for its notice.
 	receiver.available = []int32{0}
+	output.UpTrackLayersChange()
+	if state := output.State(); state.Target != 0 || state.Paused {
+		t.Fatalf("available source waited for its discovery notification: %+v", state)
+	}
+	output.UpTrackMaxPublishedLayerChange(2)
+	output.UpTrackMaxTemporalLayerSeenChange(0)
 	output.SetBudget(0)
 	if state := output.State(); !state.Paused || state.Prepare != -1 || state.VideoBudget != 0 {
 		t.Fatalf("bootstrap ignored an exhausted video budget: %+v", state)
@@ -110,6 +116,19 @@ func TestOutputUsesLibraryAllocationAndExactLifetime(t *testing.T) {
 	output.SetBudget(60_000)
 	if state := output.State(); !state.Paused || state.Target != -1 || state.Prepare != 0 || state.VideoBudget != 60_000 {
 		t.Fatalf("below-lowest budget cannot request codec adaptation: %+v", state)
+	}
+	// A new child's seed cannot veto a warm source's first video. Once feedback
+	// arrives, the same source must obey the real connection's allocation again.
+	observed := false
+	output.feedbackObserved = func() bool { return observed }
+	output.Reconcile()
+	if state := output.State(); state.Paused || state.Target < 0 {
+		t.Fatalf("warm source could not establish first feedback: %+v", state)
+	}
+	observed = true
+	output.Reconcile()
+	if state := output.State(); !state.Paused {
+		t.Fatalf("bootstrap bypassed observed raw-source limits: %+v", state)
 	}
 	receiver.controlled = true
 	output.Reconcile()

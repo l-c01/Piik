@@ -7,7 +7,7 @@ owns ports and [self-hosting](../operations/self-hosting.md) owns service setup.
 
 ## Topology
 
-- Media is automatic and P2P-first. Users do not select parents, route types, or
+- Media is automatic and defaults to P2P-first. Users do not select parents, route types, or
   network transports.
 - The Host is the only source. Every Viewer has at most one active upstream, and
   the committed media graph is acyclic and source-reachable.
@@ -21,9 +21,17 @@ same bounded P2P graph without its SFU fallback and fixes Privacy mode on for al
 rooms, including App Local and public-link rooms. The server enforces that policy
 for waiting and active participants; there is no separate Host-star mode.
 
+A Hosted operator may require SFU-only media through `SFU_ONLY=true`. The same
+controller then admits only SFU candidates: no Peer parents, Viewer relays or
+background P2P convergence. The Host still publishes once, and every Viewer
+uses the existing SFU subscription ledger and first-frame commit. Capacity or
+connection failure never permits a Peer route. An explicitly peer-only share
+is rejected before acquiring media authority; it is never silently forwarded.
+The page advertises this site policy and hides inapplicable P2P preferences.
+
 ## Per-Share Route Policy
 
-The Host chooses route policy before sharing and it remains fixed for that
+On a P2P-first site, the Host chooses route policy before sharing and it remains fixed for that
 share generation:
 
 - when SFU is available, default hybrid mode keeps P2P first and permits the
@@ -38,7 +46,7 @@ share generation:
   a Site may use self-hosted 3478/3479/3480, Public Link uses its bounded public survey, and
   pure LAN supplies none. Its default-on Host switch augments Browser and Native
   P2P edges. This gate leaves ordinary ICE and Native gateway mapping enabled.
-  Native uses one media socket for IPv4 and, where available, IPv6
+  Each Native connection uses one media socket for IPv4 and, where available, IPv6
   direct connections; its STUN survey and best-effort gateway mapping use IPv4.
   Availability and background direct acquisition share a bounded budget of
   four actual connection attempts per eligible parent/session opportunity:
@@ -46,6 +54,11 @@ share generation:
   attempts show retry 1/3, 2/3 and 3/3 on pages supporting that progress format.
   Retries use the same serial controller and normal operation deadlines;
   waiting Viewers and untried parents receive their opportunities first.
+  A retry may use bounded two-App socket preparation under ADR-0009 before its
+  one Pion connection. The first attempt and Browser-only transport stay ordinary;
+  failed optional preparation cannot disable the App for the session. Socket
+  ownership transfers only after mutual success; cancellation joins workers
+  before freeing their slot.
   It is not a participant capability, route score, or SFU preference. Candidate
   generation and selected-pair diagnostics retain only
   `ordinary | predicted | unknown` provenance.
@@ -111,12 +124,29 @@ deadline or start an independent recovery loop.
 When NAT traversal enhancement is enabled, another operation may use the
 remaining connection-attempt budget after rollback. The waiting display uses the actual
 server-issued attempt ordinal; it never counts time as an attempted connection.
-Committed Browser P2P recovery first restarts ICE on the same connection, then
-rebuilds that connection if necessary, within the existing two-request budget.
+Committed P2P recovery first requests an ICE restart, then requests a rebuild
+if necessary, within the existing two-request budget. A sender without restart
+support, including the current Native sender, replaces its connection on that
+first request.
+The budget belongs to the current parent and survives physical connection or
+Browser/Native backend replacement. Only a connected transport or a new parent
+resets it; replacing an unconnected backend cannot renew recovery indefinitely.
 Capable Native receivers also renegotiate that connection while retaining the
 encoded source, local playback and downstream edges when its codec/audio shape
 is unchanged. Pion owns ICE restart; each actual gathering owns fresh supplemental
-candidates. A changed media shape replaces the source and its dependent edges.
+candidates. Native STUN observations share only an in-flight transaction, never
+a completed address across gatherings. Discovery uses the existing media socket;
+retiring one gathering does not cancel another or close healthy media.
+Each actual gathering also refreshes a previously successful gateway mapping;
+the requested lease does not prove that the gateway retained its state. Ordinary
+SDP renegotiation does not refresh mappings, and this adds no background poller.
+A Native connection owns its UDP socket and optional gateway mapping. A new
+connection receives an independent socket; ICE restart retains the current one.
+Discovery and media must use that same connection-owned socket. Sharing a socket
+between physical connections can collapse an admitted overlap into one remote
+address/port, which Pion's UDP mux cannot demultiplex. Encoded sources remain
+shared; this isolation changes neither route authority nor copy capacity.
+A changed media shape replaces the source and its dependent edges.
 It does not require NAT prediction or reopen the route candidate. A prepared
 candidate instead follows its current route operation's failure path, without
 an independent restart loop.
@@ -194,6 +224,9 @@ An active configuration describes that connection; it cannot create a replacemen
 Browser subscriber. Replacement needs the controller's prepared subscription and
 first-frame proof. Reauthentication during an unfinished restart also returns
 that subscription to its route owner; sending an answer is not connection proof.
+Retained media keeps its original acquisition opportunity when signaling sessions
+change. Its failure cannot consume a new session's untried opportunity; a new
+physical connection binds the current one. This applies to Peer and SFU edges.
 An exhausted opportunity remains an explicit failure until an eligible new fact
 reopens acquisition. Source capture remains Host-owned throughout.
 
@@ -244,7 +277,8 @@ design. All-UDP-blocked networks currently end in bounded failure.
 App Local mode runs this graph without SFU, NAT prediction, or default STUN.
 One-link mode tunnels only HTTP/WebSocket control and adds public STUN to the
 same Browser/Native P2P edges. Reachable peers form one mixed relay tree; an
-unreachable path adds no route type or score. Site mode uses Site transport.
+unreachable path adds no route type or score. App-enabled Site pages use that
+Site's transport configuration.
 
 A Native Host reserves one loopback edge for Browser preview; it consumes no
 route-copy capacity or gateway mapping. Direct children and the admitted Native

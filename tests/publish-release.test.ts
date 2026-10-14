@@ -14,14 +14,15 @@ vi.mock("node:timers/promises", () => ({ setTimeout: async () => undefined }));
 const directory = mkdtempSync(join(tmpdir(), "piik-publisher-"));
 const version = "v1.0.1", revision = "a".repeat(40);
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
-for (const target of ["server", "windows-amd64", "linux-amd64", "darwin-arm64"]) {
-  const artifact = `${target}.${target === "server" ? "tar.gz" : "zip"}`;
+for (const target of ["server", "server-linux-arm64", "windows-amd64", "linux-amd64", "linux-arm64", "darwin-arm64", "darwin-amd64"]) {
+  const server = target.startsWith("server");
+  const artifact = `${target}.${server ? "tar.gz" : "zip"}`;
   writeFileSync(join(directory, artifact), target);
   writeFileSync(join(directory, `${target}.release.json`), JSON.stringify({
     schema: 2, version, revision, artifact, artifactSha256: hash(target),
-    ...(target === "server" ? { manifest: "server.manifest.tsv", manifestSha256: hash("manifest") } : { target }),
+    target, ...(server ? { manifest: `${target}.manifest.tsv`, manifestSha256: hash("manifest") } : {}),
   }));
-  if (target === "server") writeFileSync(join(directory, "server.manifest.tsv"), "manifest");
+  if (server) writeFileSync(join(directory, `${target}.manifest.tsv`), "manifest");
   else writeFileSync(join(directory, `${artifact}.sha256`), `${hash(target)}  ${artifact}\n`);
 }
 afterAll(() => rmSync(directory, { recursive: true, force: true }));
@@ -44,15 +45,26 @@ describe("Gitee mirror publication", () => {
   });
   async function mirror(options: { existing?: "pending" | "published" | "unknown"; corrupt?: boolean;
     wrongSource?: boolean; wrongDigest?: boolean; missing?: boolean;
+    stale?: boolean; supersededDuringUpload?: boolean;
     fault?: { method: string; remaining: number; status: number | "timeout" } } = {}) {
     const mutations: string[] = [];
     const attachments = sourceAssets.map(({ name, size }) => ({ name, size, browser_download_url: download + name }));
     const present = options.existing === "pending" ? attachments.slice(0, 1) : options.missing ? [] : attachments;
-    command.mockReturnValue(JSON.stringify({
+    const source = {
       ...release(false), html_url: `https://github.com/TNTcraftHIM/Piik/releases/tag/${version}`,
       target_commitish: options.wrongSource ? "b".repeat(40) : revision,
       assets: options.wrongDigest ? sourceAssets.map((asset) => ({ ...asset, digest: "sha256:wrong" })) : sourceAssets,
-    }));
+    };
+    let latestReads = 0;
+    command.mockImplementation((_program, args) => {
+      if (args[1].endsWith("/releases/latest")) {
+        latestReads++;
+        if (options.stale || (options.supersededDuringUpload && latestReads > 1)) {
+          return JSON.stringify({ ...source, tag_name: "v1.1.0", target_commitish: "b".repeat(40) });
+        }
+      } else expect(args[1]).toBe(`repos/TNTcraftHIM/Piik/releases/tags/${version}`);
+      return JSON.stringify(source);
+    });
     vi.stubEnv("GITEE_TOKEN", "fixture-mirror-token");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
@@ -126,6 +138,18 @@ describe("Gitee mirror publication", () => {
     expect(pending.failure).toBeUndefined();
     expect(pending.mutations.filter((value) => value.endsWith("/attach_files"))).toHaveLength(sourceAssets.length - 1);
     expect(await mirror({ existing: "published" })).toEqual({ mutations: [], failure: undefined });
+  });
+
+  it("prevents stale creation or completion while allowing existing stable verification", async () => {
+    for (const existing of [undefined, "pending"] as const) {
+      const result = await mirror({ existing, stale: true });
+      expect(result.failure).toContain("Only the latest GitHub release");
+      expect(result.mutations).toEqual([]);
+    }
+    const superseded = await mirror({ existing: "pending", supersededDuringUpload: true });
+    expect(superseded.failure).toContain("Only the latest GitHub release");
+    expect(superseded.mutations).not.toContain("PATCH /releases/42");
+    expect(await mirror({ existing: "published", stale: true })).toEqual({ mutations: [], failure: undefined });
   });
 
   it.each([503, "timeout"] as const)("retries transient read failures (%s) within a fixed bound", async (status) => {

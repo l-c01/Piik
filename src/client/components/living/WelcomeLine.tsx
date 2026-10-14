@@ -34,9 +34,9 @@ export function WelcomeCipher({ symbols }: Pick<WelcomeEntry, "symbols">) {
 export function WelcomeLine({ still = false }: { still?: boolean }) {
   const { lang, vis } = useCopy();
   const element = useRef<HTMLParagraphElement>(null);
-  const line = useRotatingText<WelcomeEntry>(locales[lang].playful.welcome, lang, element, still);
+  const line = useRotatingText<WelcomeEntry>(locales[lang].playful.welcome, lang, { element, still, rotate: false });
   if (!line) return null;
-  return <p ref={element} className={`lr-welcome${vis ? " is-cipher" : ""}`} aria-hidden={vis || undefined}>
-    {vis ? <WelcomeCipher symbols={line.symbols} /> : line.text}
+  return <p ref={element} className={`lr-welcome${vis ? " is-cipher" : ""}${still ? " is-still" : ""}`} aria-hidden={vis || undefined}>
+    {vis ? <WelcomeCipher symbols={line.symbols} /> : <span key={line.text} className="lr-welcome-text">{line.text}</span>}
   </p>;
 }

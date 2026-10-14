@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/TNTcraftHIM/Piik/internal/diagnostics"
+	"github.com/TNTcraftHIM/Piik/internal/thirdparty/livekit/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/bwe"
-	"github.com/livekit/livekit-server/pkg/sfu/bwe/sendsidebwe"
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
 	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
@@ -23,7 +23,7 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/transport/v4/packetio"
+	"github.com/pion/transport/v5/packetio"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -55,7 +55,6 @@ type Transport struct {
 	mu           sync.Mutex
 	attached     bool
 	closed       bool
-	audioBitrate uint32
 	paddingReady bool
 	closeOnce    sync.Once
 	closeErr     error
@@ -103,7 +102,7 @@ func NewTransport(options TransportOptions) (_ *Transport, err error) {
 			}
 		}
 		// Preserve stock Pion SRTP/SRTCP bounds for unclaimed streams, including audio.
-		input := packetio.NewBuffer()
+		input := &packetBuffer{Buffer: packetio.NewBuffer()}
 		limit := 1_000_000
 		if kind == packetio.RTCPBufferPacket {
 			limit = 100_000
@@ -136,11 +135,10 @@ func NewTransport(options TransportOptions) (_ *Transport, err error) {
 	})
 	transport.estimator.SetBWEListener(transport)
 	transport.prober = ccutils.NewProber(ccutils.ProberParams{Listener: transport, Logger: log})
-	// Use the pinned Pion pacer's 5 ms service cadence, with LiveKit packet
-	// ownership and a cap matching this connection's retransmission cache.
-	transport.pacer = newBoundedPacer(pacer.NewLeakyBucket(log, nil, 5*time.Millisecond, options.InitialBitrate),
+	// Match LiveKit's send-side BWE default: a reduced estimate must not throttle
+	// already-encoded frames into a stale backlog after the writer recovers.
+	transport.pacer = newBoundedPacer(pacer.NewNoQueue(log, nil),
 		log, options.Source.maxPackets)
-	transport.pacer.SetBitrate(options.InitialBitrate)
 	transport.pacer.sender = pacer.NewBase(log, transport.estimator)
 	transport.pacer.SetPacerProbeObserverListener(transport)
 	track, err := sfu.NewDownTrack(sfu.DownTrackParams{
@@ -155,6 +153,7 @@ func NewTransport(options TransportOptions) (_ *Transport, err error) {
 		return nil, err
 	}
 	transport.Output = NewOutput(track, int64(options.InitialBitrate))
+	transport.Output.feedbackObserved = transport.observed.Load
 	track.Receiver().(*outputReceiver).output = transport.Output
 	transport.Output.onActivity = transport.mediaActivity
 	transport.Output.onDemandChanged = options.OnDemandChanged
@@ -167,8 +166,6 @@ func NewTransport(options TransportOptions) (_ *Transport, err error) {
 			transport.driveProbeLocked()
 		}
 	})
-	// Spatial selection arms acquisition; its temporal bound must already be valid.
-	transport.Output.SetMaxTemporalLayer(0)
 	transport.Output.SetMaxSpatialLayer(int32(len(options.Source.TrackInfo().Layers) - 1))
 	transceiver, err := transport.PC.AddTransceiverFromTrack(track,
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
@@ -277,6 +274,7 @@ func validateReplacement(current, next *Source) error {
 	return nil
 }
 
+// TargetBitrate reports capacity for TWCC-tracked video, not total link capacity.
 func (transport *Transport) TargetBitrate() (int, bool) {
 	return int(transport.target.Load()), transport.observed.Load()
 }
@@ -302,24 +300,8 @@ func (transport *Transport) Egress() EgressStats {
 	return transport.pacer.stats()
 }
 
-// SetAudioBitrate reserves the current audio owner's contribution to this PC's
-// shared estimate. Zero means no audio demand; the transport invents no profile.
-func (transport *Transport) SetAudioBitrate(bitrate uint32) {
-	transport.mu.Lock()
-	defer transport.mu.Unlock()
-	if !transport.closed {
-		transport.audioBitrate = bitrate
-		transport.refreshBudgetLocked()
-	}
-}
-
 func (transport *Transport) refreshBudgetLocked() {
-	bitrate := int(transport.target.Load())
-	remaining := int64(bitrate) - int64(transport.audioBitrate)
-	if transport.probe.Id == ccutils.ProbeClusterIdInvalid || transport.probe.Result.EndTime != 0 {
-		transport.pacer.SetBitrate(bitrate)
-	}
-	transport.Output.SetBudget(max(remaining, 0))
+	transport.Output.SetBudget(transport.target.Load())
 }
 
 func (transport *Transport) Close() error {
@@ -359,9 +341,11 @@ func (transport *Transport) OnTransportCCFeedback(_ *sfu.DownTrack, packet *rtcp
 }
 
 // HandleTWCCFeedback invokes this synchronously under the transport's event
-// lock. Store the framework result without reentering that lock.
-func (transport *Transport) OnCongestionStateChange(_, _ bwe.CongestionState, capacity int64) {
-	if capacity > 0 {
+// lock. Congestion can reduce committed capacity; only a valid completed probe
+// can increase it. Warning/clear transitions can carry the estimator's initial
+// ceiling, especially while a probe is pending, rather than a new measurement.
+func (transport *Transport) OnCongestionStateChange(_, state bwe.CongestionState, capacity int64) {
+	if state == bwe.CongestionStateCongested && capacity > 0 && capacity < transport.target.Load() {
 		transport.target.Store(capacity)
 	}
 }
@@ -428,8 +412,7 @@ func (transport *Transport) driveProbeLocked() {
 		}
 		if transport.probe.Result.EndTime != 0 {
 			if signal, capacity, finalized := transport.estimator.ProbeClusterFinalize(); finalized {
-				valid := sendsidebwe.DefaultSendSideBWEConfig.CongestionDetector.ProbeSignal.IsValid(transport.probe)
-				if valid && signal == ccutils.ProbeSignalNotCongesting && capacity > transport.target.Load() {
+				if signal == ccutils.ProbeSignalNotCongesting && capacity > transport.target.Load() {
 					transport.target.Store(capacity)
 				}
 				transport.probe = ccutils.ProbeClusterInfoInvalid
@@ -452,14 +435,12 @@ func (transport *Transport) driveProbeLocked() {
 	if delta <= 0 {
 		return
 	}
-	usage += int64(transport.audioBitrate)
 	goal := ccutils.ProbeClusterGoal{AvailableBandwidthBps: int(transport.target.Load()),
 		ExpectedUsageBps: int(usage), DesiredBps: int(usage + max(delta*config.ProbeOveragePct/100, config.ProbeMinBps)),
 		Duration: transport.estimator.ProbeDuration()}
 	transport.probe = transport.prober.AddCluster(ccutils.ProbeClusterModeUniform, goal)
 	transport.estimator.ProbeClusterStarting(transport.probe)
 	transport.pacer.StartProbeCluster(transport.probe)
-	transport.pacer.SetBitrate(goal.DesiredBps)
 	transport.Output.SetProbeClusterId(transport.probe.Id)
 }
 
@@ -472,7 +453,6 @@ func (transport *Transport) stopProbeLocked() {
 	transport.estimator.ProbeClusterDone(transport.probe)
 	transport.prober.Reset(transport.probe)
 	transport.pacer.cancelProbes(transport.probe.Id)
-	transport.pacer.SetBitrate(int(transport.target.Load()))
 }
 
 // AddCluster returns the exact cluster synchronously. Initializing it there
@@ -524,12 +504,6 @@ type boundedPacer struct {
 func newBoundedPacer(packetPacer pacer.Pacer, log logger.Logger, limit int) *boundedPacer {
 	return &boundedPacer{Pacer: packetPacer, sender: pacer.NewBase(log, nil), recycle: pacer.NewBase(log, nil),
 		pending: make(map[*pacedPacket]struct{}), limit: limit}
-}
-
-func (queue *boundedPacer) SetBitrate(bitrate int) {
-	// Pion interceptor v0.1.47 gcc.LeakyBucketPacer.SetTargetBitrate uses 1.5
-	// pacing headroom. Codec/allocation budgets retain the unscaled BWE result.
-	queue.Pacer.SetBitrate(int(1.5 * float64(bitrate)))
 }
 
 func (queue *boundedPacer) Enqueue(packet *pacer.Packet) {
@@ -638,6 +612,9 @@ func (ticket *pacedPacket) WriteRTP(*rtp.Header, []byte) (int, error) {
 	if packet == nil {
 		return 0, io.ErrClosedPipe
 	}
+	if packet.Header.Padding {
+		packet.WriteStream = pionPaddingWriter{packet.WriteStream}
+	}
 	written, err := queue.sender.SendPacket(packet)
 	if err == nil && written > 0 {
 		queue.packets.Add(1)
@@ -648,6 +625,18 @@ func (ticket *pacedPacket) WriteRTP(*rtp.Header, []byte) (int, error) {
 }
 
 func (*pacedPacket) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// LiveKit's padding payload already includes its trailing padding bytes. Keep
+// that size for pacing/BWE, but let Pion serialize the padding exactly once.
+type pionPaddingWriter struct{ webrtc.TrackLocalWriter }
+
+func (writer pionPaddingWriter) WriteRTP(header *rtp.Header, payload []byte) (int, error) {
+	padding := int(header.PaddingSize)
+	if padding == 0 || padding > len(payload) {
+		return 0, errors.New("invalid forwarding padding")
+	}
+	return writer.TrackLocalWriter.WriteRTP(header, payload[:len(payload)-padding])
+}
 
 type closedPacketWriter struct{}
 

@@ -16,13 +16,13 @@ import (
 // authentication replaced between dispatch and use. Empty shareGeneration
 // means no share; nil displayName means the participant has no display name.
 type authenticatedSession struct {
-	roomID                     string
-	role                       protocol.Role
-	peerID                     string
-	shareGeneration            string
-	displayName                *string
-	viewerPresence             bool
-	connectionAttemptProgress4 bool
+	roomID          string
+	role            protocol.Role
+	peerID          string
+	shareGeneration string
+	displayName     *string
+	viewerPresence  bool
+	roomSession     bool
 }
 
 // outbound is one queue item: a text frame or the close frame that ends the
@@ -34,14 +34,13 @@ type outbound struct {
 	reason string
 }
 
-// session is SocketState plus the connection it belongs to. Every field is
+// session owns one signaling connection and its admission state. Every field is
 // guarded by Server.mu except conn, ctx, cancel, wake and readerDone, which
 // are immutable after accept.
 type session struct {
 	conn *websocket.Conn
 	// ctx is cancelled by terminate(); coder/websocket closes the socket
-	// when the context of a pending Read or Write expires, which is the
-	// `socket.terminate()` of the TS.
+	// when the context of a pending Read or Write expires.
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -50,23 +49,25 @@ type session struct {
 	siteAccessAuthenticated bool
 	revoked                 bool
 	authenticating          bool
-	// challenged is `lastSignalingChallengeAtMs !== undefined`.
+	// challenged distinguishes no challenge yet from a timestamp of zero.
 	challenged                 bool
 	lastSignalingChallengeAtMs int64
 	authenticated              *authenticatedSession
+	roomInteractions           bool
+	nextInteractionAtMs        int64
 
 	// authStop stops the authentication deadline; authGeneration is
-	// bumped whenever the TS cleared the timer so a callback that lost the
+	// bumped whenever the timer is cleared so a callback that lost the
 	// Stop race sees it is stale.
 	authStop       func() bool
 	authGeneration uint64
 
-	// queue is the ws send buffer; queuedBytes is its bufferedAmount.
+	// queuedBytes accounts for pending outbound text frames.
 	queue       []outbound
 	queuedBytes int
 	wake        chan struct{}
-	// closeQueued is readyState !== OPEN once close() was called: later
-	// sends are dropped and later closes are no-ops, as with ws.
+	// closeQueued stops further sends and repeated close requests while the
+	// writer completes the existing queue and close handshake.
 	closeQueued bool
 	terminated  bool
 	readerDone  chan struct{}
@@ -86,7 +87,7 @@ func newSession(conn *websocket.Conn, siteAccessAuthenticated bool) *session {
 	}
 }
 
-// open is `socket.readyState === WebSocket.OPEN`.
+// open reports whether this session still accepts outgoing messages.
 func (sess *session) open() bool {
 	return !sess.closeQueued && !sess.terminated
 }
@@ -105,7 +106,7 @@ func (sess *session) enqueue(encoded []byte) {
 	sess.notify()
 }
 
-// close is socket.close(code, reason): a no-op unless the socket is open.
+// close queues a close handshake only while the socket is open.
 // mu must be held.
 func (sess *session) close(code websocket.StatusCode, reason string) {
 	if !sess.open() {
@@ -116,7 +117,7 @@ func (sess *session) close(code websocket.StatusCode, reason string) {
 	sess.notify()
 }
 
-// terminate is socket.terminate(): abrupt, no close frame. Cancelling the
+// terminate closes abruptly without a close frame. Cancelling the
 // context closes the socket from inside the library, so nothing touches the
 // connection under mu. mu must be held.
 func (sess *session) terminate() {
@@ -127,7 +128,7 @@ func (sess *session) terminate() {
 	sess.cancel()
 }
 
-// clearAuthenticationTimer is clearTimeout(state.authenticationTimer).
+// clearAuthenticationTimer invalidates pending and already-fired callbacks.
 func (sess *session) clearAuthenticationTimer() {
 	if sess.authStop != nil {
 		sess.authStop()
@@ -152,8 +153,8 @@ func (s *Server) accept(conn *websocket.Conn, siteAccessAuthenticated bool) *ses
 	return sess
 }
 
-// armAuthenticationTimer is the setTimeout of accept(). The TS timer
-// fired blind; the generation check stands in for clearTimeout.
+// armAuthenticationTimer bounds admission time. The generation check rejects
+// a stale callback even when stopping the timer lost the race.
 func (s *Server) armAuthenticationTimer(sess *session) {
 	generation := sess.authGeneration
 	sess.authStop = s.afterFunc(time.Duration(s.authenticationTimeoutMs)*time.Millisecond, func() {
@@ -258,13 +259,6 @@ func (s *Server) heartbeat() []*session {
 // send drops unless open, terminates above the buffer bound,
 // and otherwise queues the encoded message.
 func (s *Server) send(sess *session, message protocol.ServerMessage) {
-	// Progress is optional feedback, not route authority. Older pages reject
-	// totals above three; omit it for that recipient without changing the route.
-	if prepare, ok := message.(protocol.RouteUpdatePrepareMessage); ok &&
-		(sess.authenticated == nil || !sess.authenticated.connectionAttemptProgress4) {
-		prepare.Candidate.ConnectionAttempt = nil
-		message = prepare
-	}
 	encoded, err := protocol.EncodeServerMessage(message)
 	if err != nil {
 		// JSON.stringify of a server literal cannot fail; neither can this.

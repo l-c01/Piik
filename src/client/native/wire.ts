@@ -1,10 +1,11 @@
 import { z } from "zod";
-import { sfuMediaSchema } from "../../shared/protocol";
+import { sfuMediaSchema, positiveUint32Schema, qualityResolutionSchema, punchPredictionSchema,
+  nullableSafeEvidenceNumber, nullableSafeEvidenceInteger } from "../../shared/protocol";
 
-export const NATIVE_CLIENT_PROTOCOL = 9;
+export const NATIVE_CLIENT_PROTOCOL = 10;
 export const NATIVE_CLIENT_PORT_START = 39_721;
 export const NATIVE_CLIENT_PORT_END = 39_730;
-export const NATIVE_CLIENT_SUBPROTOCOL = "piik-client-v9";
+export const NATIVE_CLIENT_SUBPROTOCOL = "piik-client-v10";
 
 const decimalIdentifierSchema = z.string().regex(/^[1-9]\d{0,19}$/);
 const opaqueIdentifierSchema = z
@@ -26,16 +27,24 @@ export const nativeDiscoveryIdentitySchema = z.object({
 
 export const nativeHealthSchema = nativeDiscoveryIdentitySchema.extend({
   protocol: z.literal(NATIVE_CLIENT_PROTOCOL),
+  qualityPreference: z.boolean().optional(),
   instanceToken: z
     .string()
     .length(43)
     .regex(/^[A-Za-z0-9_-]+$/),
   nativeMedia: z
     .object({
+      maxAudioBitrate: positiveUint32Schema.optional(),
+      maxVideoResolution: qualityResolutionSchema.optional(),
+      maxVideoPixels: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      maxVideoMacroblocksPerSecond: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      maxVideoFramerate: z.number().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      maxVideoBitrate: positiveUint32Schema.optional(),
       receiverReuse: z.boolean().default(false),
       video: z.boolean().default(false),
       processAudio: z.boolean().default(false),
       systemAudio: z.boolean().default(false),
+      processAudioExclusion: z.boolean().default(false),
       microphone: z.boolean().default(false),
       // API availability, not Windows approval or observed border visibility.
       captureBorderControl: z.boolean().default(false),
@@ -45,6 +54,11 @@ export const nativeHealthSchema = nativeDiscoveryIdentitySchema.extend({
     .prefault({}),
 });
 export type NativeHealth = z.infer<typeof nativeHealthSchema>;
+
+export const nativeConnectSchema = nativeDiscoveryIdentitySchema.extend({
+  protocol: z.literal(NATIVE_CLIENT_PROTOCOL),
+  connectURL: z.string().url().max(256),
+});
 
 const nativeWindowTargetSchema = z
   .object({
@@ -110,6 +124,13 @@ const responseBase = {
   version: z.literal(NATIVE_CLIENT_PROTOCOL),
   id: opaqueIdentifierSchema,
 };
+
+export const punchPreparedResponseSchema = z.object({
+  ...responseBase, type: z.literal("punch-prepared"), prediction: punchPredictionSchema.nullable(),
+}).strict();
+export const punchCompleteResponseSchema = z.object({
+  ...responseBase, type: z.literal("punch-complete"), connected: z.boolean(),
+}).strict();
 
 const nativeVideoCodecSchema = z.enum(["h264", "vp8"]);
 export type NativeVideoCodec = z.infer<typeof nativeVideoCodecSchema>;
@@ -228,6 +249,7 @@ export const nativeAckResponseSchema = z
       "edge-answer-accepted",
       "edge-candidate-accepted",
       "edge-closed",
+	  "punch-closed",
       "receive-candidate-accepted",
       "receiver-closed",
       "receive-stopped",
@@ -264,25 +286,20 @@ export const nativeEventSchema = z.discriminatedUnion("type", [
       rtpStatsId: z.string().min(1).max(256),
       trackIdentifier: z.string().min(1).max(256),
       codec: nativeVideoCodecSchema,
-      videoEncodingCount: z.number().int().min(1).max(3),
-      activeVideoEncodingCount: z.number().int().min(0).max(3),
+      videoEncodingCount: nullableSafeEvidenceInteger.catch(null),
+      activeVideoEncodingCount: nullableSafeEvidenceInteger.catch(null),
       rid: z.string().max(16),
       intervalFramesSent: z
         .number()
         .int()
         .nonnegative()
         .max(Number.MAX_SAFE_INTEGER),
-      framesPerSecond: z.number().finite().nonnegative().max(240),
-      width: z.number().int().nonnegative().max(16_384),
-      height: z.number().int().nonnegative().max(16_384),
-      bitrateKbps: z.number().finite().nonnegative().max(100_000),
-      audioBitrateKbps: z.number().finite().nonnegative().max(1_000),
-      availableOutgoingKbps: z
-        .number()
-        .finite()
-        .nonnegative()
-        .max(100_000)
-        .nullable(),
+      framesPerSecond: nullableSafeEvidenceNumber.catch(null),
+      width: nullableSafeEvidenceInteger.catch(null),
+      height: nullableSafeEvidenceInteger.catch(null),
+      bitrateKbps: nullableSafeEvidenceNumber.catch(null),
+      audioBitrateKbps: nullableSafeEvidenceNumber.catch(null),
+      availableOutgoingKbps: nullableSafeEvidenceNumber.catch(null),
       state: z.enum(["unknown", "healthy", "degraded"]),
       reason: z.enum(["none", "bandwidth"]).nullable(),
     })
@@ -379,11 +396,11 @@ export const nativeEventSchema = z.discriminatedUnion("type", [
         .int()
         .nonnegative()
         .max(Number.MAX_SAFE_INTEGER),
-      framesPerSecond: z.number().finite().nonnegative().max(240),
-      bitrateKbps: z.number().finite().nonnegative().max(100_000),
-      availableOutgoingKbps: z.number().finite().nonnegative().max(100_000),
-      width: z.number().int().nonnegative().max(16_384),
-      height: z.number().int().nonnegative().max(16_384),
+      framesPerSecond: nullableSafeEvidenceNumber.catch(null),
+      bitrateKbps: nullableSafeEvidenceNumber.catch(null),
+      availableOutgoingKbps: nullableSafeEvidenceNumber.catch(null),
+      width: nullableSafeEvidenceInteger.catch(null),
+      height: nullableSafeEvidenceInteger.catch(null),
     })
     .strict()
     .superRefine((event, context) => {

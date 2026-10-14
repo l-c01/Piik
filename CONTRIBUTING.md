@@ -21,6 +21,16 @@ PR; maintainers can help identify what still needs verification.
 讨论时请结合实际场景提出建议，尊重不同意见；分享截图或日志前移除隐私内容。
 无法运行的检查请如实说明，便于维护者协助验证。
 
+Review contributions by their practical value, evidence and fit with the product,
+not their line count. A small fix that identifies and resolves a real defect is
+valuable. Duplicate work already independently resolved, personal preferences or
+low-value changes may be declined; merging is not an attribution mechanism.
+Retain authorship for accepted contributions and credit substantive discoveries
+accurately, without attributing independently written code to a PR author.
+评审看实际价值、证据和产品定位，不看代码行数。发现并解决真实问题的小修复同样值得接纳；
+已经独立解决的重复工作、个人偏好或收益很低的改动可以不合并，不为增加贡献者名单而合并。
+保留已接纳贡献的作者信息，如实说明有价值的问题发现；独立编写的代码不应冒记为他人共同编写。
+
 ## Lean Workflow
 
 This is the default for an ordinary scoped implementation or bug fix.
@@ -101,15 +111,21 @@ does not establish coverage.
   The server core is Go, so its acceptance runs here. It builds the Web UI first when
   that output is missing, because both binaries embed it. CI invokes these same
   package commands rather than rebuilding their steps in YAML.
-- `npm run check:go-race` checks port mapping, media-edge ownership and their
-  scoped NAT dependencies with Go's race detector. It requires a supported cgo
-  toolchain; CI runs it on Linux.
+- `npm run check:go-race` checks port mapping, media-edge and native-control
+  ownership, loopback delivery, service storage shutdown and scoped NAT dependencies with Go's race detector. It
+  requires a supported cgo toolchain; CI runs it on Linux.
+- `npm run check:go-vuln` checks the App and Server entry points and their
+  dependencies against the Go vulnerability database. CI uses the Go version
+  declared in `go.mod`; update that owner for required toolchain security fixes.
 - `npm run check:native` runs only the current platform's capture compile/probe
   and deterministic native regressions. The Linux App packaging job includes
   its headless GStreamer output-profile and retirement test; this does not
   establish physical screen/audio capture on that runner.
+  The macOS frame self-test additionally needs an available hardware H.264
+  encoder. A runner without one reports that check as skipped and still checks
+  compilation, capability/source responses and the packaged App's startup.
 - `npm run check:container -- <local-image> <full-SHA>` checks the Compose recipe
-  against a packaged linux/amd64 image: embedded Web, P2P/STUN, optional SFU
+  against a packaged native Linux image (amd64 or arm64): embedded Web, P2P/STUN, optional SFU
   startup, room persistence across recreation, diagnostics and clean shutdown.
   It requires Docker Compose v2 and available recipe ports on an isolated runner;
   its temporary project and volumes are removed after the check.
@@ -118,6 +134,10 @@ does not establish coverage.
   result. A manual diagnostic may locate a failure, but is not retained as pass
   evidence. Existing `PIIK_CLIENT_*` gate environment names retain their current
   contract; renaming the tools does not change those overrides.
+- `gate:network-lab` runs the opt-in [controlled network laboratory](./docs/research/network-lab.md).
+  It requires a disposable Linux runner with namespace administration. Its own
+  routers contain all firewall and traffic-shaping changes; do not run it on a
+  production service or treat its model results as a public success rate.
 - On Windows, execute App/Server and Go test binaries only from stable
   project build paths. Go's temporary compiler/cache files are not firewall
   identities; do not run network tests with a changing temporary executable

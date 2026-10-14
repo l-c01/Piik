@@ -7,13 +7,16 @@ import {
 } from "../src/client/native/native-sender-edge";
 import type { NativeClientEvent } from "../src/client/native/wire";
 
-function fixture(natPrediction = false) {
+function fixture(natPrediction = false, extraStun = false, retry = false) {
   let listener: ((event: NativeClientEvent) => void) | null = null;
   const prepareEdge = vi.fn<NativeEdgeControl["prepareEdge"]>(async () => ({
     type: "offer",
     sdp: "v=0\r\n",
   }));
   const control: NativeEdgeControl = {
+    preparePunch: vi.fn(async () => null),
+    runPunch: vi.fn(async () => false),
+    closePunch: vi.fn(async () => undefined),
     updateShare: vi.fn(async () => undefined),
     prepareEdge,
     acceptSignal: vi.fn(async () => undefined),
@@ -37,7 +40,7 @@ function fixture(natPrediction = false) {
     "share_1234567",
     natPrediction
       ? {
-          iceServers: [{ urls: "stun:share.example.test:3478" }],
+          iceServers: [{ urls: ["stun:share.example.test:3478", ...(extraStun ? ["stun:other.example.test:3478"] : [])] }],
           natPredictionStunUrls: [
             "stun:share.example.test:3479",
             "stun:share.example.test:3480",
@@ -50,6 +53,7 @@ function fixture(natPrediction = false) {
       sendSignal,
       onState: (state) => states.push(state),
     },
+    undefined, retry,
   );
   return {
     edge,
@@ -62,21 +66,37 @@ function fixture(natPrediction = false) {
 }
 
 describe("native sender edge adapter", () => {
+  it("keeps initial ICE immediate and falls through immediately for a Browser retry", async () => {
+    const initial = fixture(true);
+    expect(await initial.edge.start()).toBe(true);
+    expect(initial.control.preparePunch).not.toHaveBeenCalled();
+    initial.edge.dispose();
+
+    const retry = fixture(true, false, true);
+    const started = retry.edge.start();
+    expect(retry.sent[0].kind).toBe("punch");
+    await retry.edge.acceptSignal({ kind: "punch", connectionId: "edge_12345678", punch: { phase: "ready" } });
+    expect(await started).toBe(true);
+    expect(retry.control.runPunch).not.toHaveBeenCalled();
+    expect(retry.control.prepareEdge).toHaveBeenCalledWith("share_1234567", "edge_12345678", expect.anything(), undefined, false);
+    expect(retry.sent.find(signal => signal.kind === "description")).not.toHaveProperty("punched");
+    retry.edge.dispose();
+  });
   it.each([null, { candidate: "candidate:1 1 udp 1 127.0.0.1 9 typ host" }])(
     "keeps connected media when trickle signaling is unavailable: %j", async (candidate) => {
       const current = fixture();
       expect(await current.edge.start()).toBe(true);
-      current.emit({ version: 9, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "connected" });
+      current.emit({ version: 10, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "connected" });
       current.sendSignal.mockReturnValue(false);
-      current.emit({ version: 9, type: "edge-candidate", shareId: "share_1234567", connectionId: "edge_12345678", candidate });
+      current.emit({ version: 10, type: "edge-candidate", shareId: "share_1234567", connectionId: "edge_12345678", candidate });
       expect(current.edge.isConnected()).toBe(true);
       expect(current.control.closeEdge).not.toHaveBeenCalled();
       expect(current.states).toEqual(["connected"]);
-      current.emit({ version: 9, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "failed" });
+      current.emit({ version: 10, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "failed" });
       expect(current.edge.isConnected()).toBe(false);
       expect(current.states).toEqual(["connected", "failed"]);
       current.edge.dispose();
-      current.emit({ version: 9, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "connected" });
+      current.emit({ version: 10, type: "edge-state", shareId: "share_1234567", connectionId: "edge_12345678", state: "connected" });
       expect(current.edge.isConnected()).toBe(false);
       expect(current.control.closeEdge).toHaveBeenCalledOnce();
     },
@@ -90,7 +110,7 @@ describe("native sender edge adapter", () => {
 
     const current = fixture();
     vi.mocked(current.control.prepareEdge).mockImplementationOnce(async () => {
-      current.emit({ version: 9, type: "edge-candidate", shareId: "share_1234567", connectionId: "edge_12345678", candidate: null });
+      current.emit({ version: 10, type: "edge-candidate", shareId: "share_1234567", connectionId: "edge_12345678", candidate: null });
       return { type: "offer", sdp: "v=0\r\n" };
     });
     current.sendSignal.mockImplementation((_peer, payload) => payload.kind === "description");
@@ -104,7 +124,7 @@ describe("native sender edge adapter", () => {
     const prepare = vi.mocked(current.control.prepareEdge);
     prepare.mockImplementationOnce(async () => {
       current.emit({
-        version: 9,
+        version: 10,
         type: "edge-candidate",
         shareId: "share_1234567",
         connectionId: "edge_12345678",
@@ -125,7 +145,7 @@ describe("native sender edge adapter", () => {
     const current = fixture();
     expect(await current.edge.start()).toBe(true);
     current.emit({
-      version: 9,
+      version: 10,
       type: "edge-state",
       shareId: "share_1234567",
       connectionId: "edge_12345678",
@@ -153,7 +173,7 @@ describe("native sender edge adapter", () => {
       .toHaveLength(3);
     for (const [index, port] of [40_000, 40_003, 40_006].entries()) {
       current.emit({
-        version: 9,
+        version: 10,
         type: "edge-candidate",
         shareId: "share_1234567",
         connectionId: "edge_12345678",
@@ -169,5 +189,25 @@ describe("native sender edge adapter", () => {
     );
     expect(candidates.filter((candidate) => /^candidate:s[pm]\d+ /.test(candidate)))
       .toHaveLength(8);
+  });
+
+  it("forwards extra STUN candidates without mistaking them for prediction evidence", async () => {
+    const current = fixture(true, true);
+    expect(await current.edge.start()).toBe(true);
+    const emit = (index: number, port: number) => current.emit({
+      version: 10, type: "edge-candidate", shareId: "share_1234567", connectionId: "edge_12345678",
+      candidate: { candidate: `candidate:ns${index} 1 udp 1 203.0.113.7 ${port} typ srflx` },
+    });
+    const candidates = () => current.sent.flatMap(payload => payload.kind === "candidate" && payload.candidate
+      ? [payload.candidate.candidate] : []);
+    // Deliberately receive out of list order, with three seemingly sequential ports.
+    emit(3, 40_006);
+    emit(2, 40_003);
+    emit(1, 40_000);
+    expect(candidates()).toHaveLength(3);
+    emit(4, 40_012);
+    expect(candidates().filter(value => /^candidate:ns/.test(value))).toHaveLength(4);
+    expect(candidates().filter(value => /^candidate:s[pm]/.test(value))).toHaveLength(8);
+    current.edge.dispose();
   });
 });

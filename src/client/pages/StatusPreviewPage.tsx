@@ -4,6 +4,8 @@ import { AppHeader, LedStrip } from "../components/living/Header";
 import { StageOverlay, StageTv } from "../components/living/Stage";
 import { Couch } from "../components/living/Couch";
 import { StatusIndicator } from "../components/living/StatusIndicator";
+import { ShareFailureHelp } from "../components/living/ShareFailureHelp";
+import { hostFailureChecks } from "./host-page-notices";
 import { LoadingStatus } from "../components/living/WaitingStatus";
 import { Pill } from "../components/living/primitives";
 import { deriveViewerPresentation } from "../media/viewer-presentation";
@@ -45,7 +47,7 @@ export function StatusPreviewPage() {
   const waitingParticipant = deriveParticipantStatus({ upstream: { kind: "none" } }, sourceActive);
   const titleContent = titleFrames(status.titleFrameKey);
   const title = useDocumentTitle(["6020", titleContent.label, status.titleMarker], titleContent.variations,
-    `${lang}:${vis}:${status.titleFrameKey}`, reducedMotion);
+    `${lang}:${vis}:${status.titleFrameKey}`);
   const waitingLines = locales[lang].playful.waiting;
 
   function choose(id: string) {
@@ -56,6 +58,24 @@ export function StatusPreviewPage() {
     <div className="lr-app sp-page" data-comic-reduced-motion={reducedMotion || undefined}>
       <AppHeader homeHref="/__status-preview" />
       <main className="sp-main">
+        <section className="sp-catalog" id="sharing-troubleshooting">
+          <header><h2>分享失败排查</h2><p>悬停看原因，点击状态图标打开排查；不会自动重试或更改设置。</p></header>
+          <div className="sp-catalog-grid">
+            {([
+              ["native.fail.captureStart", "app/start-share/rejected", "source-failed"],
+              ["native.fail.requestTimeout", "app/start-share/timeout", "source-failed"],
+              ["native.fail.controlDisconnected", "app/start-share/disconnected", "route-failed"],
+              ["native.fail.edge", "app/browser-media/connection", "route-failed"],
+              ["api.originNotAllowed", "site/http-403", "warning"],
+              ["host.capture.cancelled", "browser/NotAllowedError", "hint-capture-browser"],
+              ["host.camera.denied", "camera/NotAllowedError", "source-failed"],
+              ["host.roomInvalid", "status/unknown", "room-not-found"],
+            ] as const).map(([key, code, tooltip]) => <article key={code}>
+              <ShareFailureHelp status={{ icon: "alert", tone: code.endsWith("NotAllowedError") ? "warn" : "bad", tooltip, labelKey: key }} label={t(key)} code={code} checks={hostFailureChecks(code)} />
+              <span>{t(key)}</span>
+            </article>)}
+          </div>
+        </section>
         <header className="sp-heading">
           <div><p className="sp-kicker">Piik · 状态语义</p><h1>同一事实，各有分寸。</h1>
             <p>标题说正在做什么，顶部说明信令，电视下沿图标说明画面；悬停查看图示与文字说明。</p></div>
@@ -166,7 +186,7 @@ export function StatusPreviewPage() {
         </section>
         <section className="sp-catalog" id="waiting-preview">
           <header><h2>加载与等待</h2>
-            <p>通用加载用 mascot，具体媒体状态用对应漫画；文字模式保留真实状态与等待短句。短句立即出现，每 8 秒轮换，隐藏时暂停。切换上方场景可比较等待、错误和操作提示。</p>
+            <p>页面加载与站点检查只显示真实状态。App 启动与媒体等待保留一句次要短句，每 15 秒轮换，隐藏时暂停；连续等待中的状态变化不会重新抽句。</p>
           </header>
           <label>入口状态 <select value={loadingLabel} onChange={event => setLoadingLabel(event.target.value as CopyKey | "")}>
             <option value="common.loading">页面加载</option>
@@ -175,7 +195,8 @@ export function StatusPreviewPage() {
             <option value="">结束等待</option>
           </select></label>
           <div className="sp-loading-preview">
-            {loadingLabel ? <LoadingStatus label={loadingLabel} still={reducedMotion} /> : <span>等待组件已卸载。</span>}
+            {loadingLabel ? <LoadingStatus label={loadingLabel} still={reducedMotion}
+              waitingCaption={loadingLabel === "client.launch.starting"} /> : <span>等待组件已卸载。</span>}
           </div>
           <details className="sp-title-catalog"><summary>等待短句 · {waitingLines.length} 条</summary>
             <ol>{waitingLines.map(line => <li key={line}>{line}</li>)}</ol>
@@ -183,7 +204,7 @@ export function StatusPreviewPage() {
         </section>
         <section className="sp-catalog">
           <header><h2>标题彩蛋词库</h2>
-            <p>真实状态与提醒始终保留。六类状态附带独立的彩蛋词库，立即显示、每 8 秒轮换，本轮抽完再重复。暂停、结束和操作提示保持固定。各语言可分别增补短句，不要求数量相同。</p>
+            <p>真实状态与提醒始终保留。六类状态各随机选一句彩蛋，同一状态内不轮播。暂停、结束和操作提示保持固定。各语言可分别增补短句，不要求数量相同。</p>
           </header>
           {(Object.keys(locales.zh.titleFrames) as TitleFrameKey[]).map(key => {
             const frames = titleFrames(key);

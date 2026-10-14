@@ -1,8 +1,8 @@
 # Browser Node-Local Encoding Pool
 
-Reviewed and executed 2026-09-09 on Windows, Chrome 152.0.7977.82.
+Initial baseline: 2026-09-09 on Windows, Chrome 152.0.7977.82.
 [ADR-0014](../adr/0014-browser-node-local-encoding-pool.md) owns the selected
-design. The observations below belong to that measured baseline;
+design. Dated follow-ups identify their own Browser and workload boundaries;
 [status](../status.md) owns current adoption and release state, and
 [verification status](../verification-status.md) owns remaining physical limits.
 
@@ -92,6 +92,39 @@ The constrained runs use a test-only forward UDP bridge with about 250 ms
 maximum queued service; reverse feedback is unshaped. They are not a model of
 public NAT, geographic RTT or every congestion/loss pattern. Reduced quality
 and temporary stalls under real constraints remain possible.
+
+A 2026-09-30 actual-tab fault check separated A at 400 kbps from healthy B,
+then failed only A's producer. Both H264 and VP8 retained the outgoing
+connections, returned to ordinary encoding and retired all pooled groups.
+B retained 1904x1048 at about 30 fps; its largest observed frame-callback gap
+around fallback was 271 ms for H264 and 80 ms for VP8. Source-wide fallback
+therefore has a measurable handoff cost, even without a resolution drop or
+connection failure. This does not establish low-end hardware capacity.
+
+An unmatched negotiated codec is instead connection-local. A Chrome 154
+late-Viewer control reproduced all members losing pooling when only the new
+Viewer advertised different codec parameters. Scoped fallback now preserves
+the first Viewer's producer and delivers fresh pictures to both Viewers in
+VP8 1080p and H264 4K controls. Unit counterfactuals cover admission and active
+codec changes; producer failure retains its existing source-wide fallback.
+These controls establish membership isolation, not enforcement of physical
+decoder limits or the cause of field quality fluctuations.
+
+### Local Connection Failure Control
+
+On 2026-10-08, Windows headless Chrome 154 ran the actual `HostPeer` and pool
+with a moving 640x360 VP8 source. mDNS host candidates supported one producer
+and two receivers. Discarding only the producer's ICE candidates triggered its
+eight-second timeout; both existing P2P connections then delivered 30 ordinary
+decoded frames each, retaining the source and no producer groups.
+
+This loopback-origin diagnostic does not test public-origin permission,
+Chrome/Firefox LAN interoperability or public-path quality. In
+[#465](https://github.com/TNTcraftHIM/Piik/issues/465), the successful repeat
+changed permission and IP masking together. Neither is an isolated cause;
+[HTTP App discovery](https://developer.chrome.com/blog/local-network-access)
+and [WebRTC connectivity](https://chromestatus.com/feature/5065884686876672)
+need separate evidence. This control is not a release acceptance gate.
 
 ### Balanced Startup And Recovery
 
@@ -263,6 +296,356 @@ models `requestFrame()` as a pending request, not a counted queue of clock ticks
 Do not infer one delivered carrier frame per call or enlarge the encoded queue
 to hide lost timing.
 
+### Sustained H264 Recovery
+
+A v1.6.8 field observation on 2026-09-29 confirmed minutes of 180p / low FPS
+under 1080p30, balanced and a 5 Mbps ceiling. Server summaries and receiver
+RTCStats agree. A new Viewer briefly restored the incumbent to 1080p without
+changing its parent; reconnecting the observer did not restore quality. An SFU
+candidate initially decoded well, then stalled; replay through the production
+quality probe correctly withheld approval. These observations establish the
+symptom, not its network or encoder cause. Host producer/carrier histories were
+unavailable; server summaries cannot reconstruct those local owners.
+
+Serial comparisons on 2026-09-29/30 used synthetic motion, played audio,
+1080p30 / balanced / 5 Mbps and a test-only UDP bridge. They distinguish
+Canvas input from real `getDisplayMedia` capture. Each case is bounded evidence,
+not a public-network reproduction or a population result.
+
+| Input / Browser | Constraint and recovery result |
+| --- | --- |
+| Canvas bars / Edge 154.0.4258.37 | Ordinary and pooled senders recovered from 360p to 1080p after 400 kbps, 4% forward loss and 200 ms RTT; about 21 / 17 seconds after rate/loss release |
+| Textured Canvas / Chrome 153.0.8010.53 and 154.0.8037.58 | Ordinary and pooled sending could retain 540p after allocation recovered; the longer Chrome 154 pair remained there after 145 seconds |
+| Browser tab / Chrome 154.0.8037.58 | Ordinary and bare WebRTC retained 148p / about 10 fps after 65 recovery seconds; the bare sender's outgoing estimate was 5.6 Mbps and video target 5 Mbps |
+| Chrome's own window / Chrome 154.0.8037.58 | Bare and pooled sending retained 180p / about 10 fps after 65 recovery seconds, with roughly 4.5–4.7 Mbps video targets |
+| Non-Browser Windows test window / Chrome 154.0.8037.58 | All 2,758 observed source frames remained 1866x1080; bare sending recovered from 180p through 270/360p to 540p during the 65-second window |
+
+The display cases used a 45-second 400 kbps / 4% loss interval followed by
+removing both constraints; 300 ms configured RTT remained. The non-Browser
+fixture captured about 21 fps and does not establish 30 fps performance. Bare
+WebRTC used one cloned track, codec selection and initial sender parameters,
+without Piik's pool, startup guard, quality controller or repeated parameter
+writes. It also reproduced the tab restriction with VP8. Keeping the original
+preview playing and using `resizeMode:none` did not remove it.
+
+**Short disturbances can enter the persistent state.** Two one-second rate/loss
+pulses, each followed by 40 unconstrained seconds, took the bare tab sender from
+778p to 418p and then 238p; the actual Piik pool comparison ended at 148p.
+Targets recovered to about 5 Mbps and actual captured frames remained reduced.
+These single runs establish reachability in both paths, not that the pool is
+worse or that every brief blur has this cause. The fixture retained 300 ms RTT.
+
+A standalone HTML reproduction removed Piik, audio and the network shaper
+entirely. It connected two local PeerConnections, captured its own moving tab,
+selected H264 / balanced, reduced only `maxBitrate` from 5 Mbps to 400 kbps for
+45 seconds, then restored it for 65 seconds. Source frames stayed 270x148 and
+encoded output stayed at 148p / 10 fps, despite a 5 Mbps target, an approximately
+13 Mbps outgoing estimate and 0–1 ms measured RTT. A preceding latency-only comparison
+retained 238p. Network loss is therefore not necessary for this local lock;
+these are synthetic Chrome 154 results, not the field room's diagnosed cause.
+
+**Capture lock and encoder hysteresis remain distinct.** Canvas recovery could follow content
+complexity: changing to simple bars restored 1080p, retained after restoring
+the textured scene. WebRTC's [quality scaler](https://webrtc.googlesource.com/src/+/3a8b0c76e6b7bf0e72141047f82eb2c3f4862c8d/modules/video_coding/utility/quality_scaler.cc)
+uses QP thresholds and sampling history as well as bandwidth-related adaptation.
+Its default two-second checks and longer sampling after down-adaptation can
+outlast a short disturbance. A Chrome 154 ordinary-sender tab control on
+2026-09-30 remained at 524p / about 30 fps after 120 recovery seconds following two
+one-second rate/loss pulses. Actual capture stayed 1904x1048 / 30 fps; the native
+log's slow QP filter settled around 27, above its upscale threshold of 24.
+Changing only the scene to simple moving bars restored full size in about
+12 seconds. Restoring the textured scene then retained full size for the
+remaining 30 seconds. The sender made only its two startup parameter writes;
+no pool, reconnect, preference reset or frame reset caused that recovery.
+This confirms a content-dependent stable state, not merely stale samples or
+a blocked recovery operation. Restored bandwidth alone does not require this
+scaler to restore resolution. The scaler and default-threshold source matched
+inspected upstream main on that date; this does not establish every device's
+behavior or the field report's cause.
+
+A matched three-arm comparison used fixed 5 Mbps, alternating 5.0/4.9 Mbps
+every 500 ms, and repeated identical 5 Mbps writes. Native reconfiguration
+counts were 2/122/2; actual encoded rates were 4.914/4.114/4.907 Mbps. Changed
+budgets repeatedly returned the encoder target to the
+[bitrate adjuster's conservative startup state](https://webrtc.googlesource.com/src/+/3a8b0c76e6b7bf0e72141047f82eb2c3f4862c8d/video/encoder_bitrate_adjuster.cc),
+whereas identical writes did not. All three stayed at 786p and about 29 fps,
+without new keyframes during the experiment. These single-device runs show a
+framework reconfiguration cost, not additional resolution oscillation or a
+perceptual blur measurement. They do not justify delaying real demand, bitrate
+compensation or periodic resets; equal product updates are already deduplicated.
+The field's repeated brief blur still lacks matching Host histories.
+
+**Hardware encoder startup can block sibling encoding.** On 2026-10-01,
+Windows Chrome 154.0.8037.58 tests added three independent Canvas H264 producers,
+coinciding with 174/221/225 ms gaps in the existing producer; captured frames
+continued within 47 ms. The new producers never joined the pool or replaced its
+output, and the existing
+producer's parameters did not change. Their NVIDIA initialization took
+161/163/162 ms. Substituting software VP8, confirmed by RTCStats as libvpx, gave
+60/48/109 ms existing-producer gaps in the same startup windows.
+A subsequent trace recorded 148 ms of `CreateAndInitializeVEA` on the shared
+Renderer Media thread, matching GPU-side initialization. Frames timestamped
+during that interval entered encoding together on the same thread after it
+returned. This establishes blocking in the local reproduction, consistent with
+[Chromium's synchronous initialization IPC](https://github.com/chromium/chromium/blob/154.0.8037.58/media/mojo/clients/mojo_video_encode_accelerator.cc#L117).
+The trace buffer lost events elsewhere; this conclusion uses complete task and
+frame events, not missing events. It does not identify the driver's internal
+cost, explain earlier downscaling or attribute unmatched field reports. No
+codec-default change, spare prewarmed encoder or pool reset follows from it.
+The Windows [VEA provider](https://github.com/chromium/chromium/blob/154.0.8037.58/media/mojo/services/mojo_video_encode_accelerator_provider.cc)
+already assigns each service a dedicated COM STA runner; the trace likewise
+places the old service's encoding and new initialization on different threads.
+Asynchronous Renderer initialization is therefore a plausible upstream repair,
+not merely moving the wait onto another shared queue. It still needs a patched
+Browser comparison, including initialization failure and callback ordering;
+shared GPU/driver cost remains unproved.
+
+**Optional reuse must preserve the existing rate owner.** A two-Viewer,
+textured-tab H264 comparison exposed a Piik handoff defect. During recovery
+from a one-second rate/loss pulse, a healthy Viewer moved from a 5 Mbps group
+to a lower-budget group because its sampled output was 29 rather than 27 fps
+at the same 1048p. Both reported `qualityLimitationReason:none`, but the same
+NVIDIA encoder implementation's interval-average QP was about 51 on the
+candidate versus 37 on the current output; the candidate then fell to 786p. The
+[stats definition](https://www.w3.org/TR/webrtc-stats/#dom-rtcqualitylimitationreason-none)
+describes resolution/FPS limitation, not equal quantization quality.
+
+Pending membership raised the candidate's budget before the existing
+lower-budget rejection ran. The candidate repair checks this constraint before
+membership and reuses one non-regression predicate before submitting a pending
+selection. FPS comparisons also respect the Host ceiling; a sampled 32 fps
+under a 30 fps ceiling is not an improvement over 30 fps. Initial output and
+necessary downgrades retain their path, without a QP policy, timer or encoder reset.
+
+Selection also needs proof at the actual write boundary: while waiting for a key,
+a candidate can downscale after passing the sampled comparison. The output now
+asks the pool to revalidate current authority, budget and actual key dimensions
+before replacing its queue or writing bytes. Rejection clears both pending owners,
+invalidates a contradicted sample and retains prior output and recovery requests.
+H264/VP8 display-capture checks preserve live/paused settings, source replacement
+and ordinary fallback; played audio remains present. Brief video stalls remain.
+
+The bounded H264 and VP8 two-Viewer controls for this admission repair retained
+the healthy sibling at 1048p and about 29 fps through both recovery intervals.
+The constrained Viewer still adapted and recovered. This establishes one
+avoidable sibling degradation path, not the field room's cause or elimination
+of all brief blur. The affected admission rules predate the display-isolation
+repair. Raw observations stay in ignored fixtures; comparisons read native stats
+without calling the producer's startup-transition helper.
+
+Current demand also matters at group admission. Two-Viewer traces showed a
+newcomer raising an incumbent group's allocation because matching used the
+previous applied budget. The incumbent then needed another encoder, while the
+newcomer's former encoder retired. Matching current native demand prevents that
+exchange; a pending newcomer cannot establish compatibility with its own vote.
+Cancellation must stop at accepted output writing, including a pause that delays
+its completion. These are ownership repairs, not suppression of real demand
+changes or removal of the measured hardware initialization cost.
+
+**Quiet content is not rate compatibility.** A separate fixed-allocation
+comparison kept the two outgoing H264 ceilings at 3 and 5 Mbps, with no network
+shaping, while alternating simple and textured moving content. Actual native
+allocations stayed at those ceilings during the later scene cycles. Reuse based
+on a quiet 500 ms byte-rate sample repeatedly moved the weaker child into the
+5 Mbps producer; returning motion split it out again. Five producers were created
+over the run. Requiring the candidate's rate budget to fit the child's allocation
+at initial admission, optional reuse and pending revalidation retained two
+producers with no scene-driven handoffs. The healthy H264 sibling retained full
+1048p; the weaker output continued native adaptation. VP8 also retained two
+producers through the same scene changes. Three controlled regressions fail
+when these checks are removed, including a paused pending child whose candidate
+budget rises. Unequal demands may retain an additional producer even during a
+quiet scene; bounded membership and native recovery remain unchanged. These
+checks remove unnecessary encoder churn, not all content-dependent adaptation.
+
+**A known allocation should initialize the local encoder.** A replacement local
+PeerConnection otherwise starts its own estimate at WebRTC's default 300 kbps,
+even when the outgoing connection already allocates 4 Mbps. Chrome 154's native
+logs confirm this second cold start. On the same isolated 1904x1048 textured tab,
+seeding only the local answer with that 4 Mbps allocation increased VP8 output
+in the first second from 6 to 27 frames; its first sampled target was 3.33 Mbps
+rather than 2.70 Mbps. The 400 kbps control retained its native 333 kbps initial
+encoder target and two first-second frames with either version. These bounded
+results do not promise faster first frames or remove weak-network adaptation.
+
+The hint uses the existing Host-bounded allocation, not a multiplier or floor.
+WebRTC reads the send configuration from the
+[remote description](https://webrtc.googlesource.com/src/+/3a8b0c76e6b7bf0e72141047f82eb2c3f4862c8d/pc/channel.cc)
+and accepts a positive `x-google-start-bitrate` in its
+[codec bitrate configuration](https://webrtc.googlesource.com/src/+/3a8b0c76e6b7bf0e72141047f82eb2c3f4862c8d/media/engine/webrtc_media_engine.cc).
+An offer-only control lost the hint in Chrome's answer and did not improve
+startup. Piik therefore changes only its owned local answer; external SDP,
+codec identity and subsequent sender-budget updates stay unchanged. The
+application writes this hint once per producer, not on each budget change.
+The full two-Viewer VP8 follow-up retained the healthy child at 1048p through
+two one-second 400 kbps / 4% loss pulses at 40 ms configured RTT. The constrained
+child still down-adapted and froze during recovery, but regained 1048p within
+each 40-second recovery window. This is not a freeze-free claim. A separate
+audio/loss check delivered all 97 scheduled audio pulses to both played outputs;
+H264 quiet-start, live/paused settings, source replacement and ordinary-fallback
+checks passed. All owned test connections, processes and profiles retired.
+
+**Residual VP8 stalls do not require an output wait.** The ordinary two-Viewer
+control with the same source and rate/loss pulses also froze and downscaled,
+ending the recovery windows at 786p and 524p. It entered the second pulse at a
+lower resolution than pooling, so their recovery FPS is not a fair cost comparison.
+Replaying the pooled child's budget sequence on a warmed local producer without
+a shaper, carrier, queue or handoff produced nine frames in the same eight-second
+low-budget interval; adding the two original keyframe requests yielded eight,
+matching the original interval. Startup protection had already ended. Native
+logs show frame dropping and the scaler's spaced downscales. This establishes
+stalls under that budget sequence, not the cause of the sequence: keyframe bursts
+can still affect downstream estimation, and parameter reconfiguration remains
+in the replay. These results do not support removing dependency recovery or
+startup protection, growing queues or repeatedly resetting encoders. Matched
+field evidence and broader transport/allocation effects remain open.
+The rate/loss run with audio retained all 65 pulses after startup at both
+played outputs, despite video stalls; this does not establish gap-free video.
+A separate six-second complete RTP-media drop on one child, preserving RTCP
+and signaling, resumed its played video 157 ms after release for VP8 and 128 ms
+for H264. Both healthy siblings retained full dimensions; H264 still recorded
+brief sibling stalls. All post-release audio pulses arrived. This bounded local
+check does not establish recovery for an interrupted relay or reporter's network.
+
+A matched single-Viewer control separates pool handoffs from ordinary adaptation.
+Pooled sending used one producer with no handoffs; ordinary sending used no pool
+and made only two parameter writes. After the second one-second rate/loss pulse,
+both reached 262p before ending their 40-second recovery window at 390p / 15 fps.
+Actual source frames stayed 1904x1048 at about 30 fps. Native logs showed quality
+scaler down-adaptation, Chromium's below-360p software fallback and subsequent
+recovery to NVIDIA H264 at 390p; this was not a hardware failure. Pool reuse and
+frequent application-level budget writes are therefore not necessary for this
+bounded low-output state. Their effect on the intervening trajectory and the
+unmatched field reports remains distinct.
+
+The tab case exposed a more specific capture-feedback problem. A Chromium trace
+kept the source geometry at 1904x1049 while capture supplied a 268x148 content
+rectangle. Feedback rose to 66,600 pixels, but capture did not grow.
+[Chrome 154's source adapter](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/third_party/blink/renderer/platform/peerconnection/webrtc_video_track_source.cc)
+puts the adapter's target pixels into a maximum-pixel feedback field. Its
+[capture oracle](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/media/capture/content/video_capture_oracle.cc)
+then chooses a size below that limit using
+[90-row capture steps](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/media/capture/content/capture_resolution_chooser.cc).
+For this geometry the next step above 270x149 (40,230 pixels) is 433x239
+(103,487 pixels), so 66,600 cannot advance it.
+
+This matches WebRTC's [up-adaptation distinction](https://webrtc.googlesource.com/src/+/3a8b0c76e6b7bf0e72141047f82eb2c3f4862c8d/call/adaptation/video_stream_adapter.cc)
+between a soft target and a larger hard maximum intended to accommodate source
+sizes. The inspected libwebrtc revision is the exact revision pinned by
+[Chrome 154's DEPS](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/DEPS),
+retrieved through Gerrit revision content. At 270x148, the soft recovery target
+is 66,600 pixels; its intended hard maximum is 159,840. Forwarding only the soft
+target prevents the next capture step. Without larger input, the next recovery
+request cannot exceed the already installed maximum and is rejected. This
+strongly supports a feedback/size-quantization lock. Actual `VideoFrame`
+dimensions confirm reduced capture independently of stale `getSettings()`.
+Reapplying exact dimensions to the original track did not unblock it.
+
+The Piik sender boundary now forwards bounded raw display frames using
+[Chromium's track streams](https://developer.chrome.com/docs/capabilities/web-apis/mediastreamtrack-insertable-media-processing),
+without resizing, re-encoding or generated cadence. Camera/received tracks and
+unsupported Browsers keep ordinary clones. In the textured-tab comparison,
+all but the initial source frame stayed 1904x1048; output escaped 192p through
+262/390p to 524p. It still remained 524p after 125 recovery seconds. This removes
+the reproduced capture lock, not content-dependent encoder hysteresis or every
+reported blur. The separate non-Browser window case also retained full input and
+recovered gradually; do not generalize the tab mechanism to all desktop capture.
+
+Static-source testing caught a necessary lifecycle detail: unlike an RTC sink,
+a Processor does not request idle refresh frames. A static tab delivered no first
+encoded frame without them. The input retains the RTC sink's
+[1 fps refresh requirement](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/third_party/blink/renderer/modules/peerconnection/media_stream_video_webrtc_sink.h)
+through the native
+[capture constraint handler](https://raw.githubusercontent.com/chromium/chromium/154.0.8037.58/third_party/blink/renderer/modules/mediastream/media_stream_video_track.cc).
+No frame is synthesized by Piik and no sender quality floor is added.
+H264 pooling and ordinary VP8 passed static first-frame, live/quiet/paused profile
+updates, resume, source replacement and retirement with actual tab capture.
+Fault checks cover pending replacement and active-input failure without retiring
+the shared source. A fake-device input exercising the same raw-frame path retained
+20 fps during a verified hidden-page interval; self-tab capture could not enter
+hidden state in that fixture. Physical background/device coverage remains open.
+A matched full-resolution pair consumed 12.30 versus 12.46 whole-fixture CPU-seconds
+over 15 seconds. This single-machine sample is not a low-end performance guarantee.
+
+**Carrier cadence must not adapt the picture twice.** Two one-second rate/loss
+pulses exposed a separate starvation loop: after the second pulse the producer
+delivered about 15 fps, but its synthetic carrier fell to 1-3 fps. The four-frame
+queue overflowed and repeatedly requested recovery keys. Keeping only the
+carrier's native preference at `maintain-framerate` retained about 15 decoded fps;
+the last 31 seconds had four queue-overflow recoveries instead of 69. The real
+producer remained balanced and source frames remained full size in both runs.
+This implements the existing producer/clock ownership boundary; it adds no
+queue growth, quality floor or network estimator. It does not remove ordinary
+WebRTC adaptation: output still ended at 390p in that textured two-pulse case.
+
+The bounded two-Viewer tab probe passed with both H264 and VP8: after one Viewer
+was limited to 400 kbps for 14 seconds, it returned to 1904x1048 at about 30 fps
+within the 40-second recovery observation. The healthy sibling retained full size,
+and source-frame observations confirmed no capture shrink. This simpler scene
+does not supersede the textured-scene recovery boundary above.
+
+Actual tab capture through embedded SFU exposed a separate forwarding defect:
+VP8's two spatial encodings each sent 15 fps with `L1T3`, but the subscriber
+decoded about 4 fps. Both shared forwarding owners forced temporal layer zero,
+discarding enhancement frames even with ample budget. The ordinary-clone control
+had the same failure. Removing those overrides retains
+[LiveKit's supported temporal bound](https://github.com/livekit/livekit/blob/v1.13.6/pkg/sfu/forwarder.go#L293-L295)
+and allocation from real incoming layers. The repaired real-tab check decoded
+15 fps with the Host hidden, including original/half-size switching, resumed
+delivery, track replacement and retirement. RTP regression tests cover both
+Transport and Publication; restoring either old cap makes its test fail.
+This does not identify the field room's H264 degradation cause.
+
+**Upstream repair boundary.** Chromium's
+[feedback forwarding change](https://chromium-review.googlesource.com/c/chromium/src/+/2386743)
+dates to 2020; the relevant logic remained in inspected upstream main on
+2026-09-30. Reviewed historical fixes for
+[scale-boundary equality](https://codereview.webrtc.org/2713683002),
+[preference-switch waits](https://webrtc-review.googlesource.com/c/src/+/174805)
+and [requested-resolution reconfiguration](https://webrtc-review.googlesource.com/c/src/+/360200)
+do not supply a matching unshipped fix for this reproduction. Preserving the
+hard maximum separately from the soft target lets a numerical reduction escape
+the observed 148p, 180p and 238p fixed points. This is a narrow upstream repair
+candidate, not a compiled or accepted Chromium patch; full capture/adapter
+tests are still required. Updating a Piik package does not replace the user's
+Browser implementation.
+
+**The existing preference control can recover this reproduction.** After 65
+seconds stuck at 148p / 10 fps despite restored allocation, changing from
+balanced to `maintain-resolution` restored 1048p within the next two-second
+sample and reached about 30 fps. Switching back to balanced after 30 seconds
+retained that output for another 30 seconds. Bare WebRTC changed only the
+sender's degradation preference; a separate Piik run used `HostPeer`'s existing
+profile update through the pool. Both kept their connection and source; the
+pool retained one producer. Actual source frames recovered too. This provides
+a locally verified manual recovery through the existing clarity preference,
+not a field guarantee or justification for automatic preference toggling.
+The pinned `VideoStreamAdapter` clears adaptation restrictions when switching
+to or from balanced, explaining why this control escapes the reproduced state.
+
+**A new Viewer can help, but need not.** In a Canvas comparison, a degraded
+incumbent adopted a newcomer's fresh healthy producer and returned to 1080p in
+about 1.5 seconds on the same connection. In the tab comparison, the newcomer
+reused the existing producer and both stayed at 148p. Neither result establishes
+which local producer transition occurred in the field room.
+
+**Regression and repair boundary.** v1.6.5 (`04cbb2c9`)'s pool, `HostPeer` and
+quality owners showed the same Canvas recovery patterns in the current fixture.
+This compares those owners, not the whole older release or Browser. The
+[sender-owned clone and five-frame protections](./realtime-quality-adaptation.md)
+remain implemented; they address connection generations and startup, not every
+mid-share adaptation state. Field server evidence contains same-parent quality
+attempts that failed proof. There is no confirmed removed protection or recent
+Piik regression. The capture and carrier repairs above address their reproduced
+defects, not every content-dependent adaptation state.
+Do not weaken candidate proof, impose output floors or reset encoders periodically.
+
+Use actual source frames, producer/carrier histories and receiver RTCStats
+together; settings and configured ceilings are not frame evidence. Some headless
+runs lost presentation callbacks while decoding continued. Raw traces and fixture
+variants remain ignored. Matched field Host evidence is still needed to separate
+capture feedback, encoder adaptation and a continuing transport limitation.
+
 ## Cost And Accounting
 
 Before the CPU-carrier refinement, a matched actual-product VP8 1080p30 comparison's ordinary pair made
@@ -300,9 +683,19 @@ npx tsx scripts/browser-local-pool-probe.ts carrier --1080 --av --network --auto
 npx tsx scripts/browser-local-pool-probe.ts carrier --1080 --av --lifecycle
 npx tsx scripts/browser-local-pool-probe.ts carrier --1080 --av --relay
 npx tsx scripts/browser-local-pool-probe.ts carrier --1080 --background
+npx tsx scripts/browser-local-pool-probe.ts carrier --display --quiet-start --1080 --h264 --av --lifecycle
+npx tsx scripts/browser-local-pool-probe.ts ordinary --display --quiet-start --1080 --av --lifecycle
+npx tsx scripts/browser-local-pool-probe.ts carrier --display --1080 --h264 --av --network --auto --rate=400000 --preference=balanced
+npx tsx scripts/browser-local-pool-probe.ts carrier --display --size=3840x2160 --h264 --single --lifecycle
+npx tsx scripts/browser-local-pool-probe.ts carrier --size=2160x3840 --h264 --relay --late
 ```
 
 Add `--h264`, `--single` or `--late` for the corresponding case. Set
+`--size=WIDTHxHEIGHT` for a numeric source/quality ceiling within current 30 fps
+capture bounds; this also requests that window size for real tab capture.
+Chrome's content area and capture toolbar can make the actual surface smaller.
+The pool check expects one output owner per compatible allocation, not one
+owner for children with different bandwidth budgets. Set
 `--network --auto --short-pulse` for a 45-second warmup, one-second constraint
 and 40-second recovery instead of the ordinary 14-second constraint. Set
 `CHROME_PATH` for another installed Chromium binary. `--auto` extends the
@@ -310,6 +703,19 @@ recovery observation; product code owns all adaptation. Results go to ignored
 `build/browser-local-pool`; summarize with
 `node scripts/browser-local-pool-summary.mjs <result.json>`.
 A successful process exit does not establish visual/performance parity.
+`--display` captures only the isolated probe tab. It records actual source-frame
+sizes and checks that sender adaptation does not shrink capture; its receiver
+observations establish frame progress, not barcode-based glass-to-glass latency
+or audiovisual offset. The summary suppresses those unmeasured timing values.
+`--quiet-start` requires a decoded frame before the source animation starts.
+
+For real tab capture through the shared forwarding path, set `CHROME_PATH`,
+`PIIK_EMBEDDED_SFU_GATE=true`, `PIIK_EMBEDDED_SFU_DISPLAY=true` and
+`PIIK_EMBEDDED_SFU_CODEC=h264` or `vp8`, then run `npm run gate:embedded-sfu`.
+This separate arm verifies a hidden Host, decoded original/half-size layers,
+resumed delivery, video-track replacement, profile changes and retirement.
+Track replacement uses a clone of the same visual source; it does not establish
+different-device switching or audio/video synchronization.
 
 ## Primary References And Remaining Boundaries
 

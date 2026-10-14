@@ -23,7 +23,11 @@ import {
   viewerRouteEvidence,
 } from "../components/status-badge-model";
 import { AppHeader, LedStrip } from "../components/living/Header";
-import { Couch, type CouchEntry } from "../components/living/Couch";
+import type { CouchEntry } from "../components/living/Couch";
+import { RoomInteractions } from "../components/living/RoomInteractions";
+import { RoomChatOverlay, RoomChatToggle } from "../components/living/RoomChatOverlay";
+import type { RoomInteractionSession } from "../lib/room-interactions";
+import { getRuntimeCapabilities } from "../lib/api";
 import { participantColor } from "../components/living/participant-color";
 import { MetricCells } from "../components/living/Metrics";
 import { PawnDetail, RouteGlyph } from "../components/living/PawnDetail";
@@ -37,6 +41,7 @@ import {
 import { StatusIndicator } from "../components/living/StatusIndicator";
 import { Tooltip } from "../components/living/Tooltip";
 import { PlaybackControls } from "../components/living/PlaybackControls";
+import { useTheaterMode } from "../components/living/use-theater-mode";
 import { LoadingStatus } from "../components/living/WaitingStatus";
 import {
   Btn,
@@ -85,6 +90,7 @@ import {
   deriveViewerPresentation,
   reduceViewerPresentation,
   viewerFailureFromServerCode,
+  type ViewerFailureCode,
   type ViewerPresentationAction,
   type ViewerRouteKind,
 } from "../media/viewer-presentation";
@@ -124,7 +130,6 @@ interface ViewerPageProps {
   viewerGrant?: string;
   invalidGrant?: boolean;
   launchedByClient?: boolean;
-  connectionAttemptProgress4?: boolean;
 }
 
 type ViewerQualityEvidence = Extract<
@@ -164,9 +169,10 @@ export function ViewerPage({
   viewerGrant,
   invalidGrant = false,
   launchedByClient = false,
-  connectionAttemptProgress4 = false,
 }: ViewerPageProps) {
   const { lang, t, vis, titleFrames } = useCopy();
+  const clientActivationRef = useRef(launchedByClient);
+  clientActivationRef.current = launchedByClient;
   const viewerClientId = useMemo(
     () => getStableClientId("viewer", roomId),
     [roomId],
@@ -195,7 +201,7 @@ export function ViewerPage({
   >(() => new Map());
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   const [showTopology, setShowTopology] = useState(false);
-  const [theaterMode, setTheaterMode] = useState(false);
+  const [theaterMode, setTheaterMode] = useTheaterMode();
   const [hasCustomDisplayName, setHasCustomDisplayName] = useState(
     () => readStoredDisplayName() !== null,
   );
@@ -232,19 +238,6 @@ export function ViewerPage({
 
   const mediaProofGeneration = presentationState.media?.generation ?? null;
   const mediaProofEpoch = presentationState.media?.proofEpoch ?? null;
-  useEffect(() => {
-    if (!theaterMode) return;
-    const exitOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) setTheaterMode(false);
-    };
-    document.body.classList.add("lr-theater-open");
-    window.addEventListener("keydown", exitOnEscape);
-    return () => {
-      document.body.classList.remove("lr-theater-open");
-      window.removeEventListener("keydown", exitOnEscape);
-    };
-  }, [theaterMode]);
-
   const { host: labeledHostPresence, viewers } = useMemo(
     () => labelParticipantSnapshot(participantPresence ?? []),
     [participantPresence],
@@ -270,6 +263,7 @@ export function ViewerPage({
   const peerRef = useRef<ViewerMediaPeer | null>(null);
   const viewerSfuRouteRef = useRef<ViewerSfuRoute | null>(null);
   const signalRef = useRef<SignalingClient | null>(null);
+  const [interactionSession, setInteractionSession] = useState<RoomInteractionSession | null>(null);
   const presentationStateRef = useRef(presentationState);
   presentationStateRef.current = presentationState;
   function dispatchPresentation(action: ViewerPresentationAction): void {
@@ -486,29 +480,38 @@ export function ViewerPage({
     });
     setRelayChildEvidence(relayChildEvidenceStore.getSnapshot());
     let sfuTransportConnected = false;
-    let nativeClientPromise: Promise<NativeClient | null> | null = null;
+    let nativeClientConnection: { promise: Promise<NativeClient | null>; controller: AbortController } | null = null;
     let nativeViewerAvailable = true;
     const nativeViewerSessionId = createOpaqueId();
 
+    const releaseNativeClient = (): void => {
+      const connecting = nativeClientConnection;
+      nativeClientConnection = null;
+      connecting?.controller.abort();
+      void connecting?.promise.then((client) => client?.close());
+    };
+
     const acquireNativeClient = async (): Promise<NativeClient | null> => {
-      if (!active || !launchedByClient || !nativeViewerAvailable) return null;
-      if (!nativeClientPromise) {
-        const connecting: Promise<NativeClient | null> = NativeClient.connect({ waitForPermission: false }).catch(() => null).then((client) => {
-          if (!client || !active) {
-            if (nativeClientPromise === connecting) nativeClientPromise = null;
+      if (!active || !clientActivationRef.current || !nativeViewerAvailable) return null;
+      if (!nativeClientConnection) {
+        const controller = new AbortController();
+        const promise = NativeClient.connect({ waitForPermission: false, signal: controller.signal }).catch(() => null).then((client) => {
+          if (!client || !active || nativeClientConnection !== connecting) {
+            if (nativeClientConnection === connecting) nativeClientConnection = null;
             client?.close();
             return null;
           }
           client.onClose(() => {
-            if (nativeClientPromise === connecting) nativeClientPromise = null;
+            if (nativeClientConnection === connecting) nativeClientConnection = null;
           });
           return client;
         });
-        nativeClientPromise = connecting;
+        const connecting = { promise, controller };
+        nativeClientConnection = connecting;
       }
-      const connecting = nativeClientPromise;
-      const client = await connecting;
-      return active && nativeViewerAvailable && nativeClientPromise === connecting ? client : null;
+      const connecting = nativeClientConnection;
+      const client = await connecting.promise;
+      return active && nativeViewerAvailable && nativeClientConnection === connecting ? client : null;
     };
 
     function createViewerMediaPeer(
@@ -516,7 +519,7 @@ export function ViewerPage({
       events: ViewerPeerEvents,
       options: ViewerPeerOptions,
     ): ViewerMediaPeer {
-      if (!launchedByClient) {
+      if (!clientActivationRef.current) {
         return new ViewerPeer(iceConfig, events, options);
       }
       return new NativeCapableViewerPeer(
@@ -576,7 +579,6 @@ export function ViewerPage({
           : {}),
         displayName: displayNameRef.current,
         viewerPresence: true,
-        ...(connectionAttemptProgress4 ? { connectionAttemptProgress4: true } : {}),
       },
       {
         onStatus: (status) => {
@@ -588,29 +590,11 @@ export function ViewerPage({
           if (!active) {
             return;
           }
-          messageAuthority.invalidate();
-          setAssignedRoute(null);
-          clearViewerSfuRoute();
-          clearPeerState(true);
-          clearParticipantPresence();
-          dispatchPresentation({
-            type: "access",
-            access: "denied",
-            failure: reason,
-          });
+          denyRoomAccess(reason);
         },
         onAccessRequired: () => {
           if (active) {
-            messageAuthority.invalidate();
-            setAssignedRoute(null);
-            clearViewerSfuRoute();
-            clearPeerState(true);
-            clearParticipantPresence();
-            dispatchPresentation({
-              type: "access",
-              access: "denied",
-              failure: "INVALID_TOKEN",
-            });
+            denyRoomAccess("INVALID_TOKEN");
           }
         },
         onMessage: (message) => {
@@ -621,6 +605,10 @@ export function ViewerPage({
         },
       },
     );
+    setInteractionSession(null);
+    void getRuntimeCapabilities().then(capabilities => {
+      if (active && capabilities.roomInteractions) setInteractionSession(signal.enableRoomInteractions());
+    }).catch(() => { /* Optional room data never blocks viewing. */ });
     signalRef.current = signal;
     const qualityEvidenceReporter = new ViewerQualityEvidenceReporter(
       (message) => active && signal.send(message),
@@ -776,6 +764,7 @@ export function ViewerPage({
                         };
                       },
                     },
+                    (candidate?.connectionAttempt?.current ?? 1) > 1,
                   ),
           }
         : null;
@@ -1096,6 +1085,11 @@ export function ViewerPage({
         currentPeerMetrics: () => activePeerMetrics,
         qualityProbeEligible: () =>
           qualityPresentationEligible(committedTransportConnected()),
+        onSfuFailure: (failure, revision) => {
+          if (active && viewerSfuRoute === route) {
+            dispatchPresentation({ type: "receive-failure", revision, failure });
+          }
+        },
         onSfuState: (state, revision) => {
           if (active && viewerSfuRoute === route) {
             const connected = state === "connected";
@@ -1241,6 +1235,17 @@ export function ViewerPage({
       viewerRelay?.stop();
     }
 
+    function denyRoomAccess(failure: ViewerFailureCode): void {
+      messageAuthority.invalidate();
+      setAssignedRoute(null);
+      clearViewerSfuRoute();
+      clearPeerState(true);
+      clearParticipantPresence();
+      // A denied page can remain mounted or enter the back/forward cache.
+      releaseNativeClient();
+      dispatchPresentation({ type: "access", access: "denied", failure });
+    }
+
     function applyMediaAssignment(assignment: MediaAssignment, preserveUpstream = false): void {
       const nextAssignment = limitMediaAssignment(
         assignment,
@@ -1291,6 +1296,7 @@ export function ViewerPage({
             if (pendingPeer === probe) {
               if (snapshot.connectionId !== probe.candidateConnectionId) return;
               probe.snapshot = snapshot;
+              noteReceiveFailure(snapshot, probe.revision);
               if (probe.qualityProbe) {
                 if (
                   pageSuspended ||
@@ -1322,6 +1328,7 @@ export function ViewerPage({
               }
               provePendingPeer();
             } else if (active && peerRef.current === peer) {
+              noteReceiveFailure(snapshot, currentRouteRevision);
               activePeerMetrics = snapshot.metrics;
               offerPeerQualityEvidence(snapshot, peer);
               setPeerSnapshot(snapshot);
@@ -1410,6 +1417,7 @@ export function ViewerPage({
           },
           onUpdate: (snapshot) => {
             if (active) {
+              noteReceiveFailure(snapshot, currentRouteRevision);
               activePeerMetrics = snapshot.metrics;
               offerPeerQualityEvidence(snapshot, peer);
               if (
@@ -1455,6 +1463,11 @@ export function ViewerPage({
       );
       peerRef.current = peer;
       return peer;
+    }
+
+    function noteReceiveFailure(snapshot: PeerSnapshot, revision: number): void {
+      dispatchPresentation({ type: "receive-failure", revision,
+        failure: snapshot.error?.key === "viewer.msg.videoRejected" ? "VIDEO_REJECTED" : null });
     }
 
     async function handleMessage(
@@ -1766,43 +1779,19 @@ export function ViewerPage({
         }
         viewerAuthorizationGeneration = null;
         clearViewerGrant(roomId);
-        setAssignedRoute(null);
-        clearViewerSfuRoute();
-        clearPeerState(true);
-        clearParticipantPresence();
-        dispatchPresentation({
-          type: "access",
-          access: "denied",
-          failure: "INVALID_TOKEN",
-        });
+        denyRoomAccess("INVALID_TOKEN");
         signal.stop();
         return;
       }
       if (message.type === "room-closed") {
-        setAssignedRoute(null);
-        clearViewerSfuRoute();
-        clearPeerState(true);
-        clearParticipantPresence();
-        dispatchPresentation({
-          type: "access",
-          access: "denied",
-          failure: "ROOM_CLOSED",
-        });
+        denyRoomAccess("ROOM_CLOSED");
         signal.stop();
         return;
       }
       if (message.type === "error") {
         const failure = viewerFailureFromServerCode(message.code);
         if (failure !== null && failure !== "SERVER_ERROR") {
-          setAssignedRoute(null);
-          clearViewerSfuRoute();
-          clearPeerState(true);
-          clearParticipantPresence();
-          dispatchPresentation({
-            type: "access",
-            access: "denied",
-            failure,
-          });
+          denyRoomAccess(failure);
         }
         if (message.code === "INVALID_TOKEN") {
           clearViewerGrant(roomId);
@@ -1856,9 +1845,9 @@ export function ViewerPage({
       viewerRelay?.dispose();
       viewerRelay = null;
       viewerRelaySourceKey = null;
-      void nativeClientPromise?.then((client) => client?.close());
+      releaseNativeClient();
     };
-  }, [roomId, viewerGrant, viewerPasswordAttempt, launchedByClient, connectionAttemptProgress4]);
+  }, [roomId, viewerGrant, viewerPasswordAttempt]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -2016,8 +2005,9 @@ export function ViewerPage({
       : failureCode === "ROOM_FULL" ? "viewer.hint.full"
       : codeOnlyDenied
       ? "viewer.hint.denied"
-      : failureCode === "ROOM_NOT_FOUND" ||
-          failureCode === "ROOM_CLOSED"
+      : failureCode === "ROOM_CLOSED" ? "viewer.hint.closed"
+      : failureCode === "SESSION_REPLACED" ? "viewer.hint.sessionReplaced"
+      : failureCode === "ROOM_NOT_FOUND"
         ? "viewer.hint.notFound"
         : failureCode === "INVALID_TOKEN"
           // A grant that the room no longer accepts is not a retry case:
@@ -2224,6 +2214,7 @@ export function ViewerPage({
               onEnded={invalidateQualityPresentation}
             />
             <PlaybackControls
+              extraActions={<RoomChatToggle session={interactionSession} />}
               videoRef={videoRef}
               stream={remoteMedia?.stream ?? null}
               audioTrackKey={remoteMedia?.audioTrackKey}
@@ -2240,6 +2231,7 @@ export function ViewerPage({
                 if (video && binding) attemptPlayback(video, binding);
               }}
             />
+            <RoomChatOverlay session={interactionSession} visible={presentation.overlay === "none" && presentation.hasCurrentFrame} />
             {presentation.overlay === "blocking" && (
               <StageOverlay
                 dim
@@ -2290,7 +2282,7 @@ export function ViewerPage({
               />
             )}
           </div>
-          <Couch
+          <RoomInteractions session={interactionSession}
             view="viewer"
             host={
               labeledHostPresence

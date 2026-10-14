@@ -15,6 +15,8 @@ import {
   ViewerPeer,
   type ViewerPeerEvents,
   type ViewerPeerOptions,
+  type ViewerRecoveryBudget,
+  createViewerRecoveryBudget,
 } from "../webrtc/viewer-peer";
 import {
   iceServersWithNatPrediction,
@@ -26,6 +28,7 @@ import {
 import { NativeClient } from "./client";
 import { NativeMediaBridge } from "./media-bridge";
 import type { NativeClientEvent, NativeVideoCodec } from "./wire";
+import { NativePunchReceiver, punchIceConfig } from "./native-punch";
 
 
 export interface NativeViewerSource {
@@ -50,6 +53,7 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
   private identity: { parentPeerId: string; connectionId: string } | null = null;
   private signalTail: Promise<void> = Promise.resolve();
   private currentIceConfig: PeerIceConfig;
+  private punch: NativePunchReceiver | null = null;
 
   constructor(
     iceConfig: PeerIceConfig,
@@ -61,9 +65,33 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
     private readonly edgeCapacity: number,
   ) {
     this.currentIceConfig = iceConfig;
+    this.options = {
+      ...options,
+      recoveryBudget: options.recoveryBudget ?? createViewerRecoveryBudget(),
+    };
   }
 
   acceptSignal(parentPeerId: string, payload: SignalPayload): Promise<void> {
+    if (payload.kind === "punch") {
+      if (this.disposed) return Promise.resolve();
+      const survey = this.options.natPredictionEnabled && this.options.recoveryOwner === "route"
+        ? punchIceConfig(this.currentIceConfig) : null;
+      if (payload.punch.phase === "prepare") {
+        if (this.identity?.connectionId === payload.connectionId) return Promise.resolve();
+        if (!survey) {
+          this.events.sendSignal(parentPeerId, { kind: "punch", connectionId: payload.connectionId, punch: { phase: "ready" } });
+        } else if (!this.punch) {
+          this.punch = new NativePunchReceiver(parentPeerId, payload.connectionId, this.nativeSessionId,
+            survey, this.edgeCapacity, this.acquireNativeClient,
+            signal => !this.disposed && this.events.sendSignal(parentPeerId, signal));
+          void this.punch.prepare(payload.punch.secret);
+        }
+      } else if (payload.punch.phase === "start" && this.punch?.peerId === parentPeerId &&
+        this.punch.connectionId === payload.connectionId) {
+        void this.punch.run(payload.punch.prediction);
+      }
+      return Promise.resolve();
+    }
     const work = async () => {
       if (this.disposed) return;
       if (
@@ -76,6 +104,19 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
         return;
       }
       if (payload.kind === "description" && payload.description.type === "offer") {
+        const preparation = this.punch;
+        this.punch = null;
+        const committed = payload.punched && preparation?.peerId === parentPeerId &&
+          preparation.connectionId === payload.connectionId && preparation.commit();
+        if (!committed) {
+          preparation?.dispose();
+          if (payload.punched) {
+            // An expired optional preparation is a route failure, not evidence
+            // that the App's media capability is unavailable for this session.
+            this.events.onRecoveryExhausted?.(parentPeerId, payload.connectionId);
+            return;
+          }
+        }
         const nextIdentity = {
           parentPeerId,
           connectionId: payload.connectionId,
@@ -87,6 +128,9 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
         ) {
           this.backend?.dispose();
           this.backend = null;
+          if (this.identity && this.identity.parentPeerId !== parentPeerId) {
+            this.options = { ...this.options, recoveryBudget: createViewerRecoveryBudget() };
+          }
           this.identity = nextIdentity;
         }
         if (!this.backend) {
@@ -110,6 +154,7 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
         const pending = this.pendingCandidates.get(payload.connectionId) ?? [];
         this.pendingCandidates.delete(payload.connectionId);
         for (const candidate of pending) {
+          if (this.disposed) return;
           await this.backend.acceptSignal(parentPeerId, candidate);
         }
         return;
@@ -155,6 +200,8 @@ export class NativeCapableViewerPeer implements ViewerMediaPeer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.punch?.dispose();
+    this.punch = null;
     this.backend?.dispose();
     this.backend = null;
     this.identity = null;
@@ -186,7 +233,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
   private parentPeerId: string | null = null;
   private connectionId: string | null = null;
   private bridge: NativeMediaBridge | null = null;
-  private localCandidates: NatPredictionCandidateBatch | null = null;
+  private localCandidates: { batch: NatPredictionCandidateBatch; iceConfig: IceConfig } | null = null;
   private unsubscribe: (() => void) | null = null;
   private unsubscribeClose: (() => void) | null = null;
   private snapshot: PeerSnapshot | null = null;
@@ -197,8 +244,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
   private disconnectTimer: number | null = null;
   private initialConnectionTimer: number | null = null;
   private recoveryTimer: number | null = null;
-  private automaticRecoveryRequests = 0;
-  private recoveryExhaustedReported = false;
+  private readonly recoveryBudget: ViewerRecoveryBudget;
   private state: RTCPeerConnectionState = "new";
   private localCandidateType: RTCIceCandidateType | null = null;
   private remoteCandidateType: RTCIceCandidateType | null = null;
@@ -235,6 +281,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
   ) {
     this.currentIceConfig = iceConfig;
     this.recoveryOwner = options.recoveryOwner ?? "viewer";
+    this.recoveryBudget = options.recoveryBudget ?? createViewerRecoveryBudget();
     this.natPredictionEnabled = options.natPredictionEnabled ?? false;
     this.unsubscribe = client.onEvent((event) => this.onEvent(event));
     this.unsubscribeClose = client.onClose(() => {
@@ -244,6 +291,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
 
   async acceptSignal(parentPeerId: string, payload: SignalPayload): Promise<void> {
     if (this.disposed) return;
+    if (payload.kind === "punch") return;
     if (payload.kind === "candidate") {
       if (
         this.parentPeerId !== parentPeerId ||
@@ -266,7 +314,11 @@ class NativeViewerPeer implements ViewerMediaPeer {
     try {
       await this.acceptOffer(parentPeerId, payload);
     } catch {
-      this.handleBridgeFailure(payload.connectionId);
+      if (payload.punched) {
+        this.retireFailedConnection(payload.connectionId);
+      } else {
+        this.handleBridgeFailure(payload.connectionId);
+      }
     }
   }
 
@@ -290,8 +342,9 @@ class NativeViewerPeer implements ViewerMediaPeer {
     );
     if (sent) {
       this.clearInitialConnectionTimer();
-      this.automaticRecoveryRequests = Math.max(
-        this.automaticRecoveryRequests,
+      this.recoveryBudget.exhaustedReported = false;
+      this.recoveryBudget.requests = Math.max(
+        this.recoveryBudget.requests,
         rebuild ? VIEWER_MAX_AUTOMATIC_RECOVERY_REQUESTS : 1,
       );
       this.scheduleRecoveryDeadline();
@@ -325,7 +378,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
     this.disposed = true;
     this.clearTimers();
     this.disposeBridge();
-    this.localCandidates?.discard();
+    this.localCandidates?.batch.discard();
     this.localCandidates = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
@@ -355,7 +408,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
     if (identityChanged) {
       const previous = this.connectionId;
       this.disposeBridge();
-      this.localCandidates?.discard();
+      this.localCandidates?.batch.discard();
       if (previous) {
         await this.client.closeReceiver(this.sessionId, previous).catch(
           () => undefined,
@@ -363,11 +416,10 @@ class NativeViewerPeer implements ViewerMediaPeer {
       }
       this.parentPeerId = parentPeerId;
       this.connectionId = connectionId;
-      this.resetAutomaticRecovery();
     } else if (!retainSource) {
       this.disposeBridge();
     }
-    this.localCandidates?.discard();
+    this.localCandidates?.batch.discard();
     if (!retainSource) {
       this.state = "connecting";
       this.failureNotified = false;
@@ -417,7 +469,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
     const candidates = predictionEnabled
       ? new NatPredictionCandidateBatch(sendCandidate)
       : null;
-    this.localCandidates = candidates;
+    this.localCandidates = candidates ? { batch: candidates, iceConfig: nativeIceConfig } : null;
     this.emit();
     const pending = { bridge: retainSource ? this.bridge : null, bridgeFailed: false };
     this.pendingOffer = pending;
@@ -425,6 +477,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
     try {
       result = await this.client.receiveOffer(
         this.sessionId, connectionId, payload.description, nativeIceConfig, this.edgeCapacity,
+        payload.punched === true,
       );
     } finally {
       if (this.pendingOffer === pending) this.pendingOffer = null;
@@ -470,16 +523,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
       // A room-signaling outage is not evidence the local Native capability is
       // unavailable: close only this receiver and use the ordinary recovery
       // path, like the Browser peer's "signal send rejected" handling.
-      this.sourceReady = false;
-      this.sourceCodec = null;
-      void this.client.closeReceiver(this.sessionId, connectionId).catch(
-        () => undefined,
-      );
-      if (this.recoveryOwner === "route") {
-        this.reportRecoveryExhausted();
-      } else if (!this.requestRecovery(true)) {
-        this.reportRecoveryExhausted();
-      }
+      this.retireFailedConnection(connectionId);
       return;
     }
     this.scheduleInitialConnectionDeadline(connectionId);
@@ -508,6 +552,15 @@ class NativeViewerPeer implements ViewerMediaPeer {
     else this.handleBridgeFailure(connectionId);
   }
 
+  private retireFailedConnection(connectionId: string): void {
+    if (this.disposed || this.connectionId !== connectionId) return;
+    this.sourceReady = false;
+    this.sourceCodec = null;
+    void this.client.closeReceiver(this.sessionId, connectionId).catch(() => undefined);
+    if (this.recoveryOwner === "route") this.reportRecoveryExhausted();
+    else this.attemptAutomaticRecovery(true);
+  }
+
   private onEvent(event: NativeClientEvent): void {
     if (this.disposed || this.failureNotified || event.shareId !== this.sessionId) {
       return;
@@ -521,12 +574,13 @@ class NativeViewerPeer implements ViewerMediaPeer {
     }
     if (event.type === "edge-candidate") {
       if (this.localCandidates) {
+        const { batch, iceConfig } = this.localCandidates;
         if (event.candidate) {
-          this.localCandidates.add(
+          batch.add(
             event.candidate,
-            isNativeNatSurveyCandidate(event.candidate),
+            isNativeNatSurveyCandidate(event.candidate, iceConfig.iceServers, iceConfig.natPredictionStunUrls),
           );
-        } else this.localCandidates.complete();
+        } else batch.complete();
       } else if (this.parentPeerId && this.connectionId) {
         this.events.sendSignal(this.parentPeerId, {
           kind: "candidate",
@@ -649,41 +703,41 @@ class NativeViewerPeer implements ViewerMediaPeer {
       this.reportRecoveryExhausted();
       return;
     }
-    if (!this.requestRecovery(true)) {
-      this.reportRecoveryExhausted();
-    }
+    this.attemptAutomaticRecovery(true);
   }
 
-  private attemptAutomaticRecovery(): void {
+  private attemptAutomaticRecovery(forceRebuild = false): void {
     this.clearInitialConnectionTimer();
     if (
       this.disposed ||
       this.recoveryTimer !== null ||
-      this.recoveryExhaustedReported ||
+      this.recoveryBudget.exhaustedReported ||
       !this.connectionId ||
       !this.parentPeerId
     ) {
       return;
     }
     if (
-      this.automaticRecoveryRequests >=
+      this.recoveryBudget.requests >=
       VIEWER_MAX_AUTOMATIC_RECOVERY_REQUESTS
     ) {
       this.reportRecoveryExhausted();
       return;
     }
-    const rebuild = this.automaticRecoveryRequests > 0;
+    const rebuild = forceRebuild || this.recoveryBudget.requests > 0;
     if (!this.events.sendRestartRequest(this.parentPeerId, this.connectionId, rebuild)) {
       this.reportRecoveryExhausted();
       return;
     }
-    this.automaticRecoveryRequests += 1;
+    this.recoveryBudget.requests = rebuild
+      ? VIEWER_MAX_AUTOMATIC_RECOVERY_REQUESTS
+      : this.recoveryBudget.requests + 1;
     this.scheduleRecoveryDeadline();
   }
 
   private reportRecoveryExhausted(): void {
     if (
-      this.recoveryExhaustedReported ||
+      this.recoveryBudget.exhaustedReported ||
       !this.parentPeerId ||
       !this.connectionId
     ) return;
@@ -692,7 +746,7 @@ class NativeViewerPeer implements ViewerMediaPeer {
       this.parentPeerId,
       this.connectionId,
     ) ?? true;
-    if (reported) this.recoveryExhaustedReported = true;
+    if (reported) this.recoveryBudget.exhaustedReported = true;
     else this.scheduleRecoveryDeadline();
   }
 
@@ -720,8 +774,8 @@ class NativeViewerPeer implements ViewerMediaPeer {
 
   private resetAutomaticRecovery(): void {
     this.clearRecoveryTimer();
-    this.automaticRecoveryRequests = 0;
-    this.recoveryExhaustedReported = false;
+    this.recoveryBudget.requests = 0;
+    this.recoveryBudget.exhaustedReported = false;
   }
 
   private disposeBridge(): void {
@@ -786,15 +840,40 @@ export function offerHasNativeVideoCodec(sdp: string): boolean {
     const session = parse(sdp);
     const video = session.media.filter((media) => {
       const direction = media.direction ?? session.direction ?? "sendrecv";
-      return media.type === "video" && media.port > 0 &&
+      const bundled = media.bundleOnly && (session.groups ?? []).some(group =>
+        group.type === "BUNDLE" && String(group.mids).split(" ").includes(String(media.mid)));
+      return media.type === "video" && (media.port > 0 || bundled) &&
         (direction === "sendonly" || direction === "sendrecv");
     });
     if (video.length !== 1) return false;
     const media = video[0]!;
     const payloads = new Set(parsePayloads(media.payloads ?? ""));
-    return media.rtp.some((codec) => payloads.has(codec.payload) &&
-      codec.rate === 90_000 && /^(h264|vp8)$/i.test(codec.codec));
+    return media.rtp.some((codec) => {
+      if (!payloads.has(codec.payload) || codec.rate !== 90_000) return false;
+      if (codec.codec.toLowerCase() === "vp8") return true;
+      if (codec.codec.toLowerCase() !== "h264") return false;
+      return nativeH264Format(media.fmtp?.find(fmtp => fmtp.payload === codec.payload)?.config ?? "");
+    });
   } catch {
     return false;
   }
+}
+
+function nativeH264Format(fmtp: string): boolean {
+  // Preflight the same encoded-forwarding subset as mediaedge.forwardableH264;
+  // a MIME-only match must not turn unsupported media into an App failure.
+  const parameters = new Map(fmtp.split(";").map(part => {
+    const [key, value] = part.split(/=(.*)/, 2);
+    return [key?.trim().toLowerCase(), value?.trim().toLowerCase()] as const;
+  }));
+  const profile = parameters.get("profile-level-id") ?? "";
+  if (parameters.get("packetization-mode") !== "1" || !/^[0-9a-f]{6}$/.test(profile)) return false;
+  const idc = parseInt(profile.slice(0, 2), 16);
+  const constraints = parseInt(profile.slice(2, 4), 16);
+  const level = parseInt(profile.slice(4), 16);
+  // RFC 6184 Table 5: equivalent Constrained Baseline coding-tool subsets.
+  return ((idc === 0x42 && (constraints & 0x4f) === 0x40) ||
+    (idc === 0x4d && (constraints & 0x8f) === 0x80) ||
+    (idc === 0x58 && (constraints & 0xcf) === 0xc0)) &&
+    [10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52].includes(level);
 }

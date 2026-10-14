@@ -14,7 +14,7 @@ understand what Piik does, choose an entry and complete the first useful action.
 | --- | --- | --- |
 | README, English and Chinese | What is this, and how do I start? | Brand introduction and interface preview, features, getting started, self-hosting, contribution and license |
 | `site/`, for GitHub Pages | What does using it feel like, and how do I start? | Room illustration and primary download link, illustrated steps, online/App/existing-site walkthroughs, FAQ, platform downloads, self-hosting and documentation |
-| Getting-started guides | Which button or mode do I use? | Browser invitation, sharing, App setup and three mode choices |
+| Getting-started guides | Which button or mode do I use? | Browser invitation, sharing, App setup, room creation and Site approval |
 | Self-hosting guides | How do I put my own site online? | Run the binary, set the domain and HTTPS proxy, open ports and verify; service management remains a separate reference |
 | Developer and operations docs | How do I build or host it? | Existing configuration, deployment, architecture and diagnostic owners |
 
@@ -31,8 +31,16 @@ platforms, audience size, sound and sharing across networks. Order them along
 the visitor's decisions: device and installation requirements, joining friends,
 shared media, then advanced hosting. Keep related questions together and place
 material limitations beside their answers. Specific errors and recovery procedures
-belong in the usage guides, reached through a short documentation link after
-the FAQ. Do not duplicate troubleshooting steps on the homepage.
+belong in the troubleshooting guide, linked directly from the header, the end
+of the FAQ and the footer in the selected language. Keep these steps in one
+reader guide; App references link to it rather than maintaining a second copy.
+Do not duplicate troubleshooting steps on the homepage.
+
+Search titles, descriptions and repository topics describe the actual product:
+private screen sharing, watching together and optional self-hosting. Use natural
+Chinese and English phrases in the relevant introduction; preserve the brand
+line in the visible headline. Follow [Google's title guidance](https://developers.google.com/search/docs/appearance/title-link):
+avoid keyword lists, unrelated product names and unsupported performance claims.
 
 ## Presentation
 
@@ -64,8 +72,10 @@ documentation section: mark it as advanced, name its server/domain requirements
 and link its complete guide. The existing-site guide links there for visitors
 who want to run their own site. Explain what App and site each provide; optional SFU
 fallback requires the site to enable it and is not a connectivity guarantee.
-Platform download cards share one App tutorial entry. Keep section navigation
-available on phones rather than hiding the only route to documentation.
+Keep architecture choices beside each platform's download buttons, with one
+centered link for more downloads below the cards. Tutorials remain in their own
+sections. Keep section navigation available on phones rather than hiding the
+only route to documentation.
 The film can use bolder composition, but must show real operations and concrete
 benefits before its closing action. The [copy guide](./naming.md#voice-and-terminology)
 owns technical disclosure; a dramatic heading does not exempt copy from it.

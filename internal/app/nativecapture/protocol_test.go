@@ -286,19 +286,53 @@ func TestCaptureTargetIdentityAndAudioScope(t *testing.T) {
 
 func TestVideoProfileUsesTheProductBounds(t *testing.T) {
 	for _, profile := range []VideoProfile{
+		{Width: 1280, Height: 720, Framerate: 1, Bitrate: 100_000, Preference: "balanced"},
+		{Width: 1280, Height: 720, Framerate: 5, Bitrate: 800_000, Preference: "balanced"},
+		{Width: 3840, Height: 2160, Framerate: 60, Bitrate: 50_000_000, Preference: "balanced"},
 		{Width: 854, Height: 480, Framerate: 15, Bitrate: 2_000_000, Preference: "maintain-resolution"},
 		{Width: 1280, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
 		{Width: 1920, Height: 1080, Framerate: 60, Bitrate: 8_000_000, Preference: "maintain-framerate"},
 		{Width: 2560, Height: 1440, Framerate: 60, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 1920, Height: 1200, Framerate: 30, Bitrate: 5_000_000, Preference: "balanced"},
+		{Width: 720, Height: 1280, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 3840, Height: 2160, Framerate: 30, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 2160, Height: 3840, Framerate: 30, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 3840, Height: 2160, Framerate: 60, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 2160, Height: 3840, Framerate: 60, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 3000, Height: 2764, Framerate: 30, Bitrate: 12_000_000, Preference: "balanced"},
+		{Width: 1920, Height: 1080, Framerate: 240, Bitrate: 240_000_000, Preference: "balanced"},
+		{Width: 2560, Height: 1440, Framerate: 144, Bitrate: 100_000_000, Preference: "balanced"},
+		{Width: 5120, Height: 1440, Framerate: 60, Bitrate: 100_000_000, Preference: "balanced"},
+		{Width: 1440, Height: 5120, Framerate: 60, Bitrate: 100_000_000, Preference: "balanced"},
+		{Width: 4096, Height: 2304, Framerate: 56, Bitrate: 80_000_000, Preference: "balanced"},
+		{Width: 4, Height: 4, Framerate: 15, Bitrate: 2_000_000, Preference: "balanced"},
 	} {
 		if !profile.Valid() {
 			t.Fatalf("valid profile rejected: %+v", profile)
 		}
+		for _, output := range ScreenShareOutputs(profile) {
+			if !output.Valid() || output.Bitrate > profile.Bitrate {
+				t.Fatalf("valid source profile produced an invalid output: %+v", output)
+			}
+		}
 	}
 	for _, profile := range []VideoProfile{
-		{Width: 1920, Height: 1200, Framerate: 30, Bitrate: 5_000_000, Preference: "balanced"},
-		{Width: 1920, Height: 1080, Framerate: 14, Bitrate: 5_000_000, Preference: "balanced"},
-		{Width: 1920, Height: 1080, Framerate: 30, Bitrate: 12_000_001, Preference: "balanced"},
+		{Width: 0, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 2, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 1280, Height: 2, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 1279, Height: 720, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 1280, Height: 719, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 8194, Height: 100, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 5120, Height: 2880, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 4096, Height: 2306, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 6562, Height: 1438, Framerate: 30, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 3840, Height: 2160, Framerate: 65, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 1920, Height: 1080, Framerate: 241, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 2160, Height: 3840, Framerate: 120, Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: ^uint32(0), Height: ^uint32(0), Framerate: ^uint32(0), Bitrate: 3_000_000, Preference: "balanced"},
+		{Width: 1920, Height: 1080, Framerate: 0, Bitrate: 5_000_000, Preference: "balanced"},
+		{Width: 1920, Height: 1080, Framerate: 30, Bitrate: 99_999, Preference: "balanced"},
+		{Width: 1920, Height: 1080, Framerate: 30, Bitrate: 240_000_001, Preference: "balanced"},
 		{Width: 1920, Height: 1080, Framerate: 30, Bitrate: 5_000_000, Preference: "unknown"},
 	} {
 		if profile.Valid() {

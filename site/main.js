@@ -1,8 +1,43 @@
 import { mountBrands } from './assets/brand.js';
 import { initialLanguage, rememberLanguage } from './assets/language.js';
-import { createTextCycle, startTextRotation } from '../src/client/ui/text-rotation.ts';
+import { createTextCycle } from '../src/client/ui/text-rotation.ts';
+import { DEFAULT_RELEASE_API_URL, parseReleaseMetadata } from '../src/client/lib/release-update.ts';
 mountBrands();
-// Content stays HTML; scripts only add preferences and replayable illustrations.
+const architecturePickers = document.querySelectorAll('.download-architecture');
+function syncDownloadLinks(picker) {
+  const selected = picker.querySelector('input:checked');
+  for (const link of picker.closest('.download-card').querySelectorAll('a')) {
+    const target = new URL(link.href);
+    target.pathname = target.pathname.replace(/piik-app-[a-z0-9]+-[a-z0-9]+\.zip$/, `piik-app-${selected.value}.zip`);
+    link.href = target.href;
+  }
+}
+for (const picker of architecturePickers) {
+  picker.disabled = picker.querySelectorAll('input').length < 2;
+  syncDownloadLinks(picker);
+  picker.addEventListener('change', () => syncDownloadLinks(picker));
+}
+// Content and download links remain usable without scripts or release metadata.
+const releaseLabel = document.getElementById('download-release');
+if (releaseLabel) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  void fetch(DEFAULT_RELEASE_API_URL, {
+    credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error',
+    signal: controller.signal, headers: { Accept: 'application/vnd.github+json' },
+  }).then(async response => {
+    if (!response.ok) return null;
+    return parseReleaseMetadata(await response.json());
+  })
+    .then(release => {
+      if (!release?.publishedAt) return;
+      releaseLabel.querySelector('b').textContent = release.version;
+      const date = releaseLabel.querySelector('time');
+      date.dateTime = release.publishedAt;
+      date.textContent = release.publishedAt.slice(0, 10);
+      releaseLabel.hidden = false;
+    }).catch(() => {}).finally(() => clearTimeout(timeout));
+}
 const root = document.documentElement;
 const language = document.getElementById('language');
 const theme = document.getElementById('theme');
@@ -22,21 +57,13 @@ const film = document.getElementById('film-preview');
 const filmFrame = document.getElementById('website-film');
 const filmLink = document.querySelector('[data-film-link]');
 const welcomeLines = document.getElementById('welcome-lines')?.content.children;
-let stopWelcome = () => {};
-let syncWelcomeMotion = () => {};
 function syncWelcome() {
   if (!welcomeLines) return;
   const element = document.getElementById('welcome-line');
   const pool = Array.from(welcomeLines).filter(line => line.lang === root.lang);
-  const next = createTextCycle(pool);
-  const show = () => element.replaceChildren(...(pool.length ? [next().cloneNode(true)] : []));
+  const line = createTextCycle(pool)();
   element.hidden = pool.length === 0;
-  show();
-  syncWelcomeMotion = () => {
-    stopWelcome();
-    stopWelcome = pool.length > 1 && !reducedMotion() ? startTextRotation(show, element) : () => {};
-  };
-  syncWelcomeMotion();
+  element.replaceChildren(...(line ? [line.cloneNode(true)] : []));
 }
 function syncFilmPreferences() {
   const target = new URL(filmLink.href);
@@ -53,8 +80,8 @@ const copy = {
     image: roomIllustration.alt,
   },
   'zh-CN': {
-    title: 'Piik — 来，看点好康的。',
-    description: '游戏、绘画、电影、照片。Piik 是免费开源的屏幕共享工具，邀请最多 20 位朋友用浏览器观看。',
+    title: 'Piik — 免费开源的屏幕共享',
+    description: 'Piik 是免费开源的私密屏幕共享工具，适合游戏直播、一起看电影、展示绘画和照片。支持自部署站点，邀请最多 20 位朋友通过浏览器观看。',
     themes: { system: '跟随系统', light: '浅色', dark: '深色' },
     image: '戴着小金冠的房主分享 RPG 游戏、绘画、旅行照片和动画电影，三位朋友坐在沙发上观看。',
   },
@@ -162,7 +189,6 @@ function syncMotionPreference() {
     button.disabled = still;
   });
   roomIllustration.src = './assets/living-room.svg' + (still ? '#still' : '');
-  syncWelcomeMotion();
 }
 motionControl.addEventListener('change', () => {
   preferStill = motionControl.checked;

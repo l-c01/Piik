@@ -1,4 +1,4 @@
-import { useId, type FormEvent, type ReactNode } from "react";
+import { useId, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import { BrandMark } from "./BrandMark";
 import { Tooltip } from "./Tooltip";
 import { WelcomeLine } from "./WelcomeLine";
@@ -6,7 +6,7 @@ import { Btn, Pill } from "./primitives";
 import type { HintKind } from "./hints";
 import { Glyph, type GlyphName } from "../../ui/icons";
 import { useCopy, type CopyKey } from "../../ui/copy";
-export type AppMode = "local" | "link" | "site";
+export type AppMode = "local" | "link";
 
 const MODES: Array<{
   mode: AppMode;
@@ -16,13 +16,6 @@ const MODES: Array<{
   comic: HintKind;
 }> = [
   {
-    mode: "local",
-    icon: "users",
-    label: "client.launch.local",
-    hint: "client.launch.localHint",
-    comic: "hint-client-local",
-  },
-  {
     mode: "link",
     icon: "globe",
     label: "client.launch.link",
@@ -30,11 +23,11 @@ const MODES: Array<{
     comic: "hint-client-link",
   },
   {
-    mode: "site",
-    icon: "server",
-    label: "client.launch.site",
-    hint: "client.launch.siteHint",
-    comic: "hint-client-site",
+    mode: "local",
+    icon: "users",
+    label: "client.launch.local",
+    hint: "client.launch.localHint",
+    comic: "hint-client-local",
   },
 ];
 
@@ -43,17 +36,26 @@ export function LauncherForm({
   mode,
   onModeChange,
   site,
-  onSiteChange,
+  onRemoveSite,
+  siteBusy,
+  siteError,
+  target,
+  onOpen,
   localAccessPassword,
   onLocalAccessPasswordChange,
   lan,
   onSubmit,
   children,
+  roomError,
 }: {
   mode: AppMode;
   onModeChange: (mode: AppMode) => void;
   site: string;
-  onSiteChange: (site: string) => void;
+  onRemoveSite: () => void;
+  siteBusy?: boolean;
+  siteError?: string;
+  target?: string;
+  onOpen?: (event: MouseEvent<HTMLAnchorElement>) => void;
   localAccessPassword: string;
   onLocalAccessPasswordChange: (password: string) => void;
   lan?: {
@@ -63,6 +65,7 @@ export function LauncherForm({
   };
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   children?: ReactNode;
+  roomError?: ReactNode;
 }) {
   const { vis, t } = useCopy();
   const accessHintId = useId();
@@ -85,14 +88,33 @@ export function LauncherForm({
   );
   return (
     <form className="lr-client-launch-panel" onSubmit={onSubmit}>
-      <BrandMark size={68} motion="once" />
-      <WelcomeLine />
-      <h1 className={vis ? "visually-hidden" : "lr-client-launch-title"}>
-        {t("client.launch.title")}
-      </h1>
+      <header className="lr-client-launch-heading">
+        <div className="lr-client-launch-brand">
+          <BrandMark size={52} motion="once" />
+          <h1 className="lr-client-launch-title">Piik<span className="lr-client-brand-dot">.</span> <small>App</small></h1>
+        </div>
+        <WelcomeLine />
+      </header>
 
       {children}
 
+      <section className="lr-client-standby" aria-label={t("client.connect.standby")}>
+        <span className="lr-client-standby-icon" aria-hidden="true"><Glyph name="check" size={24} /></span>
+        <div className="lr-client-standby-copy">
+          <strong className={vis ? "visually-hidden" : undefined}>{t("client.connect.standby")}</strong>
+          <p className={vis ? "visually-hidden" : undefined}>{t("client.connect.standbyHint")}</p>
+          {site && <div className="lr-client-approved-site">
+            <a href={`${site}/#piik-client=1`} target="_blank" rel="noopener noreferrer" onClick={onOpen}>{site}<span aria-hidden="true"> ↗</span></a>
+            <Btn icon="x" title="client.connect.remove" hint="hint-client-site" disabled={siteBusy} onClick={onRemoveSite} />
+          </div>}
+          {siteError && <p role="alert">{siteError}</p>}
+        </div>
+      </section>
+
+      {roomError ?? (target ? <a className="lr-btn is-primary" href={target} onClick={onOpen} aria-label={t("client.launch.go")}>
+        <Glyph name="arrowRight" size={19} />{vis ? null : <span className="lr-cap">{t("client.launch.go")}</span>}
+      </a> : <>
+      <p className={vis ? "visually-hidden" : "lr-client-launch-section"}>{t("client.launch.room")}</p>
       <div
         className="lr-client-modes"
         role="radiogroup"
@@ -112,7 +134,7 @@ export function LauncherForm({
               key={choice.mode}
               type="button"
               role="radio"
-              className={`lr-client-mode${mode === choice.mode ? " is-selected" : ""}`}
+              className={`lr-tile lr-client-mode${mode === choice.mode ? " is-selected" : ""}`}
               aria-checked={mode === choice.mode}
               tabIndex={mode === choice.mode ? 0 : -1}
               aria-label={t(choice.label)}
@@ -141,46 +163,9 @@ export function LauncherForm({
         })}
       </div>
 
-      {mode === "local" && lan && (lan.addresses.length !== 1 || !lan.selected) ? (
-        <fieldset className="lr-client-lan">
-          <legend className={vis ? "visually-hidden" : undefined}>{t("client.launch.lanAddress")}</legend>
-          {lan.addresses.length === 0 ? (
-            <Pill icon="wifiOff" tone="warn" comic="signal-offline" label={t("client.launch.lanUnavailable")} />
-          ) : <>
-            {vis ? null : <p className="lr-client-lan-hint">{t("client.launch.lanHint")}</p>}
-            <div className="lr-client-lan-options">
-              {lan.addresses.map(({ address, name }) => (
-                <label key={address} className={`lr-btn lr-client-lan-option${lan.selected === address ? " is-on" : ""}`}>
-                  <input type="radio" name="lan-address" value={address}
-                    checked={lan.selected === address} onChange={() => lan.onChange(address)} />
-                  <span><strong>{name}</strong><small>{address}</small></span>
-                </label>
-              ))}
-            </div>
-          </>}
-        </fieldset>
-      ) : null}
-
-      {mode === "site" ? (
-        <label className="lr-input lr-client-site">
-          <Glyph name="link" size={18} />
-          <input
-            type="url"
-            value={site}
-            spellCheck={false}
-            inputMode="url"
-            placeholder="https://piik.example.com"
-            aria-label={t("client.launch.siteAddress")}
-            onChange={(event) => {
-              onSiteChange(event.target.value);
-            }}
-          />
-        </label>
-      ) : null}
-
-      {mode !== "site" ? (
+      <div className="lr-client-room-settings">
         <details className="lr-client-access-options">
-          <summary>
+          <summary className="lr-btn">
             <Glyph name="key" size={17} />
             <span className={vis ? "visually-hidden" : undefined}>{t("client.launch.accessSettings")}</span>
             {localAccessPassword && <span className="lr-client-access-set">
@@ -194,7 +179,28 @@ export function LauncherForm({
             {t("client.launch.localAccessHint")}
           </p>
         </details>
-      ) : null}
+        {mode === "local" && lan && (lan.addresses.length !== 1 || !lan.selected) ? (
+          <details className="lr-client-access-options" open={!lan.selected || undefined}>
+            <summary className="lr-btn">
+              <Glyph name="users" size={17} />
+              <span className={vis ? "visually-hidden" : undefined}>{t("client.launch.lanAddress")}</span>
+              <Glyph name="chevron" size={15} />
+            </summary>
+            {lan.addresses.length === 0 ? (
+              <Pill icon="wifiOff" tone="warn" comic="signal-offline" label={t("client.launch.lanUnavailable")} />
+            ) : <div className="lr-capture-device lr-client-lan">
+              <select value={lan.selected} aria-label={t("client.launch.lanAddress")}
+                aria-describedby={`${accessHintId}-lan`} onChange={event => lan.onChange(event.target.value)}>
+                <option value="" disabled>{t("client.launch.chooseAddress")}</option>
+                {lan.addresses.map(({ address, name }) => (
+                  <option key={address} value={address}>{address} · {name}</option>
+                ))}
+              </select>
+              <small id={`${accessHintId}-lan`} className={vis ? "visually-hidden" : undefined}>{t("client.launch.lanHint")}</small>
+            </div>}
+          </details>
+        ) : null}
+      </div>
 
       <Btn
         icon="arrowRight"
@@ -203,9 +209,9 @@ export function LauncherForm({
         tone="primary"
         type="submit"
         hint={MODES.find((choice) => choice.mode === mode)?.comic}
-        disabled={(mode === "site" && !site.trim()) ||
-          (mode === "local" && lan !== undefined && !lan.selected)}
+        disabled={mode === "local" && lan !== undefined && !lan.selected}
       />
+      </>)}
     </form>
   );
 }

@@ -24,7 +24,8 @@ function blockSoftDisabledClick(event: MouseEvent<HTMLButtonElement>): void {
 
 // Pointer activations blur the trigger so the comic is not pinned open by
 // focus after the action completes; keyboard clicks (detail 0) keep focus,
-// so the panel persists for genuine keyboard use.
+// so the panel persists for genuine keyboard use. Run the action first:
+// leaving an enclosing field group may otherwise commit a superseded draft.
 function blurAfterPointerClick(event: MouseEvent<HTMLButtonElement>): void {
   if (event.detail !== 0) event.currentTarget.blur();
 }
@@ -49,6 +50,7 @@ export function Btn({
   onClick,
   type = "button",
   hint,
+  hintText,
   hintTone,
   hintMotion,
   draw,
@@ -68,6 +70,8 @@ export function Btn({
   type?: "button" | "submit";
   /** Shared hint comic; text modes add the localized caption. */
   hint?: ComicKind | HintKind;
+  /** Optional explanation beyond the control's accessible name. */
+  hintText?: CopyKey;
   hintTone?: ComicTone;
   hintMotion?: ComicMotion;
   /** Draw-in spot id for state-beat toggle icons (see Glyph). */
@@ -97,8 +101,8 @@ export function Btn({
           ? blockSoftDisabledClick
           : wrapped
             ? (event) => {
-                blurAfterPointerClick(event);
                 onClick?.();
+                blurAfterPointerClick(event);
               }
             : onClick
       }
@@ -114,7 +118,7 @@ export function Btn({
     </button>
   );
   return hint ? (
-    <Tooltip kind={hint} tone={hintTone} motion={hintMotion} text={vis ? undefined : label}>{button}</Tooltip>
+    <Tooltip kind={hint} tone={hintTone} motion={hintMotion} text={vis ? undefined : hintText ? t(hintText) : label}>{button}</Tooltip>
   ) : (
     button
   );
@@ -159,8 +163,8 @@ export function Chip({
           ? blockSoftDisabledClick
           : wrapped
             ? (event) => {
-                blurAfterPointerClick(event);
                 onClick?.();
+                blurAfterPointerClick(event);
               }
             : onClick
       }
@@ -280,8 +284,8 @@ export function SwitchItem({
           softDisabled
             ? blockSoftDisabledClick
             : (event) => {
-                if (wrapped) blurAfterPointerClick(event);
                 onChange(!checked);
+                if (wrapped) blurAfterPointerClick(event);
               }
         }
       />

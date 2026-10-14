@@ -4,6 +4,7 @@ import {
   lazy,
   useEffect,
   useState,
+  useSyncExternalStore,
   type FormEvent,
   type ReactNode,
 } from "react";
@@ -11,7 +12,6 @@ import {
   ApiError,
   authenticateSiteAccess,
   getRuntimeCapabilities,
-  getOptionalRuntimeCapabilities,
   getSiteAccess,
   type SiteAccessStatus,
 } from "./lib/api";
@@ -21,6 +21,8 @@ import {
   readViewerRoute,
   watchViewerInvites,
   takeClientLaunchBootstrap,
+  watchClientActivation,
+  isClientActivated,
   type ViewerRoute,
 } from "./lib/session";
 import { AppHeader } from "./components/living/Header";
@@ -100,16 +102,17 @@ function readableError(error: unknown, t: (key: "gate.connectFailed") => string)
 
 export function App() {
   const { lang, vis } = useCopy();
+  const launchedByClient = useSyncExternalStore(watchClientActivation, isClientActivated);
   useEffect(installBrowserDebug, []);
   useEffect(() => {
-    if (appRoute.kind !== "client" && !clientLaunchBootstrap?.launchedByClient) return;
+    if (appRoute.kind !== "client" && !launchedByClient) return;
     const controller = new AbortController();
     void import("./native/client")
       .then(({ notifyNativePresentation }) =>
         notifyNativePresentation(consoleLanguage(lang, vis), controller.signal))
       .catch(() => undefined);
     return () => controller.abort();
-  }, [lang, vis]);
+  }, [lang, vis, launchedByClient]);
 
   return (
     <RouteBoundary>
@@ -194,7 +197,7 @@ function AppRoute() {
 function RouteLoader() {
   return (
     <div className="lr-app">
-      <AppHeader />
+      <AppHeader atHome={appRoute.kind === "host"} homeHref={appRoute.kind === "client" ? "/client" : undefined} />
       <main className="lr-join">
         <LoadingStatus label="common.loading" />
       </main>
@@ -202,21 +205,11 @@ function RouteLoader() {
   );
 }
 
-// Invitation and room-code entry share discovery without making an invitation
-// pass through site authentication. Resolve before mounting media: changing the
-// negotiated flag later would restart an already healthy Viewer session.
 function ViewerEntry({ route }: { route: ViewerRoute }) {
-  const [progressSupported, setProgressSupported] = useState<boolean | null>(null);
-  useEffect(() => {
-    let active = true;
-    void getOptionalRuntimeCapabilities().then(capabilities => {
-      if (active) setProgressSupported(capabilities?.connectionAttemptProgress4 === true);
-    });
-    return () => { active = false; };
-  }, []);
-  return progressSupported === null ? <RouteLoader /> : (
-    <ViewerPage {...route} connectionAttemptProgress4={progressSupported}
-      launchedByClient={clientLaunchBootstrap?.launchedByClient} />
+  const launchedByClient = useSyncExternalStore(watchClientActivation, isClientActivated);
+  return (
+    <ViewerPage {...route}
+      launchedByClient={launchedByClient} />
   );
 }
 
@@ -278,6 +271,7 @@ function SiteAccessGate({
   viewerRoute?: ViewerRoute;
 }) {
   const { t, vis } = useCopy();
+  const launchedByClient = useSyncExternalStore(watchClientActivation, isClientActivated);
   const [access, setAccess] = useState<AccessState>({ kind: "checking" });
   const [capabilities, setCapabilities] =
     useState<RuntimeCapabilities | null>(null);
@@ -397,10 +391,12 @@ function SiteAccessGate({
     }
     return (
       <HostPage
-        launchedByClient={clientLaunchBootstrap?.launchedByClient}
+        roomInteractionsAvailable={capabilities?.roomInteractions === true}
+        hostRoomSessionAvailable={capabilities?.hostRoomSession === true}
+        launchedByClient={launchedByClient}
         sfuAvailable={capabilities?.sfu === true}
+        sfuOnly={capabilities?.sfuOnly === true}
         natPredictionAvailable={capabilities?.natPrediction === true}
-        connectionAttemptProgress4={capabilities?.connectionAttemptProgress4 === true}
         onAuthorizationRequired={() =>
           setAccess({ kind: "required", error: t("gate.expired") })
         }
@@ -410,7 +406,7 @@ function SiteAccessGate({
 
   return (
     <div className="lr-app">
-      <AppHeader />
+      <AppHeader atHome={surface === "host"} />
       <main className="lr-join">
         {access.kind === "checking" ? (
           <LoadingStatus label="gate.checking" />

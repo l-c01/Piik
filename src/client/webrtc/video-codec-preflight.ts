@@ -1,14 +1,15 @@
 import {
   configureVideoSender,
-  QUALITY_RESOLUTIONS,
   startupVideoProfile,
   type QualityProfile,
 } from "../media/quality";
 import {
   applyH264ProbeCodec,
+  normalizeVideoOfferSdp,
   type BrowserVideoCodec,
 } from "./video-codec";
 import { addRemoteIceCandidate } from "./nat-prediction";
+import { mediaSourceRecord } from "./stats";
 
 const PREFLIGHT_DEADLINE_MS = 4_000;
 const PREFLIGHT_POLL_MS = 100;
@@ -54,7 +55,7 @@ export function h264ProbeTarget(
   settings: MediaTrackSettings,
   profile: QualityProfile,
 ): H264ProbeTarget {
-  const ceiling = QUALITY_RESOLUTIONS[profile.resolution];
+  const ceiling = profile.resolution;
   const sourceWidth = positiveNumber(settings.width, ceiling.width);
   const sourceHeight = positiveNumber(settings.height, ceiling.height);
   const scale = Math.max(
@@ -174,7 +175,7 @@ function readH264ProbeSample(report: RTCStatsReport): H264ProbeSample | null {
   }
   const outbound = candidates[0]!;
   const codec = recordById(report, outbound.codecId);
-  const source = recordById(report, outbound.mediaSourceId);
+  const source = mediaSourceRecord(report, outbound);
   const mimeType = stringValue(codec?.mimeType);
   if (
     codec?.type !== "codec" ||
@@ -234,6 +235,7 @@ export function h264ProbeSustainsTarget(
     const encoded = current.framesEncoded - baseline.framesEncoded;
     const source = current.sourceFrames - baseline.sourceFrames;
     return (
+      source > 0 && encoded > 0 &&
       source + frameLag >= expectedFrames &&
       encoded + frameLag >= expectedFrames &&
       encoded + frameLag >= source
@@ -241,12 +243,12 @@ export function h264ProbeSustainsTarget(
   }
   if (
     current.encodedFramesPerSecond === null ||
-    current.sourceFramesPerSecond === null ||
-    current.sourceFramesPerSecond <= 0
+    current.sourceFramesPerSecond === null
   ) {
     return null;
   }
   return (
+    current.sourceFramesPerSecond > 0 && current.encodedFramesPerSecond > 0 &&
     current.sourceFramesPerSecond + frameLag >= targetFrameRate &&
     current.encodedFramesPerSecond + frameLag >= targetFrameRate &&
     current.encodedFramesPerSecond + frameLag >=
@@ -345,7 +347,7 @@ async function runH264Probe(
     const offer = await wait(() => senderConnection.createOffer());
     await wait(() => senderConnection.setLocalDescription(offer));
     await wait(() => receiverConnection.setRemoteDescription(
-      senderConnection.localDescription!,
+      { type: "offer", sdp: normalizeVideoOfferSdp(senderConnection.localDescription!.sdp) },
     ));
     receiverRemoteReady = true;
     await wait(() => Promise.all(

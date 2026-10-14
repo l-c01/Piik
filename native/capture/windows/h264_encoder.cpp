@@ -1,6 +1,7 @@
 #include "h264_encoder.h"
 
 #include "capture_output.h"
+#include "capture_color.h"
 
 #include <d3d10_1.h>
 #include <evr.h>
@@ -8,11 +9,34 @@
 #include <propvarutil.h>
 
 #include <algorithm>
+#include <charconv>
 
 namespace piik::capture::windows {
 
 namespace {
 constexpr DWORD kMaxEncodedSampleBytes = 4 * 1024 * 1024;
+}
+
+bool SupportsH264ProfileLevelId(const std::string& value) {
+  if (value.size() != 6) return false;
+  UINT32 parsed = 0;
+  const auto end = value.data() + value.size();
+  const auto result = std::from_chars(value.data(), end, parsed, 16);
+  if (result.ec != std::errc{} || result.ptr != end) return false;
+  switch (parsed & 0xff) {
+    case 10: case 11: case 12: case 13: case 20: case 21: case 22:
+    case 30: case 31: case 32: case 40: case 41: case 42: case 50: case 51: case 52:
+      break;
+    default:
+      return false;
+  }
+  const auto idc = parsed >> 16;
+  const auto constraints = (parsed >> 8) & 0xff;
+  // RFC 6184 Table 5: these are the same Constrained Baseline tools, not
+  // permission to emit Main/High. Extra constraint flags need not be identical.
+  return (idc == 0x42 && (constraints & 0x4f) == 0x40) ||
+         (idc == 0x4d && (constraints & 0x8f) == 0x80) ||
+         (idc == 0x58 && (constraints & 0xcf) == 0xc0);
 }
 
 std::string NarrowAscii(const std::wstring& value) {
@@ -327,6 +351,7 @@ ComPtr<IMFMediaType> CreateOutputType(
         "output-type-major");
   Check(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264),
         "output-type-subtype");
+  SetSdrVideoColor(type.Get());
   Check(type->SetUINT32(MF_MT_AVG_BITRATE, profile.bit_rate),
         "output-type-bitrate");
   Check(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, profile.width,
@@ -341,8 +366,8 @@ ComPtr<IMFMediaType> CreateOutputType(
         "output-type-interlace");
   Check(type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base),
         "output-type-profile");
-  Check(type->SetUINT32(MF_MT_MPEG2_LEVEL, profile.h264_level()),
-        "output-type-level");
+  // MF recommends automatic level selection. Forcing a valid level can still
+  // make hardware reject the type; validate the actual SPS instead.
   return type;
 }
 
@@ -354,6 +379,7 @@ ComPtr<IMFMediaType> CreateInputType(
         "input-type-major");
   Check(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12),
         "input-type-subtype");
+  SetSdrVideoColor(type.Get());
   Check(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, profile.width,
                            profile.height),
         "input-type-size");
@@ -393,8 +419,6 @@ void ValidateMediaTypes(
                  "output-type-bitrate");
   RequireTypeU32(output.Get(), MF_MT_MPEG2_PROFILE,
                  eAVEncH264VProfile_Base, "output-type-profile");
-  RequireTypeU32(output.Get(), MF_MT_MPEG2_LEVEL, profile.h264_level(),
-                 "output-type-level");
 
   UINT32 width = 0;
   UINT32 height = 0;
@@ -530,7 +554,10 @@ ComPtr<IMFSample> CreateCallerOutputSample(const MFT_OUTPUT_STREAM_INFO& info) {
   ComPtr<IMFSample> sample;
   Check(MFCreateSample(&sample), "output-sample-create");
   ComPtr<IMFMediaBuffer> buffer;
-  Check(MFCreateMemoryBuffer(kMaxEncodedSampleBytes, &buffer),
+  // Stream info uses bytes; the allocator takes an alignment mask (bytes - 1).
+  Check(MFCreateAlignedMemoryBuffer(kMaxEncodedSampleBytes,
+                                    info.cbAlignment ? info.cbAlignment - 1 : 0,
+                                    &buffer),
         "output-memory-buffer");
   Check(sample->AddBuffer(buffer.Get()), "output-sample-buffer");
   return sample;
@@ -588,6 +615,11 @@ ComPtr<IMFSample> CreateSurfaceSample(ID3D11Texture2D* texture,
   Check(MFCreateDXGISurfaceBuffer(IID_ID3D11Texture2D, texture, 0, FALSE,
                                   &buffer),
         "input-dxgi-buffer");
+  // Surface storage exists, but the wrapper initially reports zero valid bytes.
+  // MFTs may honor that length instead of inferring it from the texture.
+  DWORD length = 0;
+  Check(buffer->GetMaxLength(&length), "input-buffer-capacity");
+  Check(buffer->SetCurrentLength(length), "input-buffer-length");
   ComPtr<IMFSample> sample;
   Check(MFCreateVideoSampleFromSurface(nullptr, &sample),
         "input-video-sample");
@@ -676,8 +708,8 @@ EncodedAccessUnit LiveEncoder::Encode(
       Fail("bitstream-annexb", "live output is not Annex-B H264");
     }
     if (nal.profile_level_id) {
-      if (*nal.profile_level_id != profile_.profile_level_id()) {
-        Fail("bitstream-profile", "hardware MFT changed the requested H.264 profile level");
+      if (!SupportsH264ProfileLevelId(*nal.profile_level_id)) {
+        Fail("bitstream-profile", "hardware MFT emitted unsupported H.264 coding tools or level");
       }
       if (profile_level_id_ && *profile_level_id_ != *nal.profile_level_id) {
         Fail("bitstream-profile-change", "hardware MFT changed SPS profile");
